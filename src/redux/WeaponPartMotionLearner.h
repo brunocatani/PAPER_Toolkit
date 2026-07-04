@@ -109,6 +109,11 @@ namespace redux
             const weapon_clip_stroke::AuthoredStrokeGroup& group,
             bool fallbackSource);
 
+        // Bumped on every stored/replaced path (either source) and on
+        // reset; consumers re-resolve path-dependent state (per-part
+        // attach-only targets) when it moves.
+        [[nodiscard]] std::uint64_t revision() const { return _revision; }
+
         void reset();
 
     private:
@@ -159,5 +164,6 @@ namespace redux
         std::array<RecorderSlot, kMaxActiveRecorders> _recorders{};
         std::uint64_t _observationCounter{ 0 };
         std::uint64_t _frameCounter{ 0 };
+        std::uint64_t _revision{ 0 };
     };
 }

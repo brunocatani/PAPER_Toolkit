@@ -233,6 +233,7 @@ namespace redux
         record.followerCount = (std::min)(group.followerCount, static_cast<std::uint32_t>(record.followers.size()));
         record.followers = group.followers;
         target->lastUseCounter = _observationCounter;
+        ++_revision;
 
         // Path endpoints in the stored frame: comparing these against the
         // learner's endpoints for the same part exposes any frame mismatch
@@ -261,6 +262,7 @@ namespace redux
         _paths = {};
         _recorders = {};
         _observationCounter = 0;
+        ++_revision;
     }
 
     WeaponPartMotionLearner::RecorderSlot* WeaponPartMotionLearner::acquireRecorderSlot(
@@ -385,6 +387,7 @@ namespace redux
         record.fallbackSource = false;
         record.path = candidate;
         target->lastUseCounter = _observationCounter;
+        ++_revision;
 
         // Followers: the rigid co-movers, resampled at the leader's key
         // positions (frame-aligned) so they replay time-locked to the stroke.

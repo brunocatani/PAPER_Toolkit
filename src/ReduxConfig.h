@@ -1,11 +1,14 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <string>
 
 #include "redux/MotionPathMode.h"
+#include "redux/WeaponPartEligibility.h"
 
 namespace filewatch
 {
@@ -34,6 +37,22 @@ namespace redux
         MotionPathMode motionPathMode = MotionPathMode::Hybrid;
         // spdlog level: 0=trace 1=debug 2=info 3=warn 4=error 5=critical 6=off.
         int logLevel = 2;
+        /*
+         * AttachOnly allowlist, one INI boolean per part class
+         * (bAttachOnly<Class>, see kAttachOnlyPartKeys). Composed into
+         * attachOnlyParts on every (re)load. The masks are only the class
+         * half of the gate — the runtime additionally requires a motion
+         * path per part ("must move") before whitelisting it with ROCK.
+         */
+        std::array<bool, std::size(kAttachOnlyPartKeys)> attachOnlyPartEnabled{};
+        AttachOnlyAllowList attachOnlyParts = defaultAttachOnlyAllowList();
+        /*
+         * Bumped whenever a value that changes the eligible-part set changed
+         * (mode or allowlist); the runtime recomputes per-part targets when
+         * this moves. Starts at 1 so a zero-initialized consumer always
+         * recomputes once.
+         */
+        std::uint64_t targetPolicyRevision = 1;
 
         // First load: resolve the path, create the default INI if missing,
         // parse, apply the log level, start the file watch.

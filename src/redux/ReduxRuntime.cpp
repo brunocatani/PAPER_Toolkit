@@ -275,6 +275,12 @@ namespace redux
         _learner.reset();
         _drivePartCache = {};
         _drivenPartLeases = {};
+        _eligiblePartCount = 0;
+        _eligibleParts = {};
+        _eligibleCacheGeneration = 0;
+        _eligibleLearnerRevision = 0;
+        _eligibleConfigRevision = 0;
+        _eligibleResolvedOnce = false;
         weapon_clip_motion_harvest::clearPending();
         weapon_clip_motion_harvest::resetWalk();
         weapon_clip_motion_harvest::clearClipActivationTargets();
@@ -361,6 +367,8 @@ namespace redux
             auto& entry = _drivePartCache.entries[_drivePartCache.count++];
             entry.bodyId = detail.bodyId;
             entry.node = node;
+            entry.partKind = detail.partKind;
+            entry.actionRole = detail.actionRole;
             entry.sourceName = {};
             std::memcpy(
                 entry.sourceName.data(),
@@ -369,6 +377,91 @@ namespace redux
         }
         if (sawCurrentGeneration) {
             _drivePartCache.generationKey = generationKey;
+        }
+    }
+
+    void ReduxRuntime::refreshEligibleParts(std::uint32_t weaponFormId)
+    {
+        const auto cacheGeneration = _drivePartCache.generationKey;
+        const auto learnerRevision = _learner.revision();
+        const auto configRevision = g_reduxConfig.targetPolicyRevision;
+        if (_eligibleResolvedOnce &&
+            _eligibleCacheGeneration == cacheGeneration &&
+            _eligibleLearnerRevision == learnerRevision &&
+            _eligibleConfigRevision == configRevision) {
+            return;
+        }
+        _eligibleResolvedOnce = true;
+        _eligibleCacheGeneration = cacheGeneration;
+        _eligibleLearnerRevision = learnerRevision;
+        _eligibleConfigRevision = configRevision;
+
+        const auto previousCount = _eligiblePartCount;
+        const auto previousParts = _eligibleParts;
+        _eligiblePartCount = 0;
+        _eligibleParts = {};
+
+        // Allowlisted classes whose concrete part has NO motion path yet —
+        // reported when the set changes so "why is my stock not gluing" is
+        // answered by the log ("must move" gate).
+        std::array<char, 512> unmappedNames{};
+        std::size_t unmappedLength = 0;
+        const auto appendName = [](std::array<char, 512>& buffer, std::size_t& length, std::string_view name) {
+            if (length + name.size() + 1 >= buffer.size()) {
+                return;
+            }
+            if (length > 0) {
+                buffer[length++] = ' ';
+            }
+            std::memcpy(buffer.data() + length, name.data(), name.size());
+            length += name.size();
+        };
+
+        if (cacheGeneration != 0 && weaponFormId != 0) {
+            const auto& allowList = g_reduxConfig.attachOnlyParts;
+            for (std::uint32_t i = 0; i < _drivePartCache.count; ++i) {
+                const auto& entry = _drivePartCache.entries[i];
+                if (!allowList.allows(
+                        static_cast<::rock::provider::RockProviderWeaponActionRoleV1>(entry.actionRole),
+                        static_cast<::rock::provider::RockProviderWeaponPartKindV1>(entry.partKind))) {
+                    continue;
+                }
+                const auto sourceName = providerFixedStringView(entry.sourceName.data(), entry.sourceName.size());
+                // "Must move": without a motion path under the active mode
+                // the part is not attach-only and not grouped — it keeps its
+                // normal grip even though its class is allowlisted.
+                if (!_learner.findPath(weaponFormId, sourceName, g_reduxConfig.motionPathMode)) {
+                    appendName(unmappedNames, unmappedLength, sourceName);
+                    continue;
+                }
+                if (_eligiblePartCount >= _eligibleParts.size()) {
+                    break;
+                }
+                auto& part = _eligibleParts[_eligiblePartCount++];
+                part.bodyId = entry.bodyId;
+                part.sourceName = entry.sourceName;
+            }
+        }
+
+        // Log only when the resolved set actually changed (revision bumps
+        // are frequent during harvest bursts; the set usually is not).
+        const bool setChanged = previousCount != _eligiblePartCount ||
+            std::memcmp(previousParts.data(), _eligibleParts.data(),
+                sizeof(WeaponPartDriveSandbox::EligiblePart) * _eligiblePartCount) != 0;
+        if (setChanged) {
+            std::array<char, 512> eligibleNames{};
+            std::size_t eligibleLength = 0;
+            for (std::uint32_t i = 0; i < _eligiblePartCount; ++i) {
+                appendName(eligibleNames, eligibleLength,
+                    providerFixedStringView(_eligibleParts[i].sourceName.data(), _eligibleParts[i].sourceName.size()));
+            }
+            RDX_LOG_INFO(Weapon,
+                "AttachOnly eligibility resolved (mode={}): {} moving part(s) [{}]{}{}",
+                motionPathModeName(g_reduxConfig.motionPathMode),
+                _eligiblePartCount,
+                std::string_view(eligibleNames.data(), eligibleLength),
+                unmappedLength > 0 ? " — allowlisted but unmapped (no motion path, normal grip): " : "",
+                std::string_view(unmappedNames.data(), unmappedLength));
         }
     }
 
@@ -1073,6 +1166,12 @@ namespace redux
         input.weaponGenerationKey = generationKey;
         input.weaponFormId = weaponNode && generationKey != 0 ? weaponFormId : 0;
         input.motionPathMode = g_reduxConfig.motionPathMode;
+        // Per-part attach-only whitelist: allowlisted class + motion path
+        // present ("must move"); the sandbox reinstalls provider targets
+        // only when this set changes.
+        refreshEligibleParts(input.weaponFormId);
+        input.eligiblePartCount = _eligiblePartCount;
+        input.eligibleParts = _eligibleParts;
 
         RE::NiTransform weaponWorldInverse{};
         bool hasWeaponInverse = false;
@@ -1091,10 +1190,11 @@ namespace redux
                     &report)) {
                 continue;
             }
+            // Ownership IS the policy: an AttachOnly grip carrying our owner
+            // token matched one of our per-part targets, which by
+            // construction are allowlisted AND moving — no separate class or
+            // motion re-check can disagree with the install.
             if (report.active == 0 || report.attachOnly == 0 ||
-                !weaponPartDriveEligible(
-                    static_cast<::rock::provider::RockProviderWeaponActionRoleV1>(report.actionRole),
-                    static_cast<::rock::provider::RockProviderWeaponPartKindV1>(report.partKind)) ||
                 report.providerOwnerToken != _sandbox.ownerToken() ||
                 report.weaponGenerationKey != generationKey) {
                 continue;

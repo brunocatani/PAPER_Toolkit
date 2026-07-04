@@ -1,4 +1,5 @@
 #include "redux/WeaponClipStrokePolicy.h"
+#include "redux/WeaponPartEligibility.h"
 #include "redux/WeaponPartMotionLearner.h"
 #include "redux/WeaponPartMotionPathPolicy.h"
 #include "redux/WeaponPartMotionScrubPolicy.h"
@@ -348,6 +349,43 @@ int main()
             ok &= expectTrue("larger same-tier authored stroke replaced the stored one",
                 authoredView.leaderPath && std::abs(authoredView.leaderPath->totalArcLength - 6.0f) < 0.01f);
         }
+    }
+
+    {
+        // AttachOnly allowlist booleans: defaults reproduce the action-role
+        // + feed-chain set; per-key toggles change exactly their class.
+        using namespace redux;
+        using ActionRole = rock::provider::RockProviderWeaponActionRoleV1;
+        using PartKind = rock::provider::RockProviderWeaponPartKindV1;
+
+        const auto defaults = defaultAttachOnlyAllowList();
+        ok &= expectTrue("default allowlist admits action-role bolt",
+            defaults.allows(ActionRole::Bolt, PartKind::Other));
+        ok &= expectTrue("default allowlist admits magazine part kind",
+            defaults.allows(ActionRole::None, PartKind::Magazine));
+        ok &= expectFalse("default allowlist rejects stock",
+            defaults.allows(ActionRole::None, PartKind::Stock));
+        ok &= expectFalse("default allowlist rejects latch+receiver",
+            defaults.allows(ActionRole::Latch, PartKind::Receiver));
+
+        // Rebuild with stock ON and magazine OFF via the key table, exactly
+        // as the config does from the INI booleans.
+        AttachOnlyAllowList custom{};
+        for (const auto& key : kAttachOnlyPartKeys) {
+            bool enabled = key.defaultOn;
+            if (std::strcmp(key.name, "stock") == 0) {
+                enabled = true;
+            } else if (std::strcmp(key.name, "magazine") == 0) {
+                enabled = false;
+            }
+            applyAttachOnlyPartKey(key, enabled, custom);
+        }
+        ok &= expectTrue("toggled-on stock is admitted", custom.allows(ActionRole::None, PartKind::Stock));
+        ok &= expectFalse("toggled-off magazine is rejected", custom.allows(ActionRole::None, PartKind::Magazine));
+        ok &= expectTrue("unrelated bolt class unaffected by toggles",
+            custom.allows(ActionRole::Bolt, PartKind::Other));
+        ok &= expectTrue("bolt key also enables the bolt part kind",
+            custom.allows(ActionRole::None, PartKind::Bolt));
     }
 
     return ok ? 0 : 1;

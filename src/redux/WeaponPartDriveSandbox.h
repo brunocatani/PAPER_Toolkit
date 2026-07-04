@@ -14,12 +14,14 @@ namespace redux
 
     /*
      * The drive loop of the reload runtime: registers PAPER_Redux as a ROCK
-     * provider consumer, installs a NonExclusive AttachOnly whitelist for
-     * every drive-eligible part class (so normal support grips stay
-     * untouched), and drives a gripped part along its learned/authored
-     * motion path with setWeaponPartDriveTargetsV1. Engine access stays in
-     * ReduxRuntime: this class receives plain weapon-root-local data per
-     * frame and talks only to ROCK's provider API.
+     * provider consumer, installs a NonExclusive AttachOnly whitelist of
+     * PER-PART targets (only the parts the runtime resolved as allowlisted
+     * AND moving — so unmapped parts and every other grip surface keep
+     * their normal behavior), and drives a gripped part along its
+     * learned/authored motion path with setWeaponPartDriveTargetsV1.
+     * Engine access stays in ReduxRuntime: this class receives plain
+     * weapon-root-local data per frame and talks only to ROCK's provider
+     * API.
      *
      * Ownership/lifetime: registration is lazy on the first enabled update and
      * torn down by shutdown() (drive + whitelist cleared, consumer
@@ -62,6 +64,18 @@ namespace redux
             weapon_part_motion_path::Vec3 handTranslate{};
         };
 
+        // One whitelist-eligible part of the current weapon: allowlisted
+        // class AND a motion path exists under the active mode ("must
+        // move"). The runtime computes these; this class encodes them as
+        // per-bodyId NonExclusive AttachOnly provider targets.
+        struct EligiblePart
+        {
+            std::uint32_t bodyId{ 0x7FFF'FFFFu };
+            std::array<char, kMaxSourceName> sourceName{};
+        };
+        // Matches the runtime's drive-part cache capacity.
+        static constexpr std::size_t kMaxEligibleParts = 48;
+
         struct FrameInput
         {
             std::uint32_t weaponFormId{ 0 };
@@ -70,6 +84,10 @@ namespace redux
             // start so a hot-reload mode switch never swaps the path under a
             // hand mid-scrub; it applies to the next grip.
             MotionPathMode motionPathMode{ MotionPathMode::Hybrid };
+            // Per-part attach-only whitelist for the current weapon
+            // generation; targets reinstall only when this set changes.
+            std::uint32_t eligiblePartCount{ 0 };
+            std::array<EligiblePart, kMaxEligibleParts> eligibleParts{};
             // Indexed [0]=right, [1]=left to match hand-state conventions.
             std::array<HandInput, 2> hands{};
         };
@@ -113,10 +131,22 @@ namespace redux
         };
 
         bool ensureRegistered();
+        // Install/refresh the per-part targets when the eligible set or the
+        // weapon generation changed; cheap no-op otherwise.
+        void ensureTargetsInstalled(const FrameInput& input);
         void endSession(HandSession& session);
 
+        // What is currently installed with ROCK, for change detection.
+        struct InstalledTargets
+        {
+            bool any{ false };
+            std::uint64_t weaponGenerationKey{ 0 };
+            std::uint32_t count{ 0 };
+            std::array<std::uint32_t, kMaxEligibleParts> bodyIds{};
+        };
+
         std::uint64_t _ownerToken{ 0 };
-        bool _whitelistInstalled{ false };
+        InstalledTargets _installedTargets{};
         bool _sentDrivesLastUpdate{ false };
         std::uint32_t _registrationRetryCooldownFrames{ 0 };
         bool _registrationWarned{ false };

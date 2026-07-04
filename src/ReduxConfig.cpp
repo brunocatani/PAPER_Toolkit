@@ -37,7 +37,39 @@ namespace redux
             "\n"
             "; Log verbosity: 0=trace 1=debug 2=info 3=warn 4=error 5=critical 6=off.\n"
             "; Hot-reloadable; drop to 1 or 0 when collecting harvest/scrub diagnostics.\n"
-            "iLogLevel = 2\n";
+            "iLogLevel = 2\n"
+            "\n"
+            "; AttachOnly allowlist — which part classes MAY become attach-only grips.\n"
+            "; Hot-reloadable. The class switch is only half the gate: a part must ALSO\n"
+            "; have a motion path (clip-harvested or learned, under the active mode) to\n"
+            "; actually be attach-only. A part that does not move keeps its normal grip\n"
+            "; no matter what is enabled here — e.g. with bAttachOnlyReceiver=true, a\n"
+            "; receiver nif that the animation moves glues to the hand, a static one on\n"
+            "; the same weapon stays a regular support grip.\n"
+            "bAttachOnlyBolt = true\n"
+            "bAttachOnlySlide = true\n"
+            "bAttachOnlyChargingHandle = true\n"
+            "bAttachOnlyPump = true\n"
+            "bAttachOnlyBreakAction = true\n"
+            "bAttachOnlyCylinder = true\n"
+            "bAttachOnlyLever = true\n"
+            "bAttachOnlyLatch = false\n"
+            "bAttachOnlyMagazine = true\n"
+            "bAttachOnlyMagwell = true\n"
+            "bAttachOnlyChamber = true\n"
+            "bAttachOnlyShell = true\n"
+            "bAttachOnlyRound = true\n"
+            "bAttachOnlyLaserCell = true\n"
+            "bAttachOnlyCosmeticAmmo = true\n"
+            "bAttachOnlyReceiver = false\n"
+            "bAttachOnlyBarrel = false\n"
+            "bAttachOnlyHandguard = false\n"
+            "bAttachOnlyForegrip = false\n"
+            "bAttachOnlyStock = false\n"
+            "bAttachOnlyGrip = false\n"
+            "bAttachOnlySight = false\n"
+            "bAttachOnlyAccessory = false\n"
+            "bAttachOnlyOther = false\n";
 
         std::string resolveIniPath()
         {
@@ -58,7 +90,13 @@ namespace redux
         }
     }
 
-    ReduxConfig::ReduxConfig() = default;
+    ReduxConfig::ReduxConfig()
+    {
+        for (std::size_t i = 0; i < std::size(kAttachOnlyPartKeys); ++i) {
+            attachOnlyPartEnabled[i] = kAttachOnlyPartKeys[i].defaultOn;
+        }
+    }
+
     ReduxConfig::~ReduxConfig() = default;
 
     void ReduxConfig::load()
@@ -109,6 +147,8 @@ namespace redux
         const bool previousEnabled = enabled;
         const auto previousMode = motionPathMode;
         const int previousLogLevel = logLevel;
+        const auto previousAllowList = attachOnlyParts;
+        const auto previousPartEnabled = attachOnlyPartEnabled;
 
         enabled = ini.GetBoolValue(kSection, "bEnabled", enabled);
 
@@ -130,6 +170,23 @@ namespace redux
         }
         logger::setLogLevelAndPattern(logLevel, "");
 
+        // AttachOnly allowlist booleans, composed into the class masks.
+        for (std::size_t i = 0; i < std::size(kAttachOnlyPartKeys); ++i) {
+            attachOnlyPartEnabled[i] =
+                ini.GetBoolValue(kSection, kAttachOnlyPartKeys[i].iniKey, attachOnlyPartEnabled[i]);
+        }
+        attachOnlyParts = AttachOnlyAllowList{};
+        for (std::size_t i = 0; i < std::size(kAttachOnlyPartKeys); ++i) {
+            applyAttachOnlyPartKey(kAttachOnlyPartKeys[i], attachOnlyPartEnabled[i], attachOnlyParts);
+        }
+
+        // The eligible-part set depends on the mode (which source must hold
+        // a path) and the allowlist; a change re-resolves per-part targets.
+        const bool targetPolicyChanged = motionPathMode != previousMode || !(attachOnlyParts == previousAllowList);
+        if (targetPolicyChanged) {
+            ++targetPolicyRevision;
+        }
+
         if (logDiff) {
             if (enabled != previousEnabled) {
                 RDX_LOG_INFO(Config, "bEnabled: {} -> {}", previousEnabled, enabled);
@@ -143,7 +200,20 @@ namespace redux
             if (logLevel != previousLogLevel) {
                 RDX_LOG_INFO(Config, "iLogLevel: {} -> {}", previousLogLevel, logLevel);
             }
-            if (enabled == previousEnabled && motionPathMode == previousMode && logLevel == previousLogLevel) {
+            bool allowListChangedKeys = false;
+            for (std::size_t i = 0; i < std::size(kAttachOnlyPartKeys); ++i) {
+                if (attachOnlyPartEnabled[i] != previousPartEnabled[i]) {
+                    allowListChangedKeys = true;
+                    RDX_LOG_INFO(Config,
+                        "{}: {} -> {} (mapped moving parts of this class {} attach-only on next grip)",
+                        kAttachOnlyPartKeys[i].iniKey,
+                        previousPartEnabled[i],
+                        attachOnlyPartEnabled[i],
+                        attachOnlyPartEnabled[i] ? "become" : "stop being");
+                }
+            }
+            if (enabled == previousEnabled && motionPathMode == previousMode && logLevel == previousLogLevel &&
+                !allowListChangedKeys) {
                 RDX_LOG_INFO(Config, "Reload applied, no value changes (enabled={} mode={} logLevel={})",
                     enabled,
                     motionPathModeName(motionPathMode),

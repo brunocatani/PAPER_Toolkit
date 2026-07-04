@@ -4,7 +4,6 @@
 #include "ReduxLog.h"
 #include "redux/WeaponPartMotionLearner.h"
 #include "redux/WeaponPartMotionScrubPolicy.h"
-#include "redux/WeaponPartEligibility.h"
 
 #include <algorithm>
 #include <array>
@@ -50,7 +49,7 @@ namespace redux
 
     bool WeaponPartDriveSandbox::ensureRegistered()
     {
-        if (_ownerToken != 0 && _whitelistInstalled) {
+        if (_ownerToken != 0) {
             return true;
         }
         if (_registrationRetryCooldownFrames > 0) {
@@ -66,82 +65,126 @@ namespace redux
             return false;
         }
 
-        if (_ownerToken == 0) {
-            ::rock::provider::RockProviderConsumerRegistrationV1 registration{};
-            std::memcpy(registration.modName, kSandboxConsumerName, sizeof(kSandboxConsumerName));
-            registration.requestedCapabilities =
-                static_cast<std::uint32_t>(::rock::provider::RockProviderConsumerCapabilityV1::WeaponPartInteraction);
-            ::rock::provider::RockProviderConsumerHandleV1 handle{};
-            const auto result = api->registerConsumerV1(&registration, &handle);
-            if (result != ::rock::provider::RockProviderResultV1::Ok || handle.ownerToken == 0) {
-                if (!_registrationWarned) {
-                    RDX_LOG_WARN(Weapon, "WeaponPartDriveSandbox: consumer registration failed result={}", static_cast<std::uint32_t>(result));
-                    _registrationWarned = true;
-                }
-                _registrationRetryCooldownFrames = kRegistrationRetryFrames;
-                return false;
-            }
-            _ownerToken = handle.ownerToken;
-        }
-
-        // Persistent whitelist: every drive-eligible part is grabbable as an
-        // AttachOnly glue on any weapon (generation key 0 = all generations).
-        // Targets mirror weaponPartDriveEligible: all reciprocating/hinged
-        // action roles plus the feed-chain part kinds. NonExclusive keeps
-        // every other part grip on its normal behavior.
-        using ActionRole = ::rock::provider::RockProviderWeaponActionRoleV1;
-        using PartKind = ::rock::provider::RockProviderWeaponPartKindV1;
-        constexpr std::array<ActionRole, 7> kDriveActionRoles{
-            ActionRole::Bolt,
-            ActionRole::Slide,
-            ActionRole::ChargingHandle,
-            ActionRole::Pump,
-            ActionRole::BreakAction,
-            ActionRole::Cylinder,
-            ActionRole::Lever,
-        };
-        constexpr std::array<PartKind, 7> kDrivePartKinds{
-            PartKind::Magazine,
-            PartKind::Magwell,
-            PartKind::Chamber,
-            PartKind::Shell,
-            PartKind::Round,
-            PartKind::LaserCell,
-            PartKind::CosmeticAmmo,
-        };
-        std::array<::rock::provider::RockProviderWeaponPartTargetV1, kDriveActionRoles.size() + kDrivePartKinds.size()> targets{};
-        for (auto& target : targets) {
-            target.flags = static_cast<std::uint32_t>(::rock::provider::RockProviderWeaponPartTargetFlagV1::NonExclusive);
-            target.grabMode = ::rock::provider::RockProviderWeaponPartGrabModeV1::AttachOnly;
-            target.groupId = 1;
-            target.priority = kDrivePriority;
-        }
-        for (std::size_t i = 0; i < kDriveActionRoles.size(); ++i) {
-            targets[i].flags |= static_cast<std::uint32_t>(::rock::provider::RockProviderWeaponPartTargetFlagV1::MatchActionRole);
-            targets[i].actionRole = static_cast<std::uint32_t>(kDriveActionRoles[i]);
-        }
-        for (std::size_t i = 0; i < kDrivePartKinds.size(); ++i) {
-            auto& target = targets[kDriveActionRoles.size() + i];
-            target.flags |= static_cast<std::uint32_t>(::rock::provider::RockProviderWeaponPartTargetFlagV1::MatchPartKind);
-            target.partKind = static_cast<std::uint32_t>(kDrivePartKinds[i]);
-        }
-        const auto targetResult = api->setWeaponPartTargetsV1(_ownerToken, targets.data(), static_cast<std::uint32_t>(targets.size()));
-        if (targetResult != ::rock::provider::RockProviderResultV1::Ok) {
-            if (targetResult == ::rock::provider::RockProviderResultV1::OwnerNotRegistered) {
-                // Provider dropped this owner (ROCK reset); re-register from
-                // scratch on the next attempt instead of retrying a dead token.
-                _ownerToken = 0;
-            }
+        ::rock::provider::RockProviderConsumerRegistrationV1 registration{};
+        std::memcpy(registration.modName, kSandboxConsumerName, sizeof(kSandboxConsumerName));
+        registration.requestedCapabilities =
+            static_cast<std::uint32_t>(::rock::provider::RockProviderConsumerCapabilityV1::WeaponPartInteraction);
+        ::rock::provider::RockProviderConsumerHandleV1 handle{};
+        const auto result = api->registerConsumerV1(&registration, &handle);
+        if (result != ::rock::provider::RockProviderResultV1::Ok || handle.ownerToken == 0) {
             if (!_registrationWarned) {
-                RDX_LOG_WARN(Weapon, "WeaponPartDriveSandbox: whitelist install failed result={}", static_cast<std::uint32_t>(targetResult));
+                RDX_LOG_WARN(Weapon, "WeaponPartDriveSandbox: consumer registration failed result={}", static_cast<std::uint32_t>(result));
                 _registrationWarned = true;
             }
             _registrationRetryCooldownFrames = kRegistrationRetryFrames;
             return false;
         }
-        _whitelistInstalled = true;
-        RDX_LOG_INFO(Weapon, "WeaponPartDriveSandbox: registered (token={}) with NonExclusive AttachOnly whitelist (bolt/slide/charging/pump/break/cylinder/lever action parts + feed chain)", _ownerToken);
+        _ownerToken = handle.ownerToken;
+        _installedTargets = {};
+        RDX_LOG_INFO(Weapon,
+            "WeaponPartDriveSandbox: consumer registered (token={}); per-part AttachOnly targets follow the resolved eligible set",
+            _ownerToken);
         return true;
+    }
+
+    void WeaponPartDriveSandbox::ensureTargetsInstalled(const FrameInput& input)
+    {
+        const auto count = (std::min)(input.eligiblePartCount, static_cast<std::uint32_t>(kMaxEligibleParts));
+        // Change detection: same generation and same bodyId set means the
+        // installed targets are already correct (the common per-frame case).
+        if (_installedTargets.any &&
+            _installedTargets.weaponGenerationKey == input.weaponGenerationKey &&
+            _installedTargets.count == count) {
+            bool same = true;
+            for (std::uint32_t i = 0; i < count; ++i) {
+                if (_installedTargets.bodyIds[i] != input.eligibleParts[i].bodyId) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) {
+                return;
+            }
+        }
+        if (!_installedTargets.any && count == 0) {
+            return;
+        }
+
+        const auto* api = ::rock::provider::RockProviderApi::inst;
+        if (!api || !api->setWeaponPartTargetsV1 || !api->clearWeaponPartTargetsV1) {
+            return;
+        }
+
+        if (count == 0) {
+            (void)api->clearWeaponPartTargetsV1(_ownerToken);
+            _installedTargets = {};
+            RDX_LOG_INFO(Weapon, "WeaponPartDriveSandbox: attach-only targets cleared (no eligible moving parts)");
+            return;
+        }
+
+        /*
+         * Per-part whitelist: one NonExclusive AttachOnly target per
+         * eligible part, matched by bodyId and pinned to the weapon
+         * generation. Parts of the same weapon that are NOT in this set —
+         * allowlisted classes without motion data included — never match a
+         * target and keep their normal grip behavior; a weapon swap
+         * invalidates everything through the generation key until the
+         * runtime resolves the new weapon's set.
+         */
+        std::array<::rock::provider::RockProviderWeaponPartTargetV1, kMaxEligibleParts> targets{};
+        for (std::uint32_t i = 0; i < count; ++i) {
+            auto& target = targets[i];
+            target.flags = static_cast<std::uint32_t>(::rock::provider::RockProviderWeaponPartTargetFlagV1::NonExclusive) |
+                           static_cast<std::uint32_t>(::rock::provider::RockProviderWeaponPartTargetFlagV1::MatchBodyId);
+            target.grabMode = ::rock::provider::RockProviderWeaponPartGrabModeV1::AttachOnly;
+            target.weaponGenerationKey = input.weaponGenerationKey;
+            target.bodyId = input.eligibleParts[i].bodyId;
+            target.groupId = 1;
+            target.priority = kDrivePriority;
+        }
+        const auto targetResult = api->setWeaponPartTargetsV1(_ownerToken, targets.data(), count);
+        if (targetResult != ::rock::provider::RockProviderResultV1::Ok) {
+            if (targetResult == ::rock::provider::RockProviderResultV1::OwnerNotRegistered) {
+                // Provider dropped this owner (ROCK reset); re-register from
+                // scratch on the next update instead of retrying a dead token.
+                _ownerToken = 0;
+            }
+            _installedTargets = {};
+            RDX_LOG_WARN(Weapon,
+                "WeaponPartDriveSandbox: per-part target install failed result={} (count={})",
+                static_cast<std::uint32_t>(targetResult),
+                count);
+            return;
+        }
+
+        _installedTargets.any = true;
+        _installedTargets.weaponGenerationKey = input.weaponGenerationKey;
+        _installedTargets.count = count;
+        for (std::uint32_t i = 0; i < count; ++i) {
+            _installedTargets.bodyIds[i] = input.eligibleParts[i].bodyId;
+        }
+
+        // Compact one-line set dump — this is the live answer to "why is
+        // this part (not) attach-only": exactly these parts glue.
+        std::array<char, 512> names{};
+        std::size_t nameLength = 0;
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const auto sourceName = sessionName(input.eligibleParts[i].sourceName);
+            const std::size_t needed = sourceName.size() + 1;
+            if (nameLength + needed >= names.size()) {
+                break;
+            }
+            if (nameLength > 0) {
+                names[nameLength++] = ' ';
+            }
+            std::memcpy(names.data() + nameLength, sourceName.data(), sourceName.size());
+            nameLength += sourceName.size();
+        }
+        RDX_LOG_INFO(Weapon,
+            "WeaponPartDriveSandbox: attach-only targets installed for {} moving part(s) gen={:#x}: [{}]",
+            count,
+            input.weaponGenerationKey,
+            std::string_view(names.data(), nameLength));
     }
 
     void WeaponPartDriveSandbox::endSession(HandSession& session)
@@ -159,6 +202,7 @@ namespace redux
             _sentDrivesLastUpdate = false;
             return 0;
         }
+        ensureTargetsInstalled(input);
 
         // Per hand: the gripped leader plus up to kMaxFollowers assembly parts.
         std::array<::rock::provider::RockProviderWeaponPartDriveTargetV1, 2 * (1 + weapon_clip_stroke::kMaxFollowers)> drives{};
@@ -326,7 +370,7 @@ namespace redux
                 // Provider dropped this owner; re-register lazily and end the
                 // sessions — their grip reports carry a dead owner token too.
                 _ownerToken = 0;
-                _whitelistInstalled = false;
+                _installedTargets = {};
                 _sessions = {};
             }
             if (_sentDrivesLastUpdate && outSentDrives) {
@@ -358,7 +402,7 @@ namespace redux
             }
         }
         _ownerToken = 0;
-        _whitelistInstalled = false;
+        _installedTargets = {};
         _sentDrivesLastUpdate = false;
         _registrationRetryCooldownFrames = 0;
         _registrationWarned = false;
