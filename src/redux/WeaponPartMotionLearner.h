@@ -50,6 +50,15 @@ namespace redux
             std::uint32_t weaponFormId{ 0 };
             std::string_view sourceName{};
             weapon_part_motion_path::PoseSample pose{};
+            /*
+             * Weapon-root-local scale of the node this frame. Paths do not
+             * animate scale, but DRIVES must restate it — modders author
+             * part nodes at non-1 scales, and a drive that omits the real
+             * scale rescales the mesh (in-game 2026-07-04: learned
+             * followers driven at scale 1 made a Glock slide piece and a
+             * hunting-rifle bullet comically giant).
+             */
+            float scale{ 1.0f };
             // False when a provider drive owned the node this frame.
             bool trusted{ true };
         };
@@ -145,6 +154,9 @@ namespace redux
             std::uint32_t weaponFormId{ 0 };
             std::array<char, kMaxSourceName> sourceName{};
             std::uint64_t lastSeenCounter{ 0 };
+            // Last observed weapon-root-local scale of the part; stamped on
+            // learned followers so drives restore the authored mesh scale.
+            float lastScale{ 1.0f };
             // Frame index of buffer[1] (buffer[0] is the pre-motion rest
             // pose); aligns concurrent recordings for co-movement checks.
             std::uint64_t startFrame{ 0 };

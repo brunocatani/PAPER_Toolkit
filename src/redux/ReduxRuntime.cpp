@@ -505,6 +505,7 @@ namespace redux
                 .weaponFormId = weaponFormId,
                 .sourceName = providerFixedStringView(entry.sourceName.data(), entry.sourceName.size()),
                 .pose = pose,
+                .scale = partWeaponLocal.scale,
                 .trusted = !driven,
             });
         }

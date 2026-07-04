@@ -52,6 +52,7 @@ namespace redux
             return;
         }
         recorder->lastSeenCounter = _observationCounter;
+        recorder->lastScale = observation.scale;
 
         const bool wasRecording = recorder->state.phase == weapon_part_motion_path::RecorderPhase::Recording;
         const auto result = weapon_part_motion_path::step(
@@ -412,7 +413,11 @@ namespace redux
             auto& slot = record.followers[record.followerCount];
             slot = {};
             slot.boneName = followerRecorder.sourceName;
-            slot.restScale = 1.0f;
+            // The follower's OBSERVED weapon-local scale, not 1: drives
+            // restate scale, and forcing 1 rescaled modder meshes authored
+            // at non-1 node scales (giant Glock slide piece / hunting-rifle
+            // bullet, in-game 2026-07-04).
+            slot.restScale = followerRecorder.lastScale;
             const auto lastIndex = static_cast<float>(followerRecorder.state.sampleCount - 1);
             for (std::uint32_t key = 0; key < weapon_part_motion_path::kResampledKeyCount; ++key) {
                 const float position = (std::min)(

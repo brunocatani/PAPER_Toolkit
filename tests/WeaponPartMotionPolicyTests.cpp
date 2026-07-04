@@ -349,6 +349,66 @@ int main()
             ok &= expectTrue("larger same-tier authored stroke replaced the stored one",
                 authoredView.leaderPath && std::abs(authoredView.leaderPath->totalArcLength - 6.0f) < 0.01f);
         }
+
+        // Learned co-movement followers must carry the follower's OBSERVED
+        // weapon-local scale: drives restate scale, and a hard-coded 1
+        // rescaled modder meshes authored at non-1 node scales (giant Glock
+        // slide piece / hunting-rifle bullet, in-game 2026-07-04).
+        {
+            constexpr std::uint32_t kWeapon2 = 0x0002BEEF;
+            constexpr const char* kLeader = "WeaponBolt2";
+            constexpr const char* kShell = "WeaponShell2";
+            constexpr float kShellScale = 0.1f;
+
+            PoseSample leaderRest{};
+            leaderRest.translate = Vec3{ 0.0f, 5.0f, 0.0f };
+            PoseSample shellRest{};
+            shellRest.translate = Vec3{ 0.0f, 5.0f, -2.0f };
+
+            auto feedPair = [&](float strokeOffsetY) {
+                learner.beginObservationFrame();
+                PoseSample leaderPose = leaderRest;
+                leaderPose.translate.y += strokeOffsetY;
+                learner.observe(WeaponPartMotionLearner::Observation{
+                    .weaponFormId = kWeapon2,
+                    .sourceName = kLeader,
+                    .pose = leaderPose,
+                    .scale = 1.0f,
+                    .trusted = true,
+                });
+                PoseSample shellPose = shellRest;
+                shellPose.translate.y += strokeOffsetY;
+                learner.observe(WeaponPartMotionLearner::Observation{
+                    .weaponFormId = kWeapon2,
+                    .sourceName = kShell,
+                    .pose = shellPose,
+                    .scale = kShellScale,
+                    .trusted = true,
+                });
+            };
+            for (std::uint32_t i = 0; i <= weapon_part_motion_path::kRestStableFramesToArm; ++i) {
+                feedPair(0.0f);
+            }
+            for (int i = 1; i <= 12; ++i) {
+                feedPair(-0.5f * static_cast<float>(i));
+            }
+            for (int i = 11; i >= 0; --i) {
+                feedPair(-0.5f * static_cast<float>(i));
+            }
+            for (std::uint32_t i = 0; i < weapon_part_motion_path::kRestReturnFramesToComplete + 2; ++i) {
+                feedPair(0.0f);
+            }
+
+            const auto group = learner.findGroup(kWeapon2, kLeader, MotionPathMode::LearnedOnly);
+            ok &= expectTrue("co-moved pair learns a leader group", group.leaderPath != nullptr);
+            ok &= expectTrue("rigid co-mover rides as a learned follower", group.followerCount >= 1);
+            if (group.followerCount >= 1) {
+                ok &= expectTrue("learned follower keeps the co-mover's name",
+                    std::strcmp(group.followers[0].boneName.data(), kShell) == 0);
+                ok &= expectTrue("learned follower carries the OBSERVED scale, not 1",
+                    std::abs(group.followers[0].restScale - kShellScale) < 0.001f);
+            }
+        }
     }
 
     {
