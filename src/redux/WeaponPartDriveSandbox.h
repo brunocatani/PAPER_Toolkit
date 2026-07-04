@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <string_view>
 
+#include "redux/MotionPathMode.h"
 #include "redux/WeaponClipStrokePolicy.h"
 #include "redux/WeaponPartMotionPathPolicy.h"
 
@@ -65,6 +66,10 @@ namespace redux
         {
             std::uint32_t weaponFormId{ 0 };
             std::uint64_t weaponGenerationKey{ 0 };
+            // INI-selected path source. Pinned into each session at grip
+            // start so a hot-reload mode switch never swaps the path under a
+            // hand mid-scrub; it applies to the next grip.
+            MotionPathMode motionPathMode{ MotionPathMode::Hybrid };
             // Indexed [0]=right, [1]=left to match hand-state conventions.
             std::array<HandInput, 2> hands{};
         };
@@ -87,6 +92,8 @@ namespace redux
             std::uint32_t bodyId{ 0x7FFF'FFFFu };
             std::uint64_t weaponGenerationKey{ 0 };
             std::uint32_t weaponFormId{ 0 };
+            // Path source pinned at grip start (see FrameInput).
+            MotionPathMode mode{ MotionPathMode::Hybrid };
             std::array<char, kMaxSourceName> sourceName{};
             float arcPosition{ 0.0f };
             weapon_part_motion_path::Vec3 handStartTranslate{};

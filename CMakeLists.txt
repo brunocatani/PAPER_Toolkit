@@ -173,13 +173,16 @@ option(BUILD_PAPER_REDUX_TESTS "Build PAPER Redux focused regression tests" OFF)
 if(BUILD_PAPER_REDUX_TESTS)
   enable_testing()
 
-  # Pure-policy tests: the motion path / scrub / clip stroke policies are
-  # engine-free by design, so the test binary needs no CommonLib or F4SE.
+  # Pure-policy tests: the motion path / scrub / clip stroke policies and the
+  # learner are engine-free by design, so the test binary needs no CommonLib
+  # or F4SE (the learner's logging compiles out via the test define).
   add_executable(PAPERReduxWeaponPartMotionPolicyTests
     "${ROOT_DIR}/tests/WeaponPartMotionPolicyTests.cpp"
+    "${SOURCE_DIR}/redux/WeaponPartMotionLearner.cpp"
   )
   target_compile_features(PAPERReduxWeaponPartMotionPolicyTests PRIVATE cxx_std_23)
   target_include_directories(PAPERReduxWeaponPartMotionPolicyTests PRIVATE ${SOURCE_DIR})
+  target_compile_definitions(PAPERReduxWeaponPartMotionPolicyTests PRIVATE REDUX_POLICY_TEST_NO_RUNTIME_LOGGER=1)
   add_test(NAME PAPERReduxWeaponPartMotionPolicyTests COMMAND $<TARGET_FILE:PAPERReduxWeaponPartMotionPolicyTests>)
   set_tests_properties(PAPERReduxWeaponPartMotionPolicyTests PROPERTIES LABELS "policy")
 endif()

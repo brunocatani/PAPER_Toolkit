@@ -1,5 +1,6 @@
 #include "redux/ReduxRuntime.h"
 
+#include "ReduxConfig.h"
 #include "ReduxLog.h"
 #include "redux/TransformMath.h"
 #include "redux/WeaponClipMotionHarvest.h"
@@ -1071,6 +1072,7 @@ namespace redux
         WeaponPartDriveSandbox::FrameInput input{};
         input.weaponGenerationKey = generationKey;
         input.weaponFormId = weaponNode && generationKey != 0 ? weaponFormId : 0;
+        input.motionPathMode = g_reduxConfig.motionPathMode;
 
         RE::NiTransform weaponWorldInverse{};
         bool hasWeaponInverse = false;

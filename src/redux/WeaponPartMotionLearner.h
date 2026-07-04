@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <string_view>
 
+#include "redux/MotionPathMode.h"
 #include "redux/WeaponClipStrokePolicy.h"
 #include "redux/WeaponPartMotionPathPolicy.h"
 
@@ -11,15 +12,22 @@ namespace redux
 {
     /*
      * Passive runtime that learns weapon-part motion paths from engine
-     * animation. PhysicsInteraction feeds it one observation per action part
-     * per frame, sampled in weapon-root-local space BEFORE provider drives
-     * apply; observations on frames where a drive owned the node arrive with
-     * trusted=false so the recorder never learns our own authority back.
+     * animation. ReduxRuntime feeds it one observation per evidence part
+     * per frame, sampled in weapon-root-local space; observations on frames
+     * where our drive owned the node arrive with trusted=false so the
+     * recorder never learns our own authority back.
      *
-     * Learned paths are keyed by (weapon form ID, part source name) so they
-     * survive re-equips and weapon switches within the session. Storage is
-     * fixed-capacity with oldest-use eviction; no allocation after
-     * construction and no I/O. Main-thread only (PhysicsInteraction update).
+     * Storage keeps the LEARNED and AUTHORED sources SIDE BY SIDE per
+     * (weapon form ID, part source name) key: collection is unrestricted in
+     * every mode, and the INI-selected MotionPathMode picks the serving
+     * source at lookup time only — so a hot-reload mode switch applies
+     * instantly with whatever both sources have accumulated, and neither
+     * source can destroy the other's data (previously a learned stroke
+     * overwrote the authored record in place, which would starve
+     * authored-only mode the moment learning kicked in).
+     *
+     * Fixed-capacity with oldest-use eviction; no allocation after
+     * construction and no I/O. Main-thread only (ROCK frame callback).
      */
     class WeaponPartMotionLearner
     {
@@ -27,7 +35,7 @@ namespace redux
         static constexpr std::size_t kMaxStoredPaths = 64;
         // One recorder per evidence part — the learner observes EVERY part,
         // unfiltered by grab eligibility, so every mover of a reload records
-        // simultaneously: co-movement grouping (mag pulls its bullets, a
+        // simultaneously: co-movement grouping (a mag pulls its bullets, a
         // slide carries its sights) needs concurrent recordings to compare,
         // and later-phase motions (mag insertion, lever-action feeding) need
         // parts that are still at grab time to be watched too.
@@ -55,13 +63,14 @@ namespace redux
 
         [[nodiscard]] const weapon_part_motion_path::MotionPath* findPath(
             std::uint32_t weaponFormId,
-            std::string_view sourceName) const;
+            std::string_view sourceName,
+            MotionPathMode mode) const;
 
         /*
-         * Full stroke-group view for a part: the leader path plus any
-         * followers — authored (assembly parts the clip moves with it) or
-         * learned (parts observed moving rigidly with the leader during the
-         * same stroke). Learned data outranks authored for the same key.
+         * Full stroke-group view for a part under the given mode: the leader
+         * path plus any followers — authored (assembly parts the clip moves
+         * with it) or learned (parts observed moving rigidly with the leader
+         * during the same stroke). Hybrid serves learned over authored.
          */
         struct GroupView
         {
@@ -69,19 +78,30 @@ namespace redux
             const weapon_clip_stroke::AuthoredFollower* followers{ nullptr };
             std::uint32_t followerCount{ 0 };
             bool authored{ false };
+            // Authored-only: stroke came from a merely-loaded (fallback)
+            // clip rather than one the weapon activated.
+            bool fallbackSource{ false };
         };
-        [[nodiscard]] GroupView findGroup(std::uint32_t weaponFormId, std::string_view sourceName) const;
+        [[nodiscard]] GroupView findGroup(std::uint32_t weaponFormId, std::string_view sourceName, MotionPathMode mode) const;
+
+        // Which sources hold data for a part; for source-selection logging
+        // ("mode=authored but only learned data exists").
+        struct SourceAvailability
+        {
+            bool learned{ false };
+            bool authored{ false };
+            bool authoredFallback{ false };
+        };
+        [[nodiscard]] SourceAvailability sourceAvailability(std::uint32_t weaponFormId, std::string_view sourceName) const;
 
         /*
          * Store a clip-harvested stroke group (already converted to
-         * weapon-root-local and mapped to the evidence source name). Authored
-         * groups only bootstrap parts without learned data. `fallbackSource`
-         * marks strokes from clips merely found LOADED on the graph (shared/
-         * template data): the data must be what THIS weapon actually plays,
-         * so a stroke from a clip the weapon ACTIVATED always beats a
-         * fallback stroke for the same part, and fallback data is used only
-         * when it is all that exists. Within the same tier the largest
-         * leader stroke wins.
+         * weapon-root-local and mapped to the evidence source name) into the
+         * AUTHORED record. `fallbackSource` marks strokes from clips merely
+         * found LOADED on the graph (shared/template data): a stroke from a
+         * clip the weapon ACTIVATED always beats a fallback stroke for the
+         * same part, and fallback data is used only when it is all that
+         * exists. Within the same tier the largest leader stroke wins.
          */
         void storeAuthoredGroup(
             std::uint32_t weaponFormId,
@@ -92,19 +112,26 @@ namespace redux
         void reset();
 
     private:
-        struct PathSlot
+        // One source's stroke for a part: leader path plus followers.
+        struct PathRecord
         {
             bool used{ false };
-            bool authored{ false };
             // Authored-only: stroke from a merely-loaded (fallback) clip;
             // outranked by the weapon's own activated-clip strokes.
             bool fallbackSource{ false };
-            std::uint32_t weaponFormId{ 0 };
-            std::array<char, kMaxSourceName> sourceName{};
-            std::uint64_t lastUseCounter{ 0 };
             weapon_part_motion_path::MotionPath path{};
             std::uint32_t followerCount{ 0 };
             std::array<weapon_clip_stroke::AuthoredFollower, weapon_clip_stroke::kMaxFollowers> followers{};
+        };
+
+        struct PathSlot
+        {
+            bool used{ false };
+            std::uint32_t weaponFormId{ 0 };
+            std::array<char, kMaxSourceName> sourceName{};
+            std::uint64_t lastUseCounter{ 0 };
+            PathRecord learned{};
+            PathRecord authored{};
         };
 
         struct RecorderSlot
@@ -120,6 +147,11 @@ namespace redux
             std::array<weapon_part_motion_path::PoseSample, weapon_part_motion_path::kMaxRecordingSamples> buffer{};
         };
 
+        [[nodiscard]] static const PathRecord* selectRecord(const PathSlot& slot, MotionPathMode mode);
+        [[nodiscard]] const PathSlot* findSlot(std::uint32_t weaponFormId, std::string_view sourceName) const;
+        // preferSlotsWithoutLearnedData: authored stores must not evict a
+        // slot holding a learned stroke while a purely-authored slot exists.
+        PathSlot* findOrClaimSlot(std::uint32_t weaponFormId, std::string_view sourceName, bool preferSlotsWithoutLearnedData);
         RecorderSlot* acquireRecorderSlot(std::uint32_t weaponFormId, std::string_view sourceName);
         void storeCompletedPath(const RecorderSlot& recorder);
 

@@ -1,4 +1,5 @@
 #include "redux/WeaponClipStrokePolicy.h"
+#include "redux/WeaponPartMotionLearner.h"
 #include "redux/WeaponPartMotionPathPolicy.h"
 #include "redux/WeaponPartMotionScrubPolicy.h"
 
@@ -230,6 +231,122 @@ int main()
             const auto midPose = followerPoseAtKeyPosition(follower, keyPosition);
             ok &= expectTrue("follower tracks leader progress at mid-stroke",
                 std::abs(midPose.translate.y - 2.5f) < 0.25f);
+        }
+    }
+
+    {
+        // Dual-source storage + mode selection: authored and learned records
+        // must coexist per part, with the MotionPathMode picking the serving
+        // source at lookup time only.
+        using namespace redux;
+        using redux::weapon_part_motion_path::PoseSample;
+        using redux::weapon_part_motion_path::Vec3;
+
+        constexpr std::uint32_t kWeapon = 0x0001ABCD;
+        constexpr const char* kPart = "WeaponBolt";
+        // ~2MB of recorder/path storage — far too large for the stack.
+        static WeaponPartMotionLearner learner{};
+
+        // Authored fallback stroke first (loaded shared clip).
+        weapon_clip_stroke::AuthoredStrokeGroup fallbackGroup{};
+        std::memcpy(fallbackGroup.leaderBoneName.data(), kPart, std::strlen(kPart));
+        for (std::uint32_t key = 0; key < weapon_part_motion_path::kResampledKeyCount; ++key) {
+            fallbackGroup.leaderPath.keys[key].translate.y =
+                4.0f * static_cast<float>(key) / static_cast<float>(weapon_part_motion_path::kResampledKeyCount - 1);
+        }
+        fallbackGroup.leaderPath.totalArcLength = 4.0f;
+        fallbackGroup.leaderPath.valid = true;
+        learner.storeAuthoredGroup(kWeapon, kPart, fallbackGroup, true);
+
+        ok &= expectTrue("authored-only serves the fallback stroke",
+            learner.findPath(kWeapon, kPart, MotionPathMode::AuthoredOnly) != nullptr);
+        ok &= expectTrue("hybrid serves authored while nothing is learned",
+            learner.findGroup(kWeapon, kPart, MotionPathMode::Hybrid).authored);
+        ok &= expectTrue("hybrid reports the fallback tier",
+            learner.findGroup(kWeapon, kPart, MotionPathMode::Hybrid).fallbackSource);
+        ok &= expectTrue("learned-only has nothing before learning",
+            learner.findPath(kWeapon, kPart, MotionPathMode::LearnedOnly) == nullptr);
+
+        // Activated-clip stroke outranks the fallback even when shorter...
+        weapon_clip_stroke::AuthoredStrokeGroup activatedGroup = fallbackGroup;
+        for (std::uint32_t key = 0; key < weapon_part_motion_path::kResampledKeyCount; ++key) {
+            activatedGroup.leaderPath.keys[key].translate.y *= 0.75f;
+        }
+        activatedGroup.leaderPath.totalArcLength = 3.0f;
+        activatedGroup.activatedClip = true;
+        learner.storeAuthoredGroup(kWeapon, kPart, activatedGroup, false);
+        {
+            const auto view = learner.findGroup(kWeapon, kPart, MotionPathMode::AuthoredOnly);
+            ok &= expectTrue("activated stroke replaces the fallback tier", view.leaderPath && !view.fallbackSource);
+            ok &= expectTrue("activated stroke arc stored",
+                view.leaderPath && std::abs(view.leaderPath->totalArcLength - 3.0f) < 0.01f);
+        }
+        // ...and a later fallback store never demotes it.
+        learner.storeAuthoredGroup(kWeapon, kPart, fallbackGroup, true);
+        ok &= expectFalse("fallback store cannot demote an activated stroke",
+            learner.findGroup(kWeapon, kPart, MotionPathMode::AuthoredOnly).fallbackSource);
+
+        // Teach a learned stroke through real observations.
+        PoseSample rest{};
+        rest.translate = Vec3{ 0.0f, 10.0f, 0.0f };
+        auto feed = [&](const PoseSample& pose) {
+            learner.beginObservationFrame();
+            learner.observe(WeaponPartMotionLearner::Observation{
+                .weaponFormId = kWeapon,
+                .sourceName = kPart,
+                .pose = pose,
+                .trusted = true,
+            });
+        };
+        for (std::uint32_t i = 0; i <= weapon_part_motion_path::kRestStableFramesToArm; ++i) {
+            feed(rest);
+        }
+        for (int i = 1; i <= 12; ++i) {
+            PoseSample moving = rest;
+            moving.translate.y = rest.translate.y - 0.5f * static_cast<float>(i);
+            feed(moving);
+        }
+        for (int i = 11; i >= 0; --i) {
+            PoseSample returning = rest;
+            returning.translate.y = rest.translate.y - 0.5f * static_cast<float>(i);
+            feed(returning);
+        }
+        for (std::uint32_t i = 0; i < weapon_part_motion_path::kRestReturnFramesToComplete + 2; ++i) {
+            feed(rest);
+        }
+
+        const auto* learnedPath = learner.findPath(kWeapon, kPart, MotionPathMode::LearnedOnly);
+        ok &= expectTrue("observed stroke lands in the learned record", learnedPath != nullptr);
+        ok &= expectTrue("learned stroke arc covers the observed pull",
+            learnedPath && learnedPath->totalArcLength > 5.5f && learnedPath->totalArcLength < 6.5f);
+
+        // The regression this redesign prevents: learning must NOT destroy
+        // the authored record, and each mode serves its own source.
+        {
+            const auto authoredView = learner.findGroup(kWeapon, kPart, MotionPathMode::AuthoredOnly);
+            ok &= expectTrue("authored record survives learning", authoredView.leaderPath != nullptr);
+            ok &= expectTrue("authored-only still serves the authored stroke",
+                authoredView.leaderPath && std::abs(authoredView.leaderPath->totalArcLength - 3.0f) < 0.01f);
+            const auto hybridView = learner.findGroup(kWeapon, kPart, MotionPathMode::Hybrid);
+            ok &= expectTrue("hybrid now serves the learned stroke", hybridView.leaderPath && !hybridView.authored);
+            const auto availability = learner.sourceAvailability(kWeapon, kPart);
+            ok &= expectTrue("availability reports both sources", availability.learned && availability.authored);
+        }
+
+        // And the reverse: a fresh authored store must not touch the learned
+        // record.
+        weapon_clip_stroke::AuthoredStrokeGroup biggerActivated = activatedGroup;
+        for (std::uint32_t key = 0; key < weapon_part_motion_path::kResampledKeyCount; ++key) {
+            biggerActivated.leaderPath.keys[key].translate.y *= 2.0f;
+        }
+        biggerActivated.leaderPath.totalArcLength = 6.0f;
+        learner.storeAuthoredGroup(kWeapon, kPart, biggerActivated, false);
+        ok &= expectTrue("learned record survives an authored update",
+            learner.findPath(kWeapon, kPart, MotionPathMode::LearnedOnly) != nullptr);
+        {
+            const auto authoredView = learner.findGroup(kWeapon, kPart, MotionPathMode::AuthoredOnly);
+            ok &= expectTrue("larger same-tier authored stroke replaced the stored one",
+                authoredView.leaderPath && std::abs(authoredView.leaderPath->totalArcLength - 6.0f) < 0.01f);
         }
     }
 

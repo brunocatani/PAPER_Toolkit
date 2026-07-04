@@ -182,14 +182,22 @@ namespace redux
                 if (!hand.transformsValid || hand.sourceName.empty()) {
                     continue;
                 }
-                const auto group = learner.findGroup(input.weaponFormId, hand.sourceName);
+                const auto group = learner.findGroup(input.weaponFormId, hand.sourceName, input.motionPathMode);
                 if (!group.leaderPath) {
                     if (_lastNoPathGripSequence[handIndex] != hand.gripSequence) {
                         _lastNoPathGripSequence[handIndex] = hand.gripSequence;
+                        // Say what DOES exist so a mode mismatch is readable
+                        // straight from the log ("authored data present but
+                        // mode=learned").
+                        const auto available = learner.sourceAvailability(input.weaponFormId, hand.sourceName);
                         RDX_LOG_INFO(Weapon,
-                            "WeaponPartDriveSandbox: no motion path yet for part '{}' on weapon {:08X} — no authored clip stroke harvested and no runtime sample learned",
+                            "WeaponPartDriveSandbox: no motion path for part '{}' on weapon {:08X} under mode={} (available: learned={} authored={}{})",
                             hand.sourceName,
-                            input.weaponFormId);
+                            input.weaponFormId,
+                            motionPathModeName(input.motionPathMode),
+                            available.learned,
+                            available.authored,
+                            available.authoredFallback ? " [fallback-tier]" : "");
                     }
                     continue;
                 }
@@ -202,6 +210,7 @@ namespace redux
                 session.bodyId = hand.bodyId;
                 session.weaponGenerationKey = input.weaponGenerationKey;
                 session.weaponFormId = input.weaponFormId;
+                session.mode = input.motionPathMode;
                 session.sourceName = {};
                 std::memcpy(session.sourceName.data(), hand.sourceName.data(), (std::min)(hand.sourceName.size(), session.sourceName.size() - 1));
                 session.arcPosition = seeded.arcPosition;
@@ -218,19 +227,22 @@ namespace redux
                     }
                 }
                 RDX_LOG_INFO(Weapon,
-                    "WeaponPartDriveSandbox: scrub session started hand={} part='{}' arc={:.2f}/{:.2f} source={} followers={}",
+                    "WeaponPartDriveSandbox: scrub session started hand={} part='{}' arc={:.2f}/{:.2f} mode={} source={} followers={}",
                     handIndex == 1 ? "left" : "right",
                     hand.sourceName,
                     seeded.arcPosition,
                     group.leaderPath->totalArcLength,
-                    group.authored ? "authored-clip" : "runtime-learned",
+                    motionPathModeName(session.mode),
+                    !group.authored ? "runtime-learned" : (group.fallbackSource ? "authored-fallback" : "authored-clip"),
                     session.followerCount);
             }
 
             if (!session.active || !hand.transformsValid) {
                 continue;
             }
-            const auto* path = learner.findPath(session.weaponFormId, sessionName(session.sourceName));
+            // Session-pinned mode: a hot-reload switch never swaps the path
+            // under a hand mid-scrub.
+            const auto* path = learner.findPath(session.weaponFormId, sessionName(session.sourceName), session.mode);
             if (!path) {
                 endSession(session);
                 continue;

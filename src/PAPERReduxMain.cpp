@@ -29,6 +29,10 @@ namespace
         if (!snapshot) {
             return;
         }
+        // Hot reload applies on the frame thread, before this frame's gates
+        // read the config (a mode switch reaches new grips the same frame,
+        // an enable toggle tears down / revives the runtime right here).
+        (void)g_reduxConfig.processPendingReload();
         if (!g_reduxConfig.enabled) {
             if (s_runtimeWasEnabled) {
                 s_runtime.shutdown();

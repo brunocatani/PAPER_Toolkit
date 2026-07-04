@@ -69,35 +69,129 @@ namespace redux
         }
     }
 
-    const weapon_part_motion_path::MotionPath* WeaponPartMotionLearner::findPath(
+    const WeaponPartMotionLearner::PathRecord* WeaponPartMotionLearner::selectRecord(
+        const PathSlot& slot,
+        MotionPathMode mode)
+    {
+        switch (mode) {
+        case MotionPathMode::AuthoredOnly:
+            return slot.authored.used ? &slot.authored : nullptr;
+        case MotionPathMode::LearnedOnly:
+            return slot.learned.used ? &slot.learned : nullptr;
+        case MotionPathMode::Hybrid:
+        default:
+            // Learner priority (Bruno, 2026-07-04): a real observed stroke
+            // outranks authored clip data; authored fills the gap until the
+            // part is taught.
+            if (slot.learned.used) {
+                return &slot.learned;
+            }
+            return slot.authored.used ? &slot.authored : nullptr;
+        }
+    }
+
+    const WeaponPartMotionLearner::PathSlot* WeaponPartMotionLearner::findSlot(
         std::uint32_t weaponFormId,
         std::string_view sourceName) const
     {
         for (const auto& slot : _paths) {
             if (slot.used && slotMatches(slot.weaponFormId, slot.sourceName, weaponFormId, sourceName)) {
-                // lastUseCounter is an eviction hint, not behavior; keeping
-                // this accessor const outweighs refreshing it on reads.
-                return &slot.path;
+                return &slot;
             }
         }
         return nullptr;
     }
 
+    const weapon_part_motion_path::MotionPath* WeaponPartMotionLearner::findPath(
+        std::uint32_t weaponFormId,
+        std::string_view sourceName,
+        MotionPathMode mode) const
+    {
+        // lastUseCounter is an eviction hint, not behavior; keeping this
+        // accessor const outweighs refreshing it on reads.
+        const auto* slot = findSlot(weaponFormId, sourceName);
+        const auto* record = slot ? selectRecord(*slot, mode) : nullptr;
+        return record ? &record->path : nullptr;
+    }
+
     WeaponPartMotionLearner::GroupView WeaponPartMotionLearner::findGroup(
+        std::uint32_t weaponFormId,
+        std::string_view sourceName,
+        MotionPathMode mode) const
+    {
+        const auto* slot = findSlot(weaponFormId, sourceName);
+        const auto* record = slot ? selectRecord(*slot, mode) : nullptr;
+        if (!record) {
+            return {};
+        }
+        return GroupView{
+            .leaderPath = &record->path,
+            .followers = record->followers.data(),
+            .followerCount = record->followerCount,
+            .authored = record == &slot->authored,
+            .fallbackSource = record == &slot->authored && record->fallbackSource,
+        };
+    }
+
+    WeaponPartMotionLearner::SourceAvailability WeaponPartMotionLearner::sourceAvailability(
         std::uint32_t weaponFormId,
         std::string_view sourceName) const
     {
-        for (const auto& slot : _paths) {
+        const auto* slot = findSlot(weaponFormId, sourceName);
+        if (!slot) {
+            return {};
+        }
+        return SourceAvailability{
+            .learned = slot->learned.used,
+            .authored = slot->authored.used,
+            .authoredFallback = slot->authored.used && slot->authored.fallbackSource,
+        };
+    }
+
+    WeaponPartMotionLearner::PathSlot* WeaponPartMotionLearner::findOrClaimSlot(
+        std::uint32_t weaponFormId,
+        std::string_view sourceName,
+        bool preferSlotsWithoutLearnedData)
+    {
+        PathSlot* freeSlot = nullptr;
+        PathSlot* preferredEviction = nullptr;
+        PathSlot* anyEviction = nullptr;
+        for (auto& slot : _paths) {
             if (slot.used && slotMatches(slot.weaponFormId, slot.sourceName, weaponFormId, sourceName)) {
-                return GroupView{
-                    .leaderPath = &slot.path,
-                    .followers = slot.followers.data(),
-                    .followerCount = slot.followerCount,
-                    .authored = slot.authored,
-                };
+                return &slot;
+            }
+            if (!slot.used) {
+                freeSlot = freeSlot ? freeSlot : &slot;
+                continue;
+            }
+            if (!anyEviction || slot.lastUseCounter < anyEviction->lastUseCounter) {
+                anyEviction = &slot;
+            }
+            if (preferSlotsWithoutLearnedData && slot.learned.used) {
+                continue;
+            }
+            if (!preferredEviction || slot.lastUseCounter < preferredEviction->lastUseCounter) {
+                preferredEviction = &slot;
             }
         }
-        return {};
+
+        auto* claimed = freeSlot ? freeSlot : (preferredEviction ? preferredEviction : anyEviction);
+        if (!claimed) {
+            return nullptr;
+        }
+        if (claimed->used) {
+            RDX_LOG_DEBUG(Weapon,
+                "WeaponPartMotionLearner: evicting path slot for part '{}' on weapon {:08X} (learned={} authored={})",
+                slotName(claimed->sourceName),
+                claimed->weaponFormId,
+                claimed->learned.used,
+                claimed->authored.used);
+        }
+        *claimed = {};
+        claimed->used = true;
+        claimed->weaponFormId = weaponFormId;
+        copySlotName(claimed->sourceName, sourceName);
+        return claimed;
     }
 
     void WeaponPartMotionLearner::storeAuthoredGroup(
@@ -111,62 +205,34 @@ namespace redux
         }
         ++_observationCounter;
 
-        PathSlot* target = nullptr;
-        for (auto& slot : _paths) {
-            if (slot.used && slotMatches(slot.weaponFormId, slot.sourceName, weaponFormId, sourceName)) {
-                target = &slot;
-                break;
-            }
+        auto* target = findOrClaimSlot(weaponFormId, sourceName, true);
+        if (!target) {
+            return;
         }
-        if (target) {
-            // LEARNER PRIORITY (Bruno, 2026-07-04): once a part has a real
-            // observed stroke, authored clip data never overwrites it — the
-            // authored path only bootstraps parts the player has not taught
-            // yet.
-            if (!target->authored) {
-                return;
-            }
+        auto& record = target->authored;
+        if (record.used) {
             // SOURCE TIER (Bruno, 2026-07-04): the data must be what THIS
             // weapon actually plays — a stroke from a clip the weapon
             // ACTIVATED always beats a merely-loaded fallback stroke for the
             // same part; fallback data only stands while nothing else
             // exists. Within the same tier the largest leader stroke wins
             // (a reload stroke beats a fire nudge).
-            if (target->fallbackSource != fallbackSource) {
+            if (record.fallbackSource != fallbackSource) {
                 if (fallbackSource) {
                     return;
                 }
-            } else if (!weapon_part_motion_path::shouldReplacePath(target->path, group.leaderPath)) {
+            } else if (!weapon_part_motion_path::shouldReplacePath(record.path, group.leaderPath)) {
                 return;
             }
-        } else {
-            for (auto& slot : _paths) {
-                if (!slot.used) {
-                    target = &slot;
-                    break;
-                }
-                // Authored data never evicts a learned stroke; among
-                // eviction candidates take the stalest authored slot, else
-                // drop this store.
-                if (slot.authored && (!target || slot.lastUseCounter < target->lastUseCounter)) {
-                    target = &slot;
-                }
-            }
-        }
-        if (!target) {
-            return;
         }
 
-        const bool replaced = target->used;
-        target->used = true;
-        target->authored = true;
-        target->fallbackSource = fallbackSource;
-        target->weaponFormId = weaponFormId;
-        copySlotName(target->sourceName, sourceName);
+        const bool replaced = record.used;
+        record.used = true;
+        record.fallbackSource = fallbackSource;
+        record.path = group.leaderPath;
+        record.followerCount = (std::min)(group.followerCount, static_cast<std::uint32_t>(record.followers.size()));
+        record.followers = group.followers;
         target->lastUseCounter = _observationCounter;
-        target->path = group.leaderPath;
-        target->followerCount = (std::min)(group.followerCount, static_cast<std::uint32_t>(target->followers.size()));
-        target->followers = group.followers;
 
         // Path endpoints in the stored frame: comparing these against the
         // learner's endpoints for the same part exposes any frame mismatch
@@ -174,13 +240,14 @@ namespace redux
         const auto& firstKey = group.leaderPath.keys.front();
         const auto& lastKey = group.leaderPath.keys.back();
         RDX_LOG_INFO(Weapon,
-            "WeaponPartMotionLearner: {} AUTHORED [{}] stroke group for part '{}' on weapon {:08X} (leader arc {:.2f} game units, {} followers) start=({:.2f},{:.2f},{:.2f}) end=({:.2f},{:.2f},{:.2f})",
+            "WeaponPartMotionLearner: {} AUTHORED [{}] stroke group for part '{}' on weapon {:08X} (leader arc {:.2f} game units, {} followers, learned record {}) start=({:.2f},{:.2f},{:.2f}) end=({:.2f},{:.2f},{:.2f})",
             replaced ? "updated" : "stored",
             fallbackSource ? "fallback-loaded" : "weapon-clip",
             sourceName,
             weaponFormId,
             group.leaderPath.totalArcLength,
-            target->followerCount,
+            record.followerCount,
+            target->learned.used ? "also present" : "absent",
             firstKey.translate.x,
             firstKey.translate.y,
             firstKey.translate.z,
@@ -302,57 +369,32 @@ namespace redux
             followerCandidates[followerCandidateCount++] = FollowerCandidate{ &other, offset };
         }
 
-        PathSlot* target = nullptr;
-        for (auto& slot : _paths) {
-            if (slot.used && slotMatches(slot.weaponFormId, slot.sourceName, recorder.weaponFormId, slotName(recorder.sourceName))) {
-                target = &slot;
-                break;
-            }
-        }
-        if (target) {
-            // LEARNER PRIORITY (Bruno, 2026-07-04): a real observed stroke
-            // replaces authored clip data for its part unconditionally — the
-            // learner is the trusted ground truth; authored fills the gap
-            // until the part is taught. Between learned strokes the larger
-            // stroke still wins.
-            if (!target->authored && !weapon_part_motion_path::shouldReplacePath(target->path, candidate)) {
-                return;
-            }
-        } else {
-            for (auto& slot : _paths) {
-                if (!slot.used) {
-                    target = &slot;
-                    break;
-                }
-                // Prefer evicting stale non-authored slots, but an observed
-                // stroke may take an authored slot when nothing else is free.
-                if (!target || (target->authored && !slot.authored) ||
-                    (target->authored == slot.authored && slot.lastUseCounter < target->lastUseCounter)) {
-                    target = &slot;
-                }
-            }
-        }
+        auto* target = findOrClaimSlot(recorder.weaponFormId, slotName(recorder.sourceName), false);
         if (!target) {
             return;
         }
+        auto& record = target->learned;
+        // Between learned strokes the larger stroke wins; the authored
+        // record is untouched either way (dual storage — see header).
+        if (record.used && !weapon_part_motion_path::shouldReplacePath(record.path, candidate)) {
+            return;
+        }
 
-        const bool replaced = target->used;
-        target->used = true;
-        target->authored = false;
-        target->weaponFormId = recorder.weaponFormId;
-        target->sourceName = recorder.sourceName;
+        const bool replaced = record.used;
+        record.used = true;
+        record.fallbackSource = false;
+        record.path = candidate;
         target->lastUseCounter = _observationCounter;
-        target->path = candidate;
 
         // Followers: the rigid co-movers, resampled at the leader's key
         // positions (frame-aligned) so they replay time-locked to the stroke.
-        target->followerCount = 0;
+        record.followerCount = 0;
         for (std::uint32_t c = 0; c < followerCandidateCount &&
-             target->followerCount < static_cast<std::uint32_t>(target->followers.size());
+             record.followerCount < static_cast<std::uint32_t>(record.followers.size());
              ++c) {
             const auto& followerRecorder = *followerCandidates[c].recorder;
             const auto offset = followerCandidates[c].frameOffset;
-            auto& slot = target->followers[target->followerCount];
+            auto& slot = record.followers[record.followerCount];
             slot = {};
             slot.boneName = followerRecorder.sourceName;
             slot.restScale = 1.0f;
@@ -369,7 +411,7 @@ namespace redux
                     followerRecorder.buffer[next],
                     t);
             }
-            ++target->followerCount;
+            ++record.followerCount;
         }
 
         // Once per completed stroke, never per frame. Path endpoints in the
@@ -378,14 +420,15 @@ namespace redux
         const auto& firstKey = candidate.keys.front();
         const auto& lastKey = candidate.keys.back();
         RDX_LOG_INFO(Weapon,
-            "WeaponPartMotionLearner: {} motion path for part '{}' on weapon {:08X} (stroke arc {:.2f} game units, {} keys, {} raw samples, {} co-moving followers) start=({:.2f},{:.2f},{:.2f}) end=({:.2f},{:.2f},{:.2f})",
+            "WeaponPartMotionLearner: {} LEARNED motion path for part '{}' on weapon {:08X} (stroke arc {:.2f} game units, {} keys, {} raw samples, {} co-moving followers, authored record {}) start=({:.2f},{:.2f},{:.2f}) end=({:.2f},{:.2f},{:.2f})",
             replaced ? "updated" : "learned",
             slotName(recorder.sourceName),
             recorder.weaponFormId,
             candidate.totalArcLength,
             weapon_part_motion_path::kResampledKeyCount,
             recorder.state.sampleCount,
-            target->followerCount,
+            record.followerCount,
+            target->authored.used ? "also present" : "absent",
             firstKey.translate.x,
             firstKey.translate.y,
             firstKey.translate.z,
