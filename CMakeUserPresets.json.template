@@ -1,0 +1,40 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "custom",
+      "cacheVariables": {
+        "POST_BUILD_COPY_PLUGIN": false,
+        "F4VR_COMMON_FRAMEWORK_PATH": "F:/fo4dev/PROJECT_ROCK_V2/libraries_and_tools/F4VR-CommonFramework",
+        "COMMON_LIB_F4VR_PATH": "F:/fo4dev/PROJECT_ROCK_V2/libraries_and_tools/CommonLibF4VR"
+      },
+      "inherits": ["cmake-dev", "vcpkg", "windows", "vs2022"]
+    },
+    {
+      "name": "custom-fast",
+      "cacheVariables": {
+        "POST_BUILD_COPY_PLUGIN": true,
+        "COPY_PLUGIN_BASE_PATH": "D:/FO4/mods/PAPER _Redux",
+        "F4VR_COMMON_FRAMEWORK_PATH": "F:/fo4dev/PROJECT_ROCK_V2/libraries_and_tools/F4VR-CommonFramework",
+        "COMMON_LIB_F4VR_PATH": "F:/fo4dev/PROJECT_ROCK_V2/libraries_and_tools/CommonLibF4VR"
+      },
+      "inherits": "fast"
+    },
+    {
+      "name": "custom-tests",
+      "cacheVariables": {
+        "F4VR_COMMON_FRAMEWORK_PATH": "F:/fo4dev/PROJECT_ROCK_V2/libraries_and_tools/F4VR-CommonFramework",
+        "COMMON_LIB_F4VR_PATH": "F:/fo4dev/PROJECT_ROCK_V2/libraries_and_tools/CommonLibF4VR"
+      },
+      "inherits": "tests"
+    },
+    {
+      "name": "custom-release",
+      "cacheVariables": {
+        "F4VR_COMMON_FRAMEWORK_PATH": "F:/fo4dev/PROJECT_ROCK_V2/libraries_and_tools/F4VR-CommonFramework",
+        "COMMON_LIB_F4VR_PATH": "F:/fo4dev/PROJECT_ROCK_V2/libraries_and_tools/CommonLibF4VR"
+      },
+      "inherits": "release"
+    }
+  ]
+}

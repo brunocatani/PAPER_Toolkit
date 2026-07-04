@@ -1,0 +1,29 @@
+# Build outputs and IDE state
+.vscode
+.vs/
+build*
+x64/
+[Bb]in/
+[Oo]bj/
+ipch/
+*.aps
+*.VC.db
+*.VC.VC.opendb
+*.user
+*.suo
+
+# Machine-local presets (CMakeUserPresets.json.template is the committed reference)
+CMakeUserPresets.json
+
+*opencode.json
+
+# Python tooling caches
+__pycache__/
+*.pyc
+
+# Local notes stay machine-local
+/docs/
+/analysis/
+
+*.zip
+*.7z
