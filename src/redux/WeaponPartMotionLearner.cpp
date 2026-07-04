@@ -259,8 +259,20 @@ namespace redux
 
     void WeaponPartMotionLearner::reset()
     {
-        _paths = {};
-        _recorders = {};
+        /*
+         * Slot-by-slot on purpose: `_paths = {}` / `_recorders = {}`
+         * materialize full temporary ARRAYS on the stack (~1MB each with
+         * dual-record slots), and both temporaries share one frame — this
+         * overflowed the game main thread's stack in the load-game reset
+         * (in-game 2026-07-04, EXCEPTION_STACK_OVERFLOW in __chkstk).
+         * Per-slot temporaries keep the frame at one slot (~20KB).
+         */
+        for (auto& slot : _paths) {
+            slot = {};
+        }
+        for (auto& slot : _recorders) {
+            slot = {};
+        }
         _observationCounter = 0;
         ++_revision;
     }
