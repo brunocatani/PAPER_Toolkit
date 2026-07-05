@@ -206,6 +206,30 @@ namespace redux::weapon_clip_motion_harvest
         constexpr std::uintptr_t kTriggerStride = 0x20;
         constexpr std::uintptr_t kTriggerLocalTimeOffset = 0x0;
         constexpr std::uintptr_t kTriggerEventIdOffset = 0x8;
+        /*
+         * eventId -> name chain, raw-disassembly verified 2026-07-05 (two
+         * agreeing sources per hop; see docs/research 2026-07-05 note):
+         *  - hkbContext+0x10 = hkbBehaviorGraph* (the engine's own trigger
+         *    walker 0x14192f160 reads [ctx+0x10]+0xC8 and indexes its
+         *    +0x40/+0x48 arrays with the trigger eventId = exactly
+         *    hkbBehaviorGraphData::eventInfos); gated by an exact vtable
+         *    match, so a context-layout surprise degrades into "no name".
+         *  - graph+0xC8 = m_data (finish-ctor 0x1417c3c80 preserves it as a
+         *    serialized ref between pseudoRandomGenerator +0xB8, seed 0x529,
+         *    and the reset runtime template +0xD0).
+         *  - data+0x68 = m_stringData (two static hkClassMember arrays,
+         *    0x142e26f50 / 0x142e27040-4*0x28, registration objectSize 0x70).
+         *  - stringData+0x10/+0x18 = m_eventNames hkArray<hkStringPtr>
+         *    (reflection record 0x142e41000 + ctor 0x141937eb0).
+         * eventIds are GRAPH-LOCAL indices into this array.
+         */
+        constexpr std::uintptr_t kContextBehaviorGraphOffset = 0x10;
+        constexpr std::uintptr_t kBehaviorGraphVtableModuleOffset = 0x2E04848;
+        constexpr std::uintptr_t kBehaviorGraphDataOffset = 0xC8;
+        constexpr std::uintptr_t kGraphDataStringDataOffset = 0x68;
+        constexpr std::uintptr_t kStringDataEventNamesDataOffset = 0x10;
+        constexpr std::uintptr_t kStringDataEventNamesCountOffset = 0x18;
+        constexpr std::int32_t kMaxPlausibleEventNames = 4096;
         constexpr std::int32_t kMaxPlausibleAnnotationTracks = 64;
         constexpr std::int32_t kMaxPlausibleAnnotations = 256;
         constexpr std::int32_t kMaxPlausibleTriggers = 128;
@@ -509,6 +533,63 @@ namespace redux::weapon_clip_motion_harvest
         }
 
         /*
+         * Resolves a graph-local trigger eventId to its authored name via
+         * graph->m_data->m_stringData->m_eventNames[id]. Every hop fails
+         * closed into "no name"; the caller already vtable-gated the graph.
+         */
+        [[nodiscard]] std::int32_t behaviorGraphEventNameCount(std::uintptr_t behaviorGraph)
+        {
+            if (behaviorGraph == 0) {
+                return -1;
+            }
+            const auto data = *reinterpret_cast<std::uintptr_t*>(behaviorGraph + kBehaviorGraphDataOffset);
+            if (!plausiblePointer(data)) {
+                return -1;
+            }
+            const auto stringData = *reinterpret_cast<std::uintptr_t*>(data + kGraphDataStringDataOffset);
+            if (!plausiblePointer(stringData)) {
+                return -1;
+            }
+            const auto count =
+                *reinterpret_cast<std::int32_t*>(stringData + kStringDataEventNamesCountOffset);
+            return (count >= 0 && count <= kMaxPlausibleEventNames) ? count : -1;
+        }
+
+        bool resolveGraphEventName(
+            std::uintptr_t behaviorGraph,
+            std::int32_t eventId,
+            char* out,
+            std::size_t capacity)
+        {
+            out[0] = '\0';
+            if (behaviorGraph == 0 || eventId < 0) {
+                return false;
+            }
+            const auto data = *reinterpret_cast<std::uintptr_t*>(behaviorGraph + kBehaviorGraphDataOffset);
+            if (!plausiblePointer(data)) {
+                return false;
+            }
+            const auto stringData = *reinterpret_cast<std::uintptr_t*>(data + kGraphDataStringDataOffset);
+            if (!plausiblePointer(stringData)) {
+                return false;
+            }
+            const auto count =
+                *reinterpret_cast<std::int32_t*>(stringData + kStringDataEventNamesCountOffset);
+            if (count <= 0 || count > kMaxPlausibleEventNames || eventId >= count) {
+                return false;
+            }
+            const auto names =
+                *reinterpret_cast<std::uintptr_t*>(stringData + kStringDataEventNamesDataOffset);
+            if (!plausiblePointer(names)) {
+                return false;
+            }
+            return copyHkStringPtr(
+                       *reinterpret_cast<std::uintptr_t*>(names + static_cast<std::uintptr_t>(eventId) * 8),
+                       out,
+                       capacity) > 0;
+        }
+
+        /*
          * STAGE-MARKER DUMP (phase 4, Bruno 2026-07-05): the engine's own
          * named animation stage data, log-only for now — the data source
          * for future named-stage segmentation. Two kinds:
@@ -526,7 +607,11 @@ namespace redux::weapon_clip_motion_harvest
          * the processed-binding registry and hard-capped by
          * s_stageMarkerLogBudget per weapon generation.
          */
-        void dumpClipStageMarkers(std::uintptr_t clipGenerator, std::uintptr_t binding, const char* clipName)
+        void dumpClipStageMarkers(
+            std::uintptr_t clipGenerator,
+            std::uintptr_t binding,
+            const char* clipName,
+            std::uintptr_t behaviorGraph)
         {
             if (s_stageMarkerLogBudget == 0) {
                 return;
@@ -620,12 +705,15 @@ namespace redux::weapon_clip_motion_harvest
                         ++triggerLines;
                         if (s_stageMarkerLogBudget > 1) {
                             --s_stageMarkerLogBudget;
+                            char eventName[96];
+                            resolveGraphEventName(behaviorGraph, eventId, eventName, sizeof(eventName));
                             RDX_LOG_INFO(Weapon,
-                                "STAGE-MARKER [trigger] clip='{}' t={:.3f}/{:.3f}s eventId={}",
+                                "STAGE-MARKER [trigger] clip='{}' t={:.3f}/{:.3f}s eventId={} name='{}'",
                                 clipName,
                                 localTime,
                                 duration,
-                                eventId);
+                                eventId,
+                                eventName);
                         }
                     }
                 }
@@ -640,14 +728,15 @@ namespace redux::weapon_clip_motion_harvest
              */
             --s_stageMarkerLogBudget;
             RDX_LOG_INFO(Weapon,
-                "STAGE-MARKER summary clip='{}' duration={:.2f}s annotationTracksRaw={} annotationsLogged={} triggersObject={} triggersRaw={} triggersLogged={}",
+                "STAGE-MARKER summary clip='{}' duration={:.2f}s annotationTracksRaw={} annotationsLogged={} triggersObject={} triggersRaw={} triggersLogged={} graphEventNames={}",
                 clipName,
                 duration,
                 trackCount,
                 annotationLines,
                 plausiblePointer(triggersObject) ? "set" : "null",
                 triggerCountRaw,
-                triggerLines);
+                triggerLines,
+                behaviorGraphEventNameCount(behaviorGraph));
         }
 
         // Returns true when the binding reached a terminal outcome (harvested
@@ -1178,9 +1267,21 @@ namespace redux::weapon_clip_motion_harvest
                 }
                 animationName[length] = '\0';
             }
+            /*
+             * The clip's own hkbBehaviorGraph rides at hkbContext+0x10 —
+             * needed to turn graph-local trigger eventIds into authored
+             * names. Exact-vtable gate: anything else degrades into
+             * nameless trigger lines, never a bad dereference.
+             */
+            std::uintptr_t behaviorGraph = *reinterpret_cast<std::uintptr_t*>(context + kContextBehaviorGraphOffset);
+            if (!plausiblePointer(behaviorGraph) ||
+                *reinterpret_cast<std::uintptr_t*>(behaviorGraph) !=
+                    REL::Module::get().base() + kBehaviorGraphVtableModuleOffset) {
+                behaviorGraph = 0;
+            }
             // Stage markers dump BEFORE the harvest so the names/times land
             // in the log even when the stroke harvest itself bails.
-            dumpClipStageMarkers(clipGenerator, binding, animationName.data());
+            dumpClipStageMarkers(clipGenerator, binding, animationName.data(), behaviorGraph);
             if (harvestBinding(
                     binding,
                     skeleton,
