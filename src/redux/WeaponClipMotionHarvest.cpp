@@ -153,7 +153,31 @@ namespace redux::weapon_clip_motion_harvest
          */
         constexpr std::uintptr_t kClipGeneratorVtableModuleOffset = 0x2E0FB38;
         constexpr std::uintptr_t kClipGeneratorActivateSlotOffset = 0x38;
+        constexpr std::uintptr_t kClipGeneratorUpdateSlotOffset = 0x40;
+        constexpr std::uintptr_t kClipGeneratorDeactivateSlotOffset = 0x50;
         constexpr std::uintptr_t kClipGeneratorLoadedBindingOffset = 0xD0;
+        /*
+         * hkbClipGenerator native scrub interface, raw-disassembly verified
+         * 2026-07-05 with 2-3 agreeing sources per member (update
+         * 0x14192d0d0, computeLocalTime 0x14192f560, ctor 0x14192c520; see
+         * docs/research/2026-07-05-clip-scrub-hkbClipGenerator-verified-
+         * offsets.md): +0xA4/+0xA8 crop start/end amounts (local-time
+         * seconds), +0xB8 float m_userControlledTimeFraction (engine clamps
+         * to [0,1] while mode == 2), +0xBE byte m_mode (2 = user-controlled:
+         * localTime = fraction * croppedDuration + cropStart, timestep-
+         * independent; the trigger walker and echo/loop logic are skipped
+         * entirely), +0x140 float m_localTime, +0x148 float
+         * m_previousUserControlledTimeFraction — MUST be seeded together
+         * with +0xB8 before flipping the mode, or the first scrubbed update
+         * derives a bogus previous local time.
+         */
+        constexpr std::uintptr_t kClipGeneratorCropStartOffset = 0xA4;
+        constexpr std::uintptr_t kClipGeneratorCropEndOffset = 0xA8;
+        constexpr std::uintptr_t kClipGeneratorUserFractionOffset = 0xB8;
+        constexpr std::uintptr_t kClipGeneratorModeOffset = 0xBE;
+        constexpr std::uintptr_t kClipGeneratorLocalTimeOffset = 0x140;
+        constexpr std::uintptr_t kClipGeneratorPrevUserFractionOffset = 0x148;
+        constexpr std::uint8_t kClipModeUserControlled = 2;
         // hkbClipGenerator::m_animationName (hkStringPtr — mask low bit).
         // Raw disassembly 0x141939911: [clip+0x90] & ~1 formatted into
         // "Animation loaded directly from clip's animationName".
@@ -230,7 +254,14 @@ namespace redux::weapon_clip_motion_harvest
         constexpr std::uintptr_t kStringDataEventNamesDataOffset = 0x10;
         constexpr std::uintptr_t kStringDataEventNamesCountOffset = 0x18;
         constexpr std::int32_t kMaxPlausibleEventNames = 4096;
-        constexpr std::int32_t kMaxPlausibleAnnotationTracks = 64;
+        /*
+         * Annotation tracks are one-per-transform-track (per bone), so the
+         * cap must cover full 1P rigs. The original cap of 64 silently
+         * skipped the whole annotation walk on every real clip (they report
+         * 94..123 tracks) — the 2026-07-05 "VR clips carry no annotations"
+         * summaries were reporting an unexecuted loop, not empty tracks.
+         */
+        constexpr std::int32_t kMaxPlausibleAnnotationTracks = 512;
         constexpr std::int32_t kMaxPlausibleAnnotations = 256;
         constexpr std::int32_t kMaxPlausibleTriggers = 128;
         /*
@@ -352,6 +383,39 @@ namespace redux::weapon_clip_motion_harvest
         std::uint32_t s_processedBindingCount = 0;
         // Guarded by s_hookMutex like the registry above.
         std::uint32_t s_stageMarkerLogBudget = kStageMarkerLogBudgetPerGeneration;
+
+        /*
+         * Clip-scrub sweep probe (milestone 1 of clip scrub mode, INI
+         * bClipScrubSweepTest): the first activating clip whose animation
+         * name contains the filter is flipped into Havok's user-controlled
+         * mode and its time fraction is ramped 0 -> 1 over the configured
+         * seconds; the saved mode byte is restored at ramp end or on
+         * deactivation. Log-only — validates in-game that an engine-scrubbed
+         * reload moves only the weapon rig while FRIK keeps the arms on the
+         * controllers.
+         *
+         * Thread model: the config fields are written by the main thread
+         * and read by the activation path, both under s_hookMutex. The
+         * active-sweep fields are seeded inside the activate shim (mutex
+         * held) BEFORE s_sweepClip is published with release order; after
+         * that only the update/deactivate shims of that same clip touch
+         * them (one clip's graph updates on one thread at a time), reading
+         * s_sweepClip with acquire order. The update shim's cost for every
+         * other clip in the game is a single relaxed load and compare.
+         * One sweep at a time; disabling the INI key mid-sweep lets the
+         * active sweep finish on its own (it restores itself).
+         */
+        bool s_sweepConfigEnabled = false;
+        float s_sweepConfigSeconds = 6.0f;
+        std::array<char, 48> s_sweepConfigFilter{};
+
+        std::atomic<std::uintptr_t> s_sweepClip{ 0 };
+        float s_sweepElapsedSeconds = 0.0f;
+        float s_sweepSeconds = 6.0f;
+        float s_sweepClipDuration = 0.0f;
+        std::uint8_t s_sweepSavedMode = 0;
+        std::uint32_t s_sweepNextLogDecile = 0;
+        std::array<char, 64> s_sweepClipName{};
 
         [[nodiscard]] bool bindingProcessedLocked(std::uintptr_t binding, bool fromActivation)
         {
@@ -478,6 +542,25 @@ namespace redux::weapon_clip_motion_harvest
             return true;
         }
 
+        // ASCII case-insensitive substring test (clip paths are ASCII).
+        [[nodiscard]] bool nameContainsNoCase(const char* haystack, const char* needle)
+        {
+            if (!haystack || !needle || needle[0] == '\0') {
+                return false;
+            }
+            const auto haystackLength = std::strlen(haystack);
+            const auto needleLength = std::strlen(needle);
+            if (needleLength > haystackLength) {
+                return false;
+            }
+            for (std::size_t start = 0; start + needleLength <= haystackLength; ++start) {
+                if (namesEqualNoCase(haystack + start, needle, needleLength)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         /*
          * A rig bone is a harvest target when it matches one of the weapon's
          * scene-node names: exact (case-insensitive, engine names are
@@ -596,10 +679,10 @@ namespace redux::weapon_clip_motion_harvest
          *  - hkaAnimation annotation tracks: authored {time, text} markers
          *    baked into the clip (real names at exact times);
          *  - hkbClipGenerator triggers: {localTime, eventId} pairs the game
-         *    itself fires as anim events (mag-out sounds, EjectShellCasing,
-         *    reload-complete). Event ids are graph-local; the id->name
-         *    table (hkbBehaviorGraphStringData::eventNames) is not yet
-         *    verified, so triggers log numeric ids.
+         *    itself fires as anim events (SoundPlay, EjectShellCasing,
+         *    reloadComplete — in-game validated 2026-07-05). Event ids are
+         *    graph-local; each is resolved through the clip's own graph
+         *    (hkbBehaviorGraphStringData::eventNames).
          * Offsets are destructor/walker-verified (see the constants above);
          * every hop is plausibility-gated and degrades into a logged skip,
          * and every dumped clip emits exactly one INFO summary line with
@@ -636,6 +719,21 @@ namespace redux::weapon_clip_motion_harvest
             const auto trackData =
                 *reinterpret_cast<std::uintptr_t*>(animation + kAnimationAnnotationTracksDataOffset);
             std::uint32_t annotationLines = 0;
+            /*
+             * Per-track names for filter-matching clips (sweep filter,
+             * whether or not the sweep itself is enabled): annotation
+             * tracks are one per transform track and their names are the
+             * rig bone names — the cheap proof of whether hand bones are
+             * addressable inside the animation data (authored hand-pose
+             * harvest feasibility). Compact, several names per line,
+             * budget-gated like every detail line.
+             */
+            const bool dumpTrackNames =
+                s_sweepConfigFilter[0] != '\0' && nameContainsNoCase(clipName, s_sweepConfigFilter.data());
+            char trackNameLine[224];
+            std::size_t trackNameLineLength = 0;
+            std::int32_t trackNameLineStart = 0;
+            std::uint32_t trackNamesInLine = 0;
             if (trackCount > 0 && trackCount <= kMaxPlausibleAnnotationTracks && plausiblePointer(trackData)) {
                 for (std::int32_t t = 0; t < trackCount; ++t) {
                     const auto track = trackData + static_cast<std::uintptr_t>(t) * kAnnotationTrackStride;
@@ -644,6 +742,32 @@ namespace redux::weapon_clip_motion_harvest
                         *reinterpret_cast<std::uintptr_t*>(track + kAnnotationTrackNameOffset),
                         trackName,
                         sizeof(trackName));
+                    if (dumpTrackNames) {
+                        const char* printableName = trackName[0] != '\0' ? trackName : "?";
+                        const auto nameLength = std::strlen(printableName);
+                        if (trackNamesInLine == 8 ||
+                            trackNameLineLength + nameLength + 2 >= sizeof(trackNameLine)) {
+                            if (s_stageMarkerLogBudget > 1) {
+                                --s_stageMarkerLogBudget;
+                                RDX_LOG_INFO(Weapon,
+                                    "STAGE-MARKER [tracks] clip='{}' {}..{}: {}",
+                                    clipName,
+                                    trackNameLineStart,
+                                    t - 1,
+                                    trackNameLine);
+                            }
+                            trackNameLineLength = 0;
+                            trackNamesInLine = 0;
+                            trackNameLineStart = t;
+                        }
+                        if (trackNamesInLine > 0) {
+                            trackNameLine[trackNameLineLength++] = '|';
+                        }
+                        std::memcpy(trackNameLine + trackNameLineLength, printableName, nameLength);
+                        trackNameLineLength += nameLength;
+                        trackNameLine[trackNameLineLength] = '\0';
+                        ++trackNamesInLine;
+                    }
                     const auto annotationCount =
                         *reinterpret_cast<std::int32_t*>(track + kAnnotationTrackAnnotationsCountOffset);
                     const auto annotationData =
@@ -678,6 +802,15 @@ namespace redux::weapon_clip_motion_harvest
                                 text);
                         }
                     }
+                }
+                if (dumpTrackNames && trackNamesInLine > 0 && s_stageMarkerLogBudget > 1) {
+                    --s_stageMarkerLogBudget;
+                    RDX_LOG_INFO(Weapon,
+                        "STAGE-MARKER [tracks] clip='{}' {}..{}: {}",
+                        clipName,
+                        trackNameLineStart,
+                        trackCount - 1,
+                        trackNameLine);
                 }
             }
 
@@ -1163,6 +1296,81 @@ namespace redux::weapon_clip_motion_harvest
 
         using ClipGeneratorActivateFn = void (*)(void*, void*);
         ClipGeneratorActivateFn s_originalClipActivate = nullptr;
+        // update(this, const hkbContext&, hkReal timestep) — timestep in
+        // XMM2 per MSVC x64; verified signature of 0x14192D0D0.
+        using ClipGeneratorUpdateFn = void (*)(void*, void*, float);
+        ClipGeneratorUpdateFn s_originalClipUpdate = nullptr;
+        using ClipGeneratorDeactivateFn = void (*)(void*, void*);
+        ClipGeneratorDeactivateFn s_originalClipDeactivate = nullptr;
+
+        /*
+         * Sweep hijack, called with s_hookMutex held right after the
+         * original activate returned (payload resident, m_localTime still
+         * at its start value). Recipe per the verified interface: save the
+         * mode byte, seed BOTH time fractions from the current local time,
+         * then flip to user-controlled — publication of s_sweepClip
+         * (release) is last so the update shim never sees a half-seeded
+         * sweep. Every read is plausibility-gated; a bail leaves the clip
+         * untouched.
+         */
+        void maybeBeginScrubSweepLocked(std::uintptr_t clipGenerator, std::uintptr_t binding, const char* clipName)
+        {
+            if (!s_sweepConfigEnabled || s_sweepClip.load(std::memory_order_relaxed) != 0) {
+                return;
+            }
+            if (s_sweepConfigFilter[0] == '\0' || !nameContainsNoCase(clipName, s_sweepConfigFilter.data())) {
+                return;
+            }
+            const auto animation = *reinterpret_cast<std::uintptr_t*>(binding + kBindingAnimationOffset);
+            if (!plausiblePointer(animation)) {
+                return;
+            }
+            const float duration = *reinterpret_cast<float*>(animation + kAnimationDurationOffset);
+            if (!std::isfinite(duration) || duration < kMinClipDurationSeconds || duration > kMaxClipDurationSeconds) {
+                return;
+            }
+            const float cropStart = *reinterpret_cast<float*>(clipGenerator + kClipGeneratorCropStartOffset);
+            const float cropEnd = *reinterpret_cast<float*>(clipGenerator + kClipGeneratorCropEndOffset);
+            const float localTime = *reinterpret_cast<float*>(clipGenerator + kClipGeneratorLocalTimeOffset);
+            float croppedDuration = duration;
+            if (std::isfinite(cropStart) && std::isfinite(cropEnd) && cropStart >= 0.0f && cropEnd >= 0.0f &&
+                cropStart + cropEnd < duration) {
+                croppedDuration = duration - cropStart - cropEnd;
+            }
+            float seedFraction = 0.0f;
+            if (std::isfinite(localTime) && croppedDuration > kMinClipDurationSeconds) {
+                seedFraction = localTime - (std::isfinite(cropStart) && cropStart > 0.0f ? cropStart : 0.0f);
+                seedFraction = seedFraction / croppedDuration;
+                seedFraction = seedFraction < 0.0f ? 0.0f : (seedFraction > 1.0f ? 1.0f : seedFraction);
+            }
+
+            s_sweepSavedMode = *reinterpret_cast<std::uint8_t*>(clipGenerator + kClipGeneratorModeOffset);
+            *reinterpret_cast<float*>(clipGenerator + kClipGeneratorUserFractionOffset) = seedFraction;
+            *reinterpret_cast<float*>(clipGenerator + kClipGeneratorPrevUserFractionOffset) = seedFraction;
+            *reinterpret_cast<std::uint8_t*>(clipGenerator + kClipGeneratorModeOffset) = kClipModeUserControlled;
+
+            s_sweepElapsedSeconds = 0.0f;
+            s_sweepSeconds = s_sweepConfigSeconds;
+            s_sweepClipDuration = duration;
+            s_sweepNextLogDecile = 1;
+            s_sweepClipName = {};
+            if (clipName) {
+                std::size_t length = 0;
+                while (length < s_sweepClipName.size() - 1 && clipName[length] != '\0') {
+                    s_sweepClipName[length] = clipName[length];
+                    ++length;
+                }
+            }
+            s_sweepClip.store(clipGenerator, std::memory_order_release);
+            RDX_LOG_INFO(Weapon,
+                "CLIP-SWEEP start clip='{}' duration={:.2f}s cropped={:.2f}s sweep={:.1f}s seed={:.3f} savedMode={} (mode 2 hijack; watch arms vs weapon rig)",
+                s_sweepClipName.data(),
+                duration,
+                croppedDuration,
+                s_sweepSeconds,
+                seedFraction,
+                s_sweepSavedMode);
+        }
 
         /*
          * Runs on the engine's graph-update thread right after the original
@@ -1237,17 +1445,15 @@ namespace redux::weapon_clip_motion_harvest
             if (!plausiblePointer(skeleton)) {
                 return;
             }
-            if (bindingProcessedLocked(binding, /*fromActivation=*/true)) {
-                return;
-            }
-            s_bindingsSeen.fetch_add(1, std::memory_order_relaxed);
             /*
              * hkbClipGenerator::m_animationName, hkStringPtr at +0x90.
              * Raw-disassembly verified (FO4VR 0x141939911: RSI =
              * [clip+0x90] & ~1 appended to "Animation loaded directly from
              * clip's animationName"; the AND -2 is the hkStringPtr
              * owned-bit convention). Copied under plausibility + printable
-             * gates — a bad read degrades into an unnamed harvest.
+             * gates — a bad read degrades into an unnamed harvest. Copied
+             * BEFORE the processed-binding dedup: the sweep probe below
+             * must see every activation, not just the first per binding.
              */
             std::array<char, 64> animationName{};
             const auto namePointer =
@@ -1267,6 +1473,11 @@ namespace redux::weapon_clip_motion_harvest
                 }
                 animationName[length] = '\0';
             }
+            maybeBeginScrubSweepLocked(clipGenerator, binding, animationName.data());
+            if (bindingProcessedLocked(binding, /*fromActivation=*/true)) {
+                return;
+            }
+            s_bindingsSeen.fetch_add(1, std::memory_order_relaxed);
             /*
              * The clip's own hkbBehaviorGraph rides at hkbContext+0x10 —
              * needed to turn graph-local trigger eventIds into authored
@@ -1300,6 +1511,79 @@ namespace redux::weapon_clip_motion_harvest
             }
             harvestFromClipGenerator(clipGenerator, context);
         }
+
+        /*
+         * Sweep driver. Fires for EVERY clip generator in the game each
+         * frame; the non-swept path is one relaxed load and a compare. For
+         * the swept clip: advance the ramp by the engine's own timestep,
+         * write the fraction BEFORE the original update (mode 2 computes
+         * localTime from it this same call), then log the engine-computed
+         * localTime as the probe's evidence. The clip is only ever touched
+         * inside its own engine update/deactivate, so its lifetime is
+         * guaranteed by the caller — no retained-pointer dereference risk.
+         */
+        void clipGeneratorUpdateShim(void* clipGeneratorRaw, void* context, float timestep)
+        {
+            const auto clipGenerator = reinterpret_cast<std::uintptr_t>(clipGeneratorRaw);
+            if (s_sweepClip.load(std::memory_order_acquire) != clipGenerator) {
+                if (s_originalClipUpdate) {
+                    s_originalClipUpdate(clipGeneratorRaw, context, timestep);
+                }
+                return;
+            }
+            if (std::isfinite(timestep) && timestep > 0.0f && timestep < 1.0f) {
+                s_sweepElapsedSeconds += timestep;
+            }
+            const float fraction =
+                s_sweepSeconds > 0.0f ? (std::min)(s_sweepElapsedSeconds / s_sweepSeconds, 1.0f) : 1.0f;
+            *reinterpret_cast<float*>(clipGenerator + kClipGeneratorUserFractionOffset) = fraction;
+            if (s_originalClipUpdate) {
+                s_originalClipUpdate(clipGeneratorRaw, context, timestep);
+            }
+            const auto decile = static_cast<std::uint32_t>(fraction * 10.0f);
+            if (decile >= s_sweepNextLogDecile) {
+                s_sweepNextLogDecile = decile + 1;
+                RDX_LOG_INFO(Weapon,
+                    "CLIP-SWEEP clip='{}' fraction={:.2f} engineLocalTime={:.3f}/{:.2f}s",
+                    s_sweepClipName.data(),
+                    fraction,
+                    *reinterpret_cast<float*>(clipGenerator + kClipGeneratorLocalTimeOffset),
+                    s_sweepClipDuration);
+            }
+            if (fraction >= 1.0f) {
+                // Restore AFTER the fraction-1.0 update posed the clip end;
+                // native mode resumes from there and finishes the reload
+                // normally (missed triggers may fire in a burst — expected
+                // probe artifact, commit semantics are ours in the real
+                // feature).
+                *reinterpret_cast<std::uint8_t*>(clipGenerator + kClipGeneratorModeOffset) = s_sweepSavedMode;
+                s_sweepClip.store(0, std::memory_order_release);
+                RDX_LOG_INFO(Weapon,
+                    "CLIP-SWEEP done clip='{}' swept {:.1f}s, mode {} restored",
+                    s_sweepClipName.data(),
+                    s_sweepSeconds,
+                    s_sweepSavedMode);
+            }
+        }
+
+        void clipGeneratorDeactivateShim(void* clipGeneratorRaw, void* context)
+        {
+            const auto clipGenerator = reinterpret_cast<std::uintptr_t>(clipGeneratorRaw);
+            if (s_sweepClip.load(std::memory_order_acquire) == clipGenerator) {
+                // Restore before the original tears the payload down; the
+                // mode byte survives on the clone for its next activation.
+                *reinterpret_cast<std::uint8_t*>(clipGenerator + kClipGeneratorModeOffset) = s_sweepSavedMode;
+                s_sweepClip.store(0, std::memory_order_release);
+                RDX_LOG_INFO(Weapon,
+                    "CLIP-SWEEP aborted clip='{}' deactivated at {:.2f}s of {:.1f}s sweep (mode restored)",
+                    s_sweepClipName.data(),
+                    s_sweepElapsedSeconds,
+                    s_sweepSeconds);
+            }
+            if (s_originalClipDeactivate) {
+                s_originalClipDeactivate(clipGeneratorRaw, context);
+            }
+        }
     }
 
     const char* lastResolveStage()
@@ -1324,16 +1608,45 @@ namespace redux::weapon_clip_motion_harvest
             return;
         }
         s_installed = true;
-        const auto slotAddress =
-            REL::Module::get().base() + kClipGeneratorVtableModuleOffset + kClipGeneratorActivateSlotOffset;
-        s_originalClipActivate = reinterpret_cast<ClipGeneratorActivateFn>(*reinterpret_cast<std::uintptr_t*>(slotAddress));
-        // 8-byte aligned pointer store is atomic on x64, so concurrent graph
-        // updates dispatching through the slot stay safe during the swap.
-        REL::safe_write(slotAddress, reinterpret_cast<std::uintptr_t>(&clipGeneratorActivateShim));
+        const auto vtableBase = REL::Module::get().base() + kClipGeneratorVtableModuleOffset;
+        // 8-byte aligned pointer stores are atomic on x64, so concurrent
+        // graph updates dispatching through the slots stay safe during the
+        // swaps. Activate feeds the harvest + sweep hijack; update drives
+        // an active sweep's ramp; deactivate restores an interrupted sweep.
+        const auto activateSlot = vtableBase + kClipGeneratorActivateSlotOffset;
+        s_originalClipActivate =
+            reinterpret_cast<ClipGeneratorActivateFn>(*reinterpret_cast<std::uintptr_t*>(activateSlot));
+        REL::safe_write(activateSlot, reinterpret_cast<std::uintptr_t>(&clipGeneratorActivateShim));
+        const auto updateSlot = vtableBase + kClipGeneratorUpdateSlotOffset;
+        s_originalClipUpdate =
+            reinterpret_cast<ClipGeneratorUpdateFn>(*reinterpret_cast<std::uintptr_t*>(updateSlot));
+        REL::safe_write(updateSlot, reinterpret_cast<std::uintptr_t>(&clipGeneratorUpdateShim));
+        const auto deactivateSlot = vtableBase + kClipGeneratorDeactivateSlotOffset;
+        s_originalClipDeactivate =
+            reinterpret_cast<ClipGeneratorDeactivateFn>(*reinterpret_cast<std::uintptr_t*>(deactivateSlot));
+        REL::safe_write(deactivateSlot, reinterpret_cast<std::uintptr_t>(&clipGeneratorDeactivateShim));
         RDX_LOG_INFO(Weapon,
-            "WeaponClipMotionHarvest: clip-activation hook installed (vtable slot +{:#x}, original +{:#x})",
-            kClipGeneratorVtableModuleOffset + kClipGeneratorActivateSlotOffset,
-            moduleRelative(reinterpret_cast<std::uintptr_t>(s_originalClipActivate)));
+            "WeaponClipMotionHarvest: clip lifecycle hooks installed (activate +{:#x}, update +{:#x}, deactivate +{:#x})",
+            moduleRelative(reinterpret_cast<std::uintptr_t>(s_originalClipActivate)),
+            moduleRelative(reinterpret_cast<std::uintptr_t>(s_originalClipUpdate)),
+            moduleRelative(reinterpret_cast<std::uintptr_t>(s_originalClipDeactivate)));
+    }
+
+    void setScrubSweepConfig(bool enabled, float sweepSeconds, const char* clipNameFilter)
+    {
+        std::scoped_lock lock(s_hookMutex);
+        s_sweepConfigEnabled = enabled;
+        if (std::isfinite(sweepSeconds)) {
+            s_sweepConfigSeconds = sweepSeconds < 1.0f ? 1.0f : (sweepSeconds > 60.0f ? 60.0f : sweepSeconds);
+        }
+        s_sweepConfigFilter = {};
+        if (clipNameFilter) {
+            std::size_t length = 0;
+            while (length < s_sweepConfigFilter.size() - 1 && clipNameFilter[length] != '\0') {
+                s_sweepConfigFilter[length] = clipNameFilter[length];
+                ++length;
+            }
+        }
     }
 
     void setClipActivationTargets(

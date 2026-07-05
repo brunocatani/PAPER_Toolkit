@@ -304,6 +304,13 @@ namespace redux
         }
         ageDrivenPartLeases();
 
+        // Keep the sweep probe's view of the INI fresh across hot reloads;
+        // one uncontended lock and a small copy per frame.
+        weapon_clip_motion_harvest::setScrubSweepConfig(
+            g_reduxConfig.clipScrubSweepTest,
+            g_reduxConfig.clipScrubSweepSeconds,
+            g_reduxConfig.clipScrubSweepClipFilter.c_str());
+
         auto* weaponNode = reinterpret_cast<RE::NiNode*>(snapshot.weaponNode);
         const auto generationKey = snapshot.weaponGenerationKey;
         const auto weaponFormId = snapshot.weaponFormId;

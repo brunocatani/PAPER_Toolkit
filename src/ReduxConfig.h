@@ -92,6 +92,20 @@ namespace redux
          */
         bool shellEjectOnMaxTravel = true;
         /*
+         * Clip-scrub sweep probe (milestone 1 of clip scrub mode): when
+         * true, the next activating animation clip whose path contains
+         * sClipScrubSweepClipFilter is frozen into Havok's user-controlled
+         * mode and its time is ramped 0 -> 1 over fClipScrubSweepSeconds
+         * while the game renders — validating that an engine-scrubbed
+         * reload moves only the weapon rig (FRIK keeps the arms on the
+         * controllers). Log-only: no ammo changes, no grips, one sweep at
+         * a time, mode restored afterwards. The filter also selects which
+         * clips dump their per-track bone names.
+         */
+        bool clipScrubSweepTest = false;
+        float clipScrubSweepSeconds = 6.0f;
+        std::string clipScrubSweepClipFilter = "Reload";
+        /*
          * Re-record mode: while true, EVERY config (re)load wipes all
          * learner-held motion data (learned strokes AND drained authored
          * strokes; authored re-harvests on the next equip / clip playback),

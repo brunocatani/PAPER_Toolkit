@@ -82,6 +82,17 @@ namespace redux
             "; halfway back toward rest); weapons without a casing model do nothing.\n"
             "bShellEjectOnMaxTravel = true\n"
             "\n"
+            "; Clip-scrub sweep probe (log-only test): when true, the next animation\n"
+            "; clip whose path contains sClipScrubSweepClipFilter is frozen into the\n"
+            "; engine's user-controlled mode and its time is swept 0 -> 1 over\n"
+            "; fClipScrubSweepSeconds — trigger a reload and watch: the weapon rig\n"
+            "; should play the reload in slow motion while the arms stay on the\n"
+            "; controllers. No ammo changes, one sweep at a time, everything is\n"
+            "; restored afterwards. Hot-reloadable; leave false during normal play.\n"
+            "bClipScrubSweepTest = false\n"
+            "fClipScrubSweepSeconds = 6.0\n"
+            "sClipScrubSweepClipFilter = Reload\n"
+            "\n"
             "; Re-record mode: while true, EVERY save of this INI (and every game\n"
             "; start) wipes all learned motion data so reloads re-record from scratch\n"
             "; under the current grouping settings (drained authored strokes are wiped\n"
@@ -225,6 +236,9 @@ namespace redux
         const float previousExtremeTolerance = travelExtremeTolerance;
         const float previousChainTolerance = stageChainToleranceGameUnits;
         const bool previousShellEject = shellEjectOnMaxTravel;
+        const bool previousSweepTest = clipScrubSweepTest;
+        const float previousSweepSeconds = clipScrubSweepSeconds;
+        const std::string previousSweepFilter = clipScrubSweepClipFilter;
         const bool previousResetLearned = resetLearnedPaths;
         const bool previousMotionLibrary = motionLibrary;
         const bool previousLibraryReadOnly = motionLibraryReadOnly;
@@ -270,6 +284,11 @@ namespace redux
         // Cap keeps the max/rest zones clear of the 50%-of-travel re-arm point.
         travelExtremeTolerance = readClampedFloat("fTravelExtremeTolerance", travelExtremeTolerance, 0.02f, 0.45f);
         shellEjectOnMaxTravel = ini.GetBoolValue(kSection, "bShellEjectOnMaxTravel", shellEjectOnMaxTravel);
+        clipScrubSweepTest = ini.GetBoolValue(kSection, "bClipScrubSweepTest", clipScrubSweepTest);
+        clipScrubSweepSeconds = readClampedFloat("fClipScrubSweepSeconds", clipScrubSweepSeconds, 1.0f, 60.0f);
+        if (const char* sweepFilter = ini.GetValue(kSection, "sClipScrubSweepClipFilter", clipScrubSweepClipFilter.c_str())) {
+            clipScrubSweepClipFilter = sweepFilter;
+        }
         resetLearnedPaths = ini.GetBoolValue(kSection, "bResetLearnedPaths", resetLearnedPaths);
         motionLibrary = ini.GetBoolValue(kSection, "bMotionLibrary", motionLibrary);
         motionLibraryReadOnly = ini.GetBoolValue(kSection, "bMotionLibraryReadOnly", motionLibraryReadOnly);
@@ -317,6 +336,15 @@ namespace redux
                     previousShellEject,
                     shellEjectOnMaxTravel);
             }
+            const bool sweepChanged = clipScrubSweepTest != previousSweepTest ||
+                clipScrubSweepSeconds != previousSweepSeconds || clipScrubSweepClipFilter != previousSweepFilter;
+            if (sweepChanged) {
+                RDX_LOG_INFO(Config,
+                    "Clip-scrub sweep probe: enabled={} seconds={:.1f} filter='{}' (next matching clip activation sweeps)",
+                    clipScrubSweepTest,
+                    clipScrubSweepSeconds,
+                    clipScrubSweepClipFilter);
+            }
             if (resetLearnedPaths != previousResetLearned) {
                 RDX_LOG_INFO(Config,
                     "bResetLearnedPaths: {} -> {} (while true, every reload wipes learned motion data)",
@@ -362,7 +390,7 @@ namespace redux
             }
             if (enabled == previousEnabled && motionPathMode == previousMode && logLevel == previousLogLevel &&
                 requireTriggerUnlock == previousRequireTriggerUnlock && !allowListChangedKeys && !groupingChanged &&
-                shellEjectOnMaxTravel == previousShellEject && resetLearnedPaths == previousResetLearned &&
+                shellEjectOnMaxTravel == previousShellEject && !sweepChanged && resetLearnedPaths == previousResetLearned &&
                 motionLibrary == previousMotionLibrary && motionLibraryReadOnly == previousLibraryReadOnly &&
                 fullSubtreeObservation == previousFullSubtree) {
                 RDX_LOG_INFO(Config, "Reload applied, no value changes (enabled={} mode={} logLevel={})",

@@ -129,6 +129,22 @@ namespace redux::weapon_clip_motion_harvest
     void clearClipActivationTargets();
 
     /*
+     * Clip-scrub sweep probe (milestone 1 of clip scrub mode, INI
+     * bClipScrubSweepTest): while enabled, the next activating clip on a
+     * registered character whose animation name contains `clipNameFilter`
+     * (case-insensitive) is flipped into Havok's native user-controlled
+     * mode (m_mode = 2) and its time fraction is ramped 0 -> 1 over
+     * `sweepSeconds` by the update hook; the saved mode is restored at
+     * ramp end (or on deactivation), letting the engine finish the clip
+     * normally. Log-only validation: in-game the arms must stay on the
+     * controllers while the weapon rig plays the reload. One sweep at a
+     * time; disabling mid-sweep lets the active sweep finish. The filter
+     * also selects which clips dump their per-track (bone) names in the
+     * stage-marker dump, independent of `enabled`.
+     */
+    void setScrubSweepConfig(bool enabled, float sweepSeconds, const char* clipNameFilter);
+
+    /*
      * One-shot dump of the manager→bindings chain: raw pointer of every hop,
      * each object's vtable rebased to a module offset (identifies the actual
      * runtime type in Ghidra), skeleton bone count/names, and the binding
