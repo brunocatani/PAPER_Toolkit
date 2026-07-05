@@ -64,6 +64,19 @@ namespace redux
             std::uint32_t partKind{ 0 };
             std::uint32_t actionRole{ 0 };
             std::array<char, WeaponPartMotionLearner::kMaxSourceName> sourceName{};
+            /*
+             * Rest-pose capture (weapon-local): the pose the part settles at
+             * while ungripped and undriven for ~1s is its authored rest
+             * (bolts close, slides return to battery). Latest stationary
+             * pose wins, so a mid-animation pause that latches a wrong rest
+             * is overwritten the next time the part truly idles. Reference
+             * for the delta curve anchoring max-travel and stage triggers.
+             */
+            bool restPoseValid{ false };
+            weapon_part_motion_path::PoseSample restPose{};
+            bool hasLastObserved{ false };
+            weapon_part_motion_path::PoseSample lastObserved{};
+            std::uint32_t stationaryFrames{ 0 };
         };
 
         struct DrivePartCache
@@ -125,6 +138,10 @@ namespace redux
         bool _pipboySuppressionAvailable{ false };
         // Last attach-arming state, for transition logging only.
         bool _lastAttachModeArmed{ false };
+        // Parts held by a hand last frame (any grip kind): a held part is
+        // not at rest, so its rest-pose capture pauses. One-frame lag is
+        // absorbed by the stationary-frame requirement.
+        std::array<std::uint32_t, 2> _grippedBodyIds{ 0x7FFF'FFFFu, 0x7FFF'FFFFu };
         std::array<DrivenPartLease, WeaponPartDriveSandbox::kMaxSentDrives> _drivenPartLeases{};
         // Scratch for the per-frame harvest drain; member storage because one
         // full batch of stroke groups is far too large for the stack.

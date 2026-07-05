@@ -71,6 +71,15 @@ namespace redux
             weapon_part_motion_path::Vec3 partTranslate{};
             float partScale{ 1.0f };
             weapon_part_motion_path::Vec3 handTranslate{};
+            /*
+             * Weapon-local pose the part settles at when idle (runtime
+             * rest-pose capture): the reference for the delta curve that
+             * anchors max-travel events and stage-transition triggers.
+             * When unavailable the path's first key stands in — correct for
+             * forward-recorded strokes, which is all the old behavior was.
+             */
+            bool restPoseValid{ false };
+            weapon_part_motion_path::PoseSample restPose{};
         };
 
         /*
@@ -87,6 +96,11 @@ namespace redux
         {
             std::uint32_t bodyId{ 0x7FFF'FFFFu };
             std::array<char, kMaxSourceName> sourceName{};
+            // Diagnostics for tuning: where the scrub was, where the delta
+            // curve put the extreme, and how tall the curve is.
+            float arcPosition{ 0.0f };
+            float extremeArcPosition{ 0.0f };
+            float peakDelta{ 0.0f };
         };
         // One per hand at most per update.
         static constexpr std::size_t kMaxMaxTravelEvents = 2;

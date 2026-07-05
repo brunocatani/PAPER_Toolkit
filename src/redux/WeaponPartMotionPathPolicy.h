@@ -299,6 +299,65 @@ namespace redux::weapon_part_motion_path
         return true;
     }
 
+    /*
+     * The physical travel extremes of a path as the peak and floor of its
+     * DELTA CURVE — displacement (poseDistance) from a reference rest pose
+     * evaluated at every key — instead of assuming key order. Learned
+     * strokes can be recorded in either direction (a recorder that armed
+     * while a bolt idled OPEN stores the closing stroke, so the path END is
+     * the rest pose); the delta curve puts the max-travel point at the true
+     * far point regardless of recording direction, and on curved strokes
+     * (bolt up-and-back) it lands at the fully-traveled corner. Both
+     * max-travel events and stage-transition triggers anchor on these
+     * positions (Bruno, 2026-07-05). Invalid when the curve is too flat to
+     * name an extreme (bad rest reference or degenerate path).
+     */
+    struct TravelExtreme
+    {
+        bool valid{ false };
+        // Arc position of the key FARTHEST from the rest reference — the
+        // physical max-travel point.
+        float arcPosition{ 0.0f };
+        // Arc position of the key NEAREST the rest reference — the physical
+        // rest point on the path.
+        float restArcPosition{ 0.0f };
+        float peakDelta{ 0.0f };
+        float restDelta{ 0.0f };
+    };
+
+    inline TravelExtreme travelExtremeFromRest(const MotionPath& path, const PoseSample& restPose)
+    {
+        TravelExtreme result{};
+        if (!path.valid || !(path.totalArcLength > 0.0f)) {
+            return result;
+        }
+        std::uint32_t peakKey = 0;
+        std::uint32_t restKey = 0;
+        float peakDelta = poseDistance(path.keys[0], restPose);
+        float restDelta = peakDelta;
+        for (std::uint32_t i = 1; i < kResampledKeyCount; ++i) {
+            const float delta = poseDistance(path.keys[i], restPose);
+            if (delta > peakDelta) {
+                peakDelta = delta;
+                peakKey = i;
+            }
+            if (delta < restDelta) {
+                restDelta = delta;
+                restKey = i;
+            }
+        }
+        if (!(peakDelta - restDelta >= kMinPathExcursionGameUnits)) {
+            return result;
+        }
+        const float keySpan = static_cast<float>(kResampledKeyCount - 1);
+        result.valid = true;
+        result.arcPosition = path.totalArcLength * static_cast<float>(peakKey) / keySpan;
+        result.restArcPosition = path.totalArcLength * static_cast<float>(restKey) / keySpan;
+        result.peakDelta = peakDelta;
+        result.restDelta = restDelta;
+        return result;
+    }
+
     inline bool shouldReplacePath(const MotionPath& existing, const MotionPath& candidate)
     {
         if (!candidate.valid) {

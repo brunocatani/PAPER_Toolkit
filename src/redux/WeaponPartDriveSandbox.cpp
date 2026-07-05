@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 
 namespace redux
@@ -282,10 +283,13 @@ namespace redux
                 session.sourceName = {};
                 std::memcpy(session.sourceName.data(), hand.sourceName.data(), (std::min)(hand.sourceName.size(), session.sourceName.size() - 1));
                 session.arcPosition = seeded.arcPosition;
-                // Seeding inside the end zone latches WITHOUT emitting — a
-                // grab of an already-out part is not a completed stroke.
-                session.maxTravelLatched =
-                    seeded.arcPosition >= group.leaderPath->totalArcLength - input.stageEndEpsilonArcUnits;
+                // Seeding inside the max-travel zone latches WITHOUT
+                // emitting — a grab of an already-out part is not a stroke.
+                const auto& seedRestReference = hand.restPoseValid ? hand.restPose : group.leaderPath->keys[0];
+                const auto seedExtreme =
+                    weapon_part_motion_path::travelExtremeFromRest(*group.leaderPath, seedRestReference);
+                session.maxTravelLatched = seedExtreme.valid &&
+                    std::abs(seeded.arcPosition - seedExtreme.arcPosition) <= input.stageEndEpsilonArcUnits;
                 session.handStartTranslate = hand.handTranslate;
                 session.pathAnchorTranslate = seeded.target.translate;
                 session.partScale = hand.partScale;
@@ -299,7 +303,7 @@ namespace redux
                     }
                 }
                 RDX_LOG_INFO(Weapon,
-                    "WeaponPartDriveSandbox: scrub session started hand={} part='{}' arc={:.2f}/{:.2f} mode={} source={} followers={} returnStage={}",
+                    "WeaponPartDriveSandbox: scrub session started hand={} part='{}' arc={:.2f}/{:.2f} mode={} source={} followers={} returnStage={} maxTravelArc={:.2f} restArc={:.2f} peakDelta={:.2f} restRef={}",
                     handIndex == 1 ? "left" : "right",
                     hand.sourceName,
                     seeded.arcPosition,
@@ -307,7 +311,11 @@ namespace redux
                     motionPathModeName(session.mode),
                     !group.authored ? "runtime-learned" : (group.fallbackSource ? "authored-fallback" : "authored-clip"),
                     session.followerCount,
-                    group.returnPath != nullptr);
+                    group.returnPath != nullptr,
+                    seedExtreme.valid ? seedExtreme.arcPosition : -1.0f,
+                    seedExtreme.valid ? seedExtreme.restArcPosition : -1.0f,
+                    seedExtreme.valid ? seedExtreme.peakDelta : 0.0f,
+                    hand.restPoseValid ? "live-rest" : "path-start");
             }
 
             if (!session.active || !hand.transformsValid) {
@@ -335,15 +343,29 @@ namespace redux
             session.arcPosition = scrubbed.arcPosition;
 
             /*
-             * Max-travel event (Bruno, 2026-07-05 shell-eject test), checked
-             * BEFORE the stage handoff so the emission belongs to the primary
-             * end just reached, not to the next stage's seed. Latched: one
-             * event on entering the end zone, re-armed only after the scrub
-             * retreats below half the path.
+             * DELTA CURVE anchor (Bruno, 2026-07-05): max-travel events and
+             * stage-transition triggers both anchor on the path's physical
+             * travel extremes — displacement from the part's REST pose
+             * graphed along the path — never on key order. Learned strokes
+             * record in whichever direction the animation happened to run
+             * (a recorder armed while a bolt idled open stores the closing
+             * stroke), so "last key" can be the rest pose; the delta curve
+             * is direction-agnostic. Falls back to the first key as the
+             * rest reference when no live rest pose is captured yet.
              */
-            if (!session.onReturnStage) {
+            const auto& restReference = hand.restPoseValid ? hand.restPose : path->keys[0];
+            const auto extreme = weapon_part_motion_path::travelExtremeFromRest(*path, restReference);
+
+            /*
+             * Max-travel event (shell-eject test), checked BEFORE the stage
+             * handoff so the emission belongs to the extreme just reached,
+             * not to the next stage's seed. Latched: one event on entering
+             * the max-travel zone, re-armed only after the part comes at
+             * least halfway back down the delta curve toward rest.
+             */
+            if (!session.onReturnStage && extreme.valid) {
                 const bool atMaxTravel =
-                    scrubbed.arcPosition >= path->totalArcLength - input.stageEndEpsilonArcUnits;
+                    std::abs(scrubbed.arcPosition - extreme.arcPosition) <= input.stageEndEpsilonArcUnits;
                 if (atMaxTravel && !session.maxTravelLatched) {
                     session.maxTravelLatched = true;
                     if (outMaxTravelEvents && outMaxTravelEventCount &&
@@ -351,9 +373,15 @@ namespace redux
                         auto& event = outMaxTravelEvents[(*outMaxTravelEventCount)++];
                         event.bodyId = session.bodyId;
                         event.sourceName = session.sourceName;
+                        event.arcPosition = scrubbed.arcPosition;
+                        event.extremeArcPosition = extreme.arcPosition;
+                        event.peakDelta = extreme.peakDelta;
                     }
-                } else if (!atMaxTravel && scrubbed.arcPosition < 0.5f * path->totalArcLength) {
-                    session.maxTravelLatched = false;
+                } else if (!atMaxTravel && session.maxTravelLatched) {
+                    const float scrubDelta = weapon_part_motion_path::poseDistance(scrubbed.target, restReference);
+                    if (scrubDelta <= extreme.restDelta + 0.5f * (extreme.peakDelta - extreme.restDelta)) {
+                        session.maxTravelLatched = false;
+                    }
                 }
             }
 
@@ -371,8 +399,18 @@ namespace redux
              * primary's end hands off on the first update, so an out-mag
              * grab starts directly on the insertion stage.
              */
-            if (input.stageTransitionsEnabled &&
-                scrubbed.arcPosition >= path->totalArcLength - input.stageEndEpsilonArcUnits) {
+            // Transition trigger on the SAME delta-curve anchors: a stage
+            // hands over at either physical travel extreme — the far point
+            // (mag fully out -> insertion path) or the rest point (seated ->
+            // extraction re-arms) — not at the recorded key order's end. The
+            // seed-near-next-start check below still decides whether a
+            // chained stage actually begins at the reached extreme. Old
+            // arc-end trigger remains only as the no-delta-curve fallback.
+            const bool atTransitionPoint = extreme.valid
+                ? (std::abs(scrubbed.arcPosition - extreme.arcPosition) <= input.stageEndEpsilonArcUnits ||
+                      std::abs(scrubbed.arcPosition - extreme.restArcPosition) <= input.stageEndEpsilonArcUnits)
+                : scrubbed.arcPosition >= path->totalArcLength - input.stageEndEpsilonArcUnits;
+            if (input.stageTransitionsEnabled && atTransitionPoint) {
                 const auto* nextPath = session.onReturnStage ? liveGroup.leaderPath : liveGroup.returnPath;
                 const auto* nextFollowers = session.onReturnStage ? liveGroup.followers : liveGroup.returnFollowers;
                 const auto nextFollowerCount = session.onReturnStage ? liveGroup.followerCount : liveGroup.returnFollowerCount;

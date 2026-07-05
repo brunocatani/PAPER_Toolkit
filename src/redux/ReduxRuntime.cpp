@@ -24,6 +24,11 @@ namespace redux
         // write is not animation evidence either.
         constexpr std::uint32_t kDrivenPartUntrustedFrames = 3;
 
+        // A part stationary (recorder stillness epsilons), ungripped, and
+        // undriven for this many frames counts as sitting at its authored
+        // rest pose (~1s at VR frame rates).
+        constexpr std::uint32_t kRestPoseStationaryFrames = 90;
+
         // OpenVR k_EButton_SteamVR_Trigger as ROCK's raw wand button id
         // (axis-button base 32 + axis 1 — see ROCK's InputRemapPolicy
         // kOpenVrSteamVrTriggerButtonId). Level state only by API design.
@@ -538,7 +543,7 @@ namespace redux
         // concurrent recordings can be compared for co-movement grouping.
         _learner.beginObservationFrame();
         for (std::uint32_t i = 0; i < _drivePartCache.count; ++i) {
-            const auto& entry = _drivePartCache.entries[i];
+            auto& entry = _drivePartCache.entries[i];
             if (!entry.node || !nodeContainsNode(weaponNode, entry.node, 64)) {
                 continue;
             }
@@ -566,6 +571,28 @@ namespace redux
                 .scale = partWeaponLocal.scale,
                 .trusted = !driven,
             });
+
+            // Rest-pose capture for the delta-curve anchors (see the cache
+            // entry declaration): a driven or hand-held part is not resting.
+            const bool gripped = entry.bodyId == _grippedBodyIds[0] || entry.bodyId == _grippedBodyIds[1];
+            if (driven || gripped) {
+                entry.hasLastObserved = false;
+                entry.stationaryFrames = 0;
+            } else {
+                if (entry.hasLastObserved && weapon_part_motion_path::posesAreStill(pose, entry.lastObserved)) {
+                    if (entry.stationaryFrames < kRestPoseStationaryFrames) {
+                        ++entry.stationaryFrames;
+                    }
+                    if (entry.stationaryFrames >= kRestPoseStationaryFrames) {
+                        entry.restPose = pose;
+                        entry.restPoseValid = true;
+                    }
+                } else {
+                    entry.stationaryFrames = 0;
+                }
+                entry.lastObserved = pose;
+                entry.hasLastObserved = true;
+            }
         }
     }
 
@@ -1255,6 +1282,13 @@ namespace redux
             gripReportValid[isLeft ? 1u : 0u] = api && api->getWeaponPartGripStateV1 &&
                 api->getWeaponPartGripStateV1(handEnum, &gripReports[isLeft ? 1u : 0u]);
         }
+        // Held parts (any grip kind) pause their rest-pose capture in the
+        // next observation pass — a hand can hold a part off-rest still.
+        for (std::size_t handIndex = 0; handIndex < 2; ++handIndex) {
+            _grippedBodyIds[handIndex] = gripReportValid[handIndex] && gripReports[handIndex].active != 0
+                ? gripReports[handIndex].bodyId
+                : 0x7FFF'FFFFu;
+        }
 
         /*
          * Trigger selects the grip type (Bruno, 2026-07-04), PER HAND: grab
@@ -1362,6 +1396,10 @@ namespace redux
                         handInput.sourceName = providerFixedStringView(
                             _drivePartCache.entries[i].sourceName.data(),
                             _drivePartCache.entries[i].sourceName.size());
+                        if (_drivePartCache.entries[i].restPoseValid) {
+                            handInput.restPoseValid = true;
+                            handInput.restPose = _drivePartCache.entries[i].restPose;
+                        }
                         break;
                     }
                 }
@@ -1448,7 +1486,10 @@ namespace redux
                 }
                 const auto eventName = providerFixedStringView(event.sourceName.data(), event.sourceName.size());
                 if (!entry || !isShellEjectActionPart(entry->partKind, entry->actionRole)) {
-                    RDX_LOG_DEBUG(Weapon,
+                    // INFO on purpose: "why didn't this weapon eject" must
+                    // be readable at the default log level; latched events
+                    // are rare enough (one per full stroke).
+                    RDX_LOG_INFO(Weapon,
                         "SHELL-EJECT skip: part '{}' at max travel is not a bolt/slide-class action (kind={} role={})",
                         eventName,
                         entry ? entry->partKind : 0xFFFFFFFFu,
@@ -1461,10 +1502,13 @@ namespace redux
                 }
                 const auto result = ejectShellCasingForEquippedWeapon(*player, input.weaponFormId);
                 RDX_LOG_INFO(Weapon,
-                    "SHELL-EJECT: part '{}' (kind={} role={}) hit max travel -> {}",
+                    "SHELL-EJECT: part '{}' (kind={} role={}) hit max travel (arc={:.2f} extremeArc={:.2f} peakDelta={:.2f}) -> {}",
                     eventName,
                     entry->partKind,
                     entry->actionRole,
+                    event.arcPosition,
+                    event.extremeArcPosition,
+                    event.peakDelta,
                     shellEjectResultName(result));
             }
         }

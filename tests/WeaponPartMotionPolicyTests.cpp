@@ -94,6 +94,44 @@ int main()
         ok &= expectTrue("motion path is truncated at peak excursion, not the return",
             std::abs(path.keys[kResampledKeyCount - 1].translate.y - peak.translate.y) < 0.30f);
 
+        // Delta-curve travel extremes: max travel is the key farthest from
+        // the REST reference, wherever it lies on the path — never "the
+        // last key". A forward-recorded stroke has it at the far end...
+        {
+            const auto extreme = travelExtremeFromRest(path, rest);
+            ok &= expectTrue("forward path: delta extreme valid", extreme.valid);
+            ok &= expectTrue("forward path: max travel at the far end",
+                extreme.arcPosition > path.totalArcLength * 0.9f);
+            ok &= expectTrue("forward path: rest point at the start",
+                extreme.restArcPosition < path.totalArcLength * 0.1f);
+
+            // ...and a stroke recorded in the CLOSING direction (recorder
+            // armed while the part idled open, so the rest pose is the path
+            // END) still puts max travel at the physically far point, which
+            // is now the path START.
+            MotionPath reversed{};
+            reversed.valid = true;
+            reversed.totalArcLength = path.totalArcLength;
+            for (std::uint32_t i = 0; i < kResampledKeyCount; ++i) {
+                reversed.keys[i] = path.keys[kResampledKeyCount - 1 - i];
+            }
+            const auto reversedExtreme = travelExtremeFromRest(reversed, rest);
+            ok &= expectTrue("reversed path: delta extreme valid", reversedExtreme.valid);
+            ok &= expectTrue("reversed path: max travel at the path START",
+                reversedExtreme.arcPosition < reversed.totalArcLength * 0.1f);
+            ok &= expectTrue("reversed path: rest point at the path END",
+                reversedExtreme.restArcPosition > reversed.totalArcLength * 0.9f);
+
+            // A rest reference the path never leaves names no extreme.
+            MotionPath flat{};
+            flat.valid = true;
+            flat.totalArcLength = 1.0f;
+            for (auto& key : flat.keys) {
+                key = rest;
+            }
+            ok &= expectFalse("flat delta curve names no extreme", travelExtremeFromRest(flat, rest).valid);
+        }
+
         // Untrusted (driven) frames discard an in-flight recording.
         RecorderState drivenRecorder{};
         for (std::uint32_t i = 0; i <= kRestStableFramesToArm; ++i) {
