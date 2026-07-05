@@ -116,6 +116,13 @@ namespace redux
         std::uint64_t _eligibleLearnerRevision{ 0 };
         std::uint64_t _eligibleConfigRevision{ 0 };
         bool _eligibleResolvedOnce{ false };
+        // Trigger-unlock support probe (once per session): raw wand button
+        // reads and the pipboy-suppression query need a current ROCK; if the
+        // loaded ROCK predates them, unlock falls back to grab-only with a
+        // one-time warning instead of dead-locking every grip.
+        bool _rawWandSupportChecked{ false };
+        bool _rawWandButtonsAvailable{ false };
+        bool _pipboySuppressionAvailable{ false };
         std::array<DrivenPartLease, WeaponPartDriveSandbox::kMaxSentDrives> _drivenPartLeases{};
         // Scratch for the per-frame harvest drain; member storage because one
         // full batch of stroke groups is far too large for the stack.

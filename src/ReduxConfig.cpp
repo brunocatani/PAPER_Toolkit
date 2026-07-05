@@ -39,6 +39,12 @@ namespace redux
             "; Hot-reloadable; drop to 1 or 0 when collecting harvest/scrub diagnostics.\n"
             "iLogLevel = 2\n"
             "\n"
+            "; Trigger arming for attach-only manipulation: grabbing an eligible part\n"
+            "; glues the hand, but the part only starts moving once that hand's TRIGGER\n"
+            "; is pressed (or already held); the unlock lasts until the part is released.\n"
+            "; false = parts scrub immediately on grab.\n"
+            "bRequireTriggerUnlock = true\n"
+            "\n"
             "; AttachOnly allowlist — which part classes MAY become attach-only grips.\n"
             "; Hot-reloadable. The class switch is only half the gate: a part must ALSO\n"
             "; have a motion path (clip-harvested or learned, under the active mode) to\n"
@@ -150,7 +156,9 @@ namespace redux
         const auto previousAllowList = attachOnlyParts;
         const auto previousPartEnabled = attachOnlyPartEnabled;
 
+        const bool previousRequireTriggerUnlock = requireTriggerUnlock;
         enabled = ini.GetBoolValue(kSection, "bEnabled", enabled);
+        requireTriggerUnlock = ini.GetBoolValue(kSection, "bRequireTriggerUnlock", requireTriggerUnlock);
 
         const char* modeText = ini.GetValue(kSection, "sMotionPathMode", motionPathModeName(motionPathMode));
         MotionPathMode parsedMode = motionPathMode;
@@ -200,6 +208,12 @@ namespace redux
             if (logLevel != previousLogLevel) {
                 RDX_LOG_INFO(Config, "iLogLevel: {} -> {}", previousLogLevel, logLevel);
             }
+            if (requireTriggerUnlock != previousRequireTriggerUnlock) {
+                RDX_LOG_INFO(Config,
+                    "bRequireTriggerUnlock: {} -> {} (applies to new grips)",
+                    previousRequireTriggerUnlock,
+                    requireTriggerUnlock);
+            }
             bool allowListChangedKeys = false;
             for (std::size_t i = 0; i < std::size(kAttachOnlyPartKeys); ++i) {
                 if (attachOnlyPartEnabled[i] != previousPartEnabled[i]) {
@@ -213,7 +227,7 @@ namespace redux
                 }
             }
             if (enabled == previousEnabled && motionPathMode == previousMode && logLevel == previousLogLevel &&
-                !allowListChangedKeys) {
+                requireTriggerUnlock == previousRequireTriggerUnlock && !allowListChangedKeys) {
                 RDX_LOG_INFO(Config, "Reload applied, no value changes (enabled={} mode={} logLevel={})",
                     enabled,
                     motionPathModeName(motionPathMode),

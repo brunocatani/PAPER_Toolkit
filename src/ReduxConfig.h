@@ -35,6 +35,15 @@ namespace redux
     {
         bool enabled = true;
         MotionPathMode motionPathMode = MotionPathMode::Hybrid;
+        /*
+         * Attach-only manipulation arming: grabbing an eligible part glues
+         * the hand, but the part only starts scrubbing once that hand's
+         * TRIGGER is pressed (or was already held); the unlock then lasts
+         * until the part is released. ROCK suppresses the native pipboy
+         * trigger action while the hand is engaged, so the button is free
+         * for this. Off = grips scrub immediately (pre-unlock behavior).
+         */
+        bool requireTriggerUnlock = true;
         // spdlog level: 0=trace 1=debug 2=info 3=warn 4=error 5=critical 6=off.
         int logLevel = 2;
         /*

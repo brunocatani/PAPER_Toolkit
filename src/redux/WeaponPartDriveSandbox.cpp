@@ -226,6 +226,26 @@ namespace redux
                 if (!hand.transformsValid || hand.sourceName.empty()) {
                     continue;
                 }
+                /*
+                 * Trigger arming: the hand is already glued to the part
+                 * (ROCK's AttachOnly grip), but the part does not scrub
+                 * until the trigger unlocks it. Level semantics — a trigger
+                 * already held at grab time unlocks immediately, a later
+                 * press unlocks then; the session then seeds from the part
+                 * and hand poses AT UNLOCK, so displacement is measured from
+                 * the moment manipulation actually starts.
+                 */
+                if (!hand.triggerHeld) {
+                    if (_lastAwaitingUnlockGripSequence[handIndex] != hand.gripSequence) {
+                        _lastAwaitingUnlockGripSequence[handIndex] = hand.gripSequence;
+                        RDX_LOG_INFO(Weapon,
+                            "WeaponPartDriveSandbox: hand={} glued to part '{}' — awaiting trigger unlock{}",
+                            handIndex == 1 ? "left" : "right",
+                            hand.sourceName,
+                            hand.triggerBlockedByPipboy ? " (trigger held but native pipboy action not suppressed — ignored)" : "");
+                    }
+                    continue;
+                }
                 const auto group = learner.findGroup(input.weaponFormId, hand.sourceName, input.motionPathMode);
                 if (!group.leaderPath) {
                     if (_lastNoPathGripSequence[handIndex] != hand.gripSequence) {
@@ -408,5 +428,6 @@ namespace redux
         _registrationWarned = false;
         _sessions = {};
         _lastNoPathGripSequence = {};
+        _lastAwaitingUnlockGripSequence = {};
     }
 }

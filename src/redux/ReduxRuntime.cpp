@@ -23,6 +23,11 @@ namespace redux
         // write is not animation evidence either.
         constexpr std::uint32_t kDrivenPartUntrustedFrames = 3;
 
+        // OpenVR k_EButton_SteamVR_Trigger as ROCK's raw wand button id
+        // (axis-button base 32 + axis 1 — see ROCK's InputRemapPolicy
+        // kOpenVrSteamVrTriggerButtonId). Level state only by API design.
+        constexpr std::uint32_t kOpenVrTriggerButtonId = 33;
+
         [[nodiscard]] std::string_view providerFixedStringView(const char* value, std::size_t capacity)
         {
             if (!value) {
@@ -1182,13 +1187,28 @@ namespace redux
         }
 
         const auto* api = ::rock::provider::RockProviderApi::inst;
+        // Trigger-arming support probe, once: an older ROCK without raw wand
+        // button reads must not dead-lock every grip — fall back to
+        // grab-only activation with a one-time warning.
+        if (!_rawWandSupportChecked && g_reduxConfig.requireTriggerUnlock && api) {
+            _rawWandSupportChecked = true;
+            _rawWandButtonsAvailable = ::rock::provider::supportsRawWandButtonStateV1();
+            _pipboySuppressionAvailable = ::rock::provider::supportsPipboyInputSuppressionV1();
+            if (!_rawWandButtonsAvailable) {
+                RDX_LOG_WARN(Weapon,
+                    "bRequireTriggerUnlock is set but the loaded ROCK has no raw wand button API — falling back to grab-only activation");
+            } else {
+                RDX_LOG_INFO(Weapon,
+                    "Trigger arming active (raw wand buttons available, pipboy suppression query {})",
+                    _pipboySuppressionAvailable ? "available" : "missing");
+            }
+        }
         for (const bool isLeft : { false, true }) {
             auto& handInput = input.hands[isLeft ? 1u : 0u];
+            const auto handEnum = isLeft ? ::rock::provider::RockProviderHand::Left : ::rock::provider::RockProviderHand::Right;
             ::rock::provider::RockProviderWeaponPartGripStateV1 report{};
             if (!api || !api->getWeaponPartGripStateV1 ||
-                !api->getWeaponPartGripStateV1(
-                    isLeft ? ::rock::provider::RockProviderHand::Left : ::rock::provider::RockProviderHand::Right,
-                    &report)) {
+                !api->getWeaponPartGripStateV1(handEnum, &report)) {
                 continue;
             }
             // Ownership IS the policy: an AttachOnly grip carrying our owner
@@ -1204,6 +1224,30 @@ namespace redux
             handInput.gripActive = true;
             handInput.gripSequence = report.gripSequence;
             handInput.bodyId = report.bodyId;
+
+            /*
+             * Trigger arming (level state — a press or an already-held
+             * trigger both unlock). On the pipboy hand the button only
+             * counts as ours while ROCK is swallowing the native pipboy
+             * action; otherwise a press would also open the Pip-Boy or
+             * toggle the flashlight, so it stays ignored (and logged by the
+             * sandbox's awaiting-unlock hint).
+             */
+            if (!g_reduxConfig.requireTriggerUnlock || !_rawWandButtonsAvailable) {
+                handInput.triggerHeld = true;
+            } else if (api->getRawWandButtonStateV1) {
+                ::rock::provider::RockProviderRawWandButtonStateV1 buttonState{};
+                if (api->getRawWandButtonStateV1(handEnum, kOpenVrTriggerButtonId, &buttonState) &&
+                    buttonState.available != 0 && buttonState.held != 0) {
+                    bool triggerIsOurs = true;
+                    if (_pipboySuppressionAvailable && api->getOffhandHandV1 && api->isNativePipboyInputSuppressedV1 &&
+                        api->getOffhandHandV1() == handEnum) {
+                        triggerIsOurs = api->isNativePipboyInputSuppressedV1();
+                    }
+                    handInput.triggerHeld = triggerIsOurs;
+                    handInput.triggerBlockedByPipboy = !triggerIsOurs;
+                }
+            }
 
             // Names and nodes come from the member cache (stable storage) so
             // the string_views handed to the sandbox outlive this scope.
