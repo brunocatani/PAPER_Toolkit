@@ -145,6 +145,38 @@ namespace redux::weapon_clip_motion_harvest
     void setScrubSweepConfig(bool enabled, float sweepSeconds, const char* clipNameFilter);
 
     /*
+     * Clip-scrub SESSION machinery (sMotionPathMode = scrub): while armed,
+     * the first activating clip matching `clipNameFilter` is captured and
+     * FROZEN in Havok's user-controlled mode at its start; the runtime then
+     * feeds the desired time fraction each frame (from the player's hand on
+     * a reload part) and the update hook applies it — the ENGINE poses
+     * every part. Ending the session restores the saved mode so the engine
+     * finishes the reload natively (v1 commit semantics: the game's own
+     * sounds, transitions, and ammo refill). The session also ends itself
+     * on clip deactivation (weapon switch). One session at a time; the
+     * sweep probe takes precedence when both are enabled.
+     *
+     * Main-thread API; fraction traffic is atomic (the main thread never
+     * touches the clip object — all clip writes run inside the hooked
+     * update/deactivate on the graph thread).
+     */
+    struct ClipScrubSessionState
+    {
+        bool active{ false };
+        // Increments per capture; detects session turnover across frames.
+        std::uint64_t sessionId{ 0 };
+        float durationSeconds{ 0.0f };
+        float croppedDurationSeconds{ 0.0f };
+        // Engine-observed fraction (feedback for the pursuit controller).
+        float fraction{ 0.0f };
+    };
+    void setClipScrubCaptureConfig(bool armed, const char* clipNameFilter);
+    [[nodiscard]] ClipScrubSessionState clipScrubSessionState();
+    void setClipScrubDesiredFraction(float fraction);
+    // Request release-to-native; applied by the graph thread next update.
+    void endClipScrubSession();
+
+    /*
      * One-shot dump of the manager→bindings chain: raw pointer of every hop,
      * each object's vtable rebased to a module offset (identifies the actual
      * runtime type in Ghidra), skeleton bone count/names, and the binding

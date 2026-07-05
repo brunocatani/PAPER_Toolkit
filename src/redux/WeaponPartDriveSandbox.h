@@ -161,6 +161,16 @@ namespace redux
              * scale — Bruno, 2026-07-05).
              */
             float travelExtremeToleranceFraction{ 0.10f };
+            /*
+             * Clip-scrub session feed (mode == ClipScrub): the harvest
+             * module's captured-and-frozen reload clip, when one is live.
+             * `clipScrubFraction` is the ENGINE-observed time fraction —
+             * the pursuit controller's feedback signal. No session means
+             * scrub grips glue but cannot drive (hint logged once per grip).
+             */
+            bool clipScrubSessionActive{ false };
+            std::uint64_t clipScrubSessionId{ 0 };
+            float clipScrubFraction{ 0.0f };
             // Per-part attach-only whitelist for the current weapon
             // generation; targets reinstall only when this set changes.
             std::uint32_t eligiblePartCount{ 0 };
@@ -175,12 +185,17 @@ namespace redux
         // Returns the number of drives sent this update, written to
         // outSentDrives (capacity kMaxSentDrives). Max-travel events land in
         // outMaxTravelEvents (capacity kMaxMaxTravelEvents) when provided.
+        // In ClipScrub mode a gripped session emits a desired clip-time
+        // fraction instead of drives: written to outClipScrubFraction with
+        // outClipScrubFractionValid set (one hand owns time per frame).
         std::uint32_t update(
             const FrameInput& input,
             const WeaponPartMotionLearner& learner,
             SentDrive* outSentDrives,
             MaxTravelEvent* outMaxTravelEvents = nullptr,
-            std::uint32_t* outMaxTravelEventCount = nullptr);
+            std::uint32_t* outMaxTravelEventCount = nullptr,
+            float* outClipScrubFraction = nullptr,
+            bool* outClipScrubFractionValid = nullptr);
         void shutdown();
 
         [[nodiscard]] std::uint64_t ownerToken() const { return _ownerToken; }
@@ -219,6 +234,28 @@ namespace redux
              */
             std::uint32_t followerCount{ 0 };
             std::array<weapon_clip_stroke::AuthoredFollower, weapon_clip_stroke::kMaxFollowers> followers{};
+            /*
+             * Clip-scrub session (mode == ClipScrub): the hand drives the
+             * captured clip's TIME through a pursuit controller — no path
+             * lookup, no drives. The controller learns the part's local
+             * motion direction from what the engine-posed part actually did
+             * per unit fraction (the engine is the curve oracle), then
+             * steers the fraction so the part chases the hand's displaced
+             * target. Degenerate stretches (part not responding — stage
+             * dwells, bootstrap) fall back to a slow forward crawl gated on
+             * real hand pull, which carries the session across windows
+             * where the gripped part is authored to rest.
+             */
+            bool clipScrub{ false };
+            std::uint64_t clipScrubSessionId{ 0 };
+            weapon_part_motion_path::Vec3 scrubPartStartTranslate{};
+            weapon_part_motion_path::Vec3 scrubPrevPartTranslate{};
+            float scrubPrevFraction{ 0.0f };
+            bool scrubDirectionValid{ false };
+            weapon_part_motion_path::Vec3 scrubDirection{};
+            // Game units of part travel per unit fraction (local slope).
+            float scrubSlope{ 0.0f };
+            std::uint32_t scrubLastLogDecile{ 0 };
         };
 
         bool ensureRegistered();

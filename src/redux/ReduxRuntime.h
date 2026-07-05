@@ -174,6 +174,11 @@ namespace redux
         bool _pipboySuppressionAvailable{ false };
         // Last attach-arming state, for transition logging only.
         bool _lastAttachModeArmed{ false };
+        // Clip-scrub session bookkeeping: frames with a live frozen clip
+        // but no hand driving it (idle release), and the last session id
+        // seen (resets the idle counter on capture turnover).
+        std::uint32_t _scrubIdleFrames{ 0 };
+        std::uint64_t _scrubLastSessionId{ 0 };
         // Parts held by a hand last frame (any grip kind): a held part is
         // not at rest, so its rest-pose capture pauses. One-frame lag is
         // absorbed by the stationary-frame requirement.

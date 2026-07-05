@@ -33,6 +33,14 @@ namespace redux
         // (axis-button base 32 + axis 1 — see ROCK's InputRemapPolicy
         // kOpenVrSteamVrTriggerButtonId). Level state only by API design.
         constexpr std::uint32_t kOpenVrTriggerButtonId = 33;
+        /*
+         * Clip-scrub session lifecycle: complete (release to native, engine
+         * finishes the reload) once the hand has scrubbed this close to the
+         * end; a frozen session nobody drives for this long also releases,
+         * so an untouched reload cannot stay frozen forever.
+         */
+        constexpr float kClipScrubCompleteFraction = 0.985f;
+        constexpr std::uint32_t kClipScrubIdleTimeoutFrames = 1080;
 
         // Shell-eject test: the "racking" classifications whose full
         // rearward travel should eject a casing — bolt/slide-class by part
@@ -310,6 +318,12 @@ namespace redux
             g_reduxConfig.clipScrubSweepTest,
             g_reduxConfig.clipScrubSweepSeconds,
             g_reduxConfig.clipScrubSweepClipFilter.c_str());
+        // Scrub mode arms the session capture: the next activating clip
+        // matching the filter freezes and waits for a hand. Same filter as
+        // the sweep probe (the probe wins when both are enabled).
+        weapon_clip_motion_harvest::setClipScrubCaptureConfig(
+            g_reduxConfig.motionPathMode == MotionPathMode::ClipScrub,
+            g_reduxConfig.clipScrubSweepClipFilter.c_str());
 
         auto* weaponNode = reinterpret_cast<RE::NiNode*>(snapshot.weaponNode);
         const auto generationKey = snapshot.weaponGenerationKey;
@@ -580,6 +594,10 @@ namespace redux
         _eligibleConfigRevision = 0;
         _eligibleResolvedOnce = false;
         _lastAttachModeArmed = false;
+        _scrubIdleFrames = 0;
+        _scrubLastSessionId = 0;
+        weapon_clip_motion_harvest::setClipScrubCaptureConfig(false, nullptr);
+        weapon_clip_motion_harvest::endClipScrubSession();
         weapon_clip_motion_harvest::clearPending();
         weapon_clip_motion_harvest::resetWalk();
         weapon_clip_motion_harvest::clearClipActivationTargets();
@@ -793,6 +811,17 @@ namespace redux
             length += name.size();
         };
 
+        /*
+         * ClipScrub drives no stored geometry, but the "must move" gate
+         * still applies — under a HYBRID lookup: any source's mere
+         * EXISTENCE (learned or authored, however broken authored's
+         * conversion is) proves the animation moves this part, so static
+         * receivers keep their normal grip in scrub mode too.
+         */
+        const auto eligibilityLookupMode = g_reduxConfig.motionPathMode == MotionPathMode::ClipScrub
+            ? MotionPathMode::Hybrid
+            : g_reduxConfig.motionPathMode;
+
         if (cacheGeneration != 0 && weaponFormId != 0) {
             const auto& allowList = g_reduxConfig.attachOnlyParts;
             for (std::uint32_t i = 0; i < _drivePartCache.count; ++i) {
@@ -813,7 +842,7 @@ namespace redux
                 // normal grip even though its class is allowlisted.
                 if (!_learner.findPath(
                         WeaponPartMotionLearner::PartKey{ weaponFormId, entry.omodFormId, sourceName },
-                        g_reduxConfig.motionPathMode)) {
+                        eligibilityLookupMode)) {
                     appendName(unmappedNames, unmappedLength, sourceName);
                     ++unmappedCount;
                     continue;
@@ -1597,6 +1626,36 @@ namespace redux
         input.stageTransitionsEnabled = g_reduxConfig.stageTransitions;
         input.travelExtremeToleranceFraction = g_reduxConfig.travelExtremeTolerance;
 
+        /*
+         * Clip-scrub session lifecycle (mode == scrub). The captured clip
+         * is queried before the sandbox update so this frame's grips see
+         * the live state; the end conditions run here because they are
+         * runtime policy, not clip mechanics: completion hands the clip
+         * back to the engine (native finish = v1 commit semantics), the
+         * idle timeout frees a frozen reload nobody is driving, and a mode
+         * hot-switch away from scrub must not leave a clip frozen.
+         */
+        auto scrubSession = weapon_clip_motion_harvest::clipScrubSessionState();
+        if (scrubSession.active) {
+            if (g_reduxConfig.motionPathMode != MotionPathMode::ClipScrub) {
+                weapon_clip_motion_harvest::endClipScrubSession();
+                scrubSession.active = false;
+            } else if (scrubSession.fraction >= kClipScrubCompleteFraction) {
+                RDX_LOG_INFO(Weapon,
+                    "CLIP-SCRUB complete at fraction {:.3f} — releasing to native (engine finishes the reload)",
+                    scrubSession.fraction);
+                weapon_clip_motion_harvest::endClipScrubSession();
+                scrubSession.active = false;
+            }
+        }
+        if (scrubSession.sessionId != _scrubLastSessionId) {
+            _scrubLastSessionId = scrubSession.sessionId;
+            _scrubIdleFrames = 0;
+        }
+        input.clipScrubSessionActive = scrubSession.active;
+        input.clipScrubSessionId = scrubSession.sessionId;
+        input.clipScrubFraction = scrubSession.fraction;
+
         const auto* api = ::rock::provider::RockProviderApi::inst;
         // Trigger-arming support probe, once: an older ROCK without raw wand
         // button reads must not dead-lock attach-only grips — fall back to
@@ -1792,7 +1851,25 @@ namespace redux
         std::array<WeaponPartDriveSandbox::SentDrive, WeaponPartDriveSandbox::kMaxSentDrives> sentDrives{};
         std::array<WeaponPartDriveSandbox::MaxTravelEvent, WeaponPartDriveSandbox::kMaxMaxTravelEvents> maxTravelEvents{};
         std::uint32_t maxTravelEventCount = 0;
-        const auto sentCount = _sandbox.update(input, _learner, sentDrives.data(), maxTravelEvents.data(), &maxTravelEventCount);
+        float scrubDesiredFraction = 0.0f;
+        bool scrubFractionValid = false;
+        const auto sentCount = _sandbox.update(input, _learner, sentDrives.data(), maxTravelEvents.data(),
+            &maxTravelEventCount, &scrubDesiredFraction, &scrubFractionValid);
+
+        if (scrubSession.active) {
+            if (scrubFractionValid) {
+                weapon_clip_motion_harvest::setClipScrubDesiredFraction(scrubDesiredFraction);
+                _scrubIdleFrames = 0;
+            } else if (++_scrubIdleFrames >= kClipScrubIdleTimeoutFrames) {
+                _scrubIdleFrames = 0;
+                RDX_LOG_INFO(Weapon,
+                    "CLIP-SCRUB idle timeout at fraction {:.3f} — releasing frozen reload to native",
+                    scrubSession.fraction);
+                weapon_clip_motion_harvest::endClipScrubSession();
+            }
+        } else {
+            _scrubIdleFrames = 0;
+        }
         // Refresh the untrusted-observation leases for everything we drove
         // this frame; the lease outlives the drive by the restore frame.
         for (std::uint32_t i = 0; i < sentCount; ++i) {

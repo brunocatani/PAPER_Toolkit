@@ -417,6 +417,40 @@ namespace redux::weapon_clip_motion_harvest
         std::uint32_t s_sweepNextLogDecile = 0;
         std::array<char, 64> s_sweepClipName{};
 
+        /*
+         * Clip-scrub SESSION (sMotionPathMode = scrub, the real feature —
+         * the sweep above is the throwaway probe): while armed, the first
+         * activating clip matching the filter is captured and FROZEN in
+         * user-controlled mode at its start; the runtime's pursuit
+         * controller then feeds a desired time fraction (from the player's
+         * hand on a reload part) through s_scrubDesiredFraction, and the
+         * update shim applies it. Ending the session (completion, idle
+         * timeout, mode switch) restores the saved mode so the ENGINE
+         * finishes the reload natively — sounds, transitions, and the ammo
+         * commit are the game's own, which is v1's commit semantics.
+         *
+         * Thread model mirrors the sweep: capture config + hijack under
+         * s_hookMutex, non-atomic session fields seeded BEFORE s_scrubClip
+         * publishes (release), then touched only by the swept clip's own
+         * update/deactivate shims. Main thread <-> graph thread traffic is
+         * atomics only: desired fraction in, observed fraction out, end
+         * request in. Restore transitions run exclusively on the graph
+         * thread inside the shims — the main thread never touches the clip.
+         */
+        bool s_scrubCaptureArmed = false;
+        std::array<char, 48> s_scrubCaptureFilter{};
+
+        std::atomic<std::uintptr_t> s_scrubClip{ 0 };
+        std::atomic<std::uint64_t> s_scrubSessionId{ 0 };
+        std::atomic<float> s_scrubDesiredFraction{ 0.0f };
+        std::atomic<float> s_scrubObservedFraction{ 0.0f };
+        std::atomic<bool> s_scrubEndRequested{ false };
+        std::uint8_t s_scrubSavedMode = 0;
+        float s_scrubCropStart = 0.0f;
+        float s_scrubCroppedDuration = 0.0f;
+        float s_scrubClipDuration = 0.0f;
+        std::array<char, 64> s_scrubClipName{};
+
         [[nodiscard]] bool bindingProcessedLocked(std::uintptr_t binding, bool fromActivation)
         {
             for (std::uint32_t i = 0; i < s_processedBindingCount; ++i) {
@@ -1315,7 +1349,8 @@ namespace redux::weapon_clip_motion_harvest
          */
         void maybeBeginScrubSweepLocked(std::uintptr_t clipGenerator, std::uintptr_t binding, const char* clipName)
         {
-            if (!s_sweepConfigEnabled || s_sweepClip.load(std::memory_order_relaxed) != 0) {
+            if (!s_sweepConfigEnabled || s_sweepClip.load(std::memory_order_relaxed) != 0 ||
+                s_scrubClip.load(std::memory_order_relaxed) != 0) {
                 return;
             }
             if (s_sweepConfigFilter[0] == '\0' || !nameContainsNoCase(clipName, s_sweepConfigFilter.data())) {
@@ -1370,6 +1405,76 @@ namespace redux::weapon_clip_motion_harvest
                 s_sweepSeconds,
                 seedFraction,
                 s_sweepSavedMode);
+        }
+
+        /*
+         * Scrub-session capture, called with s_hookMutex held right after
+         * the original activate. Same verified hijack recipe as the sweep,
+         * but frozen at the seed — the runtime's controller owns the
+         * fraction from here. The sweep probe takes precedence when both
+         * are enabled; one session at a time.
+         */
+        void maybeBeginClipScrubSessionLocked(std::uintptr_t clipGenerator, std::uintptr_t binding, const char* clipName)
+        {
+            if (!s_scrubCaptureArmed || s_sweepConfigEnabled ||
+                s_scrubClip.load(std::memory_order_relaxed) != 0 ||
+                s_sweepClip.load(std::memory_order_relaxed) != 0) {
+                return;
+            }
+            if (s_scrubCaptureFilter[0] == '\0' || !nameContainsNoCase(clipName, s_scrubCaptureFilter.data())) {
+                return;
+            }
+            const auto animation = *reinterpret_cast<std::uintptr_t*>(binding + kBindingAnimationOffset);
+            if (!plausiblePointer(animation)) {
+                return;
+            }
+            const float duration = *reinterpret_cast<float*>(animation + kAnimationDurationOffset);
+            if (!std::isfinite(duration) || duration < kMinClipDurationSeconds || duration > kMaxClipDurationSeconds) {
+                return;
+            }
+            const float cropStart = *reinterpret_cast<float*>(clipGenerator + kClipGeneratorCropStartOffset);
+            const float cropEnd = *reinterpret_cast<float*>(clipGenerator + kClipGeneratorCropEndOffset);
+            const float localTime = *reinterpret_cast<float*>(clipGenerator + kClipGeneratorLocalTimeOffset);
+            float croppedDuration = duration;
+            float effectiveCropStart = 0.0f;
+            if (std::isfinite(cropStart) && std::isfinite(cropEnd) && cropStart >= 0.0f && cropEnd >= 0.0f &&
+                cropStart + cropEnd < duration) {
+                croppedDuration = duration - cropStart - cropEnd;
+                effectiveCropStart = cropStart;
+            }
+            float seedFraction = 0.0f;
+            if (std::isfinite(localTime) && croppedDuration > kMinClipDurationSeconds) {
+                seedFraction = (localTime - effectiveCropStart) / croppedDuration;
+                seedFraction = seedFraction < 0.0f ? 0.0f : (seedFraction > 1.0f ? 1.0f : seedFraction);
+            }
+
+            s_scrubSavedMode = *reinterpret_cast<std::uint8_t*>(clipGenerator + kClipGeneratorModeOffset);
+            *reinterpret_cast<float*>(clipGenerator + kClipGeneratorUserFractionOffset) = seedFraction;
+            *reinterpret_cast<float*>(clipGenerator + kClipGeneratorPrevUserFractionOffset) = seedFraction;
+            *reinterpret_cast<std::uint8_t*>(clipGenerator + kClipGeneratorModeOffset) = kClipModeUserControlled;
+
+            s_scrubCropStart = effectiveCropStart;
+            s_scrubCroppedDuration = croppedDuration;
+            s_scrubClipDuration = duration;
+            s_scrubClipName = {};
+            if (clipName) {
+                std::size_t length = 0;
+                while (length < s_scrubClipName.size() - 1 && clipName[length] != '\0') {
+                    s_scrubClipName[length] = clipName[length];
+                    ++length;
+                }
+            }
+            s_scrubDesiredFraction.store(seedFraction, std::memory_order_relaxed);
+            s_scrubObservedFraction.store(seedFraction, std::memory_order_relaxed);
+            s_scrubEndRequested.store(false, std::memory_order_relaxed);
+            s_scrubSessionId.fetch_add(1, std::memory_order_relaxed);
+            s_scrubClip.store(clipGenerator, std::memory_order_release);
+            RDX_LOG_INFO(Weapon,
+                "CLIP-SCRUB session start clip='{}' duration={:.2f}s cropped={:.2f}s seed={:.3f} (frozen; grab a reload part to drive it)",
+                s_scrubClipName.data(),
+                duration,
+                croppedDuration,
+                seedFraction);
         }
 
         /*
@@ -1474,6 +1579,7 @@ namespace redux::weapon_clip_motion_harvest
                 animationName[length] = '\0';
             }
             maybeBeginScrubSweepLocked(clipGenerator, binding, animationName.data());
+            maybeBeginClipScrubSessionLocked(clipGenerator, binding, animationName.data());
             if (bindingProcessedLocked(binding, /*fromActivation=*/true)) {
                 return;
             }
@@ -1525,6 +1631,44 @@ namespace redux::weapon_clip_motion_harvest
         void clipGeneratorUpdateShim(void* clipGeneratorRaw, void* context, float timestep)
         {
             const auto clipGenerator = reinterpret_cast<std::uintptr_t>(clipGeneratorRaw);
+            /*
+             * Scrub-session branch: apply the runtime's desired fraction,
+             * publish the engine-computed fraction back, and perform the
+             * restore-to-native transition here (graph thread) when the
+             * runtime requested the session end. The clip is alive by
+             * construction inside its own update.
+             */
+            if (s_scrubClip.load(std::memory_order_acquire) == clipGenerator) {
+                if (s_scrubEndRequested.load(std::memory_order_relaxed)) {
+                    *reinterpret_cast<std::uint8_t*>(clipGenerator + kClipGeneratorModeOffset) = s_scrubSavedMode;
+                    s_scrubClip.store(0, std::memory_order_release);
+                    RDX_LOG_INFO(Weapon,
+                        "CLIP-SCRUB session released to native clip='{}' at fraction {:.3f} (mode {} restored; engine finishes the reload)",
+                        s_scrubClipName.data(),
+                        s_scrubObservedFraction.load(std::memory_order_relaxed),
+                        s_scrubSavedMode);
+                    if (s_originalClipUpdate) {
+                        s_originalClipUpdate(clipGeneratorRaw, context, timestep);
+                    }
+                    return;
+                }
+                float desired = s_scrubDesiredFraction.load(std::memory_order_relaxed);
+                desired = desired < 0.0f ? 0.0f : (desired > 1.0f ? 1.0f : desired);
+                *reinterpret_cast<float*>(clipGenerator + kClipGeneratorUserFractionOffset) = desired;
+                if (s_originalClipUpdate) {
+                    s_originalClipUpdate(clipGeneratorRaw, context, timestep);
+                }
+                if (s_scrubCroppedDuration > kMinClipDurationSeconds) {
+                    const float localTime =
+                        *reinterpret_cast<float*>(clipGenerator + kClipGeneratorLocalTimeOffset);
+                    if (std::isfinite(localTime)) {
+                        float observed = (localTime - s_scrubCropStart) / s_scrubCroppedDuration;
+                        observed = observed < 0.0f ? 0.0f : (observed > 1.0f ? 1.0f : observed);
+                        s_scrubObservedFraction.store(observed, std::memory_order_relaxed);
+                    }
+                }
+                return;
+            }
             if (s_sweepClip.load(std::memory_order_acquire) != clipGenerator) {
                 if (s_originalClipUpdate) {
                     s_originalClipUpdate(clipGeneratorRaw, context, timestep);
@@ -1569,6 +1713,14 @@ namespace redux::weapon_clip_motion_harvest
         void clipGeneratorDeactivateShim(void* clipGeneratorRaw, void* context)
         {
             const auto clipGenerator = reinterpret_cast<std::uintptr_t>(clipGeneratorRaw);
+            if (s_scrubClip.load(std::memory_order_acquire) == clipGenerator) {
+                *reinterpret_cast<std::uint8_t*>(clipGenerator + kClipGeneratorModeOffset) = s_scrubSavedMode;
+                s_scrubClip.store(0, std::memory_order_release);
+                RDX_LOG_INFO(Weapon,
+                    "CLIP-SCRUB session ended clip='{}' deactivated at fraction {:.3f} (mode restored)",
+                    s_scrubClipName.data(),
+                    s_scrubObservedFraction.load(std::memory_order_relaxed));
+            }
             if (s_sweepClip.load(std::memory_order_acquire) == clipGenerator) {
                 // Restore before the original tears the payload down; the
                 // mode byte survives on the clone for its next activation.
@@ -1646,6 +1798,56 @@ namespace redux::weapon_clip_motion_harvest
                 s_sweepConfigFilter[length] = clipNameFilter[length];
                 ++length;
             }
+        }
+    }
+
+    void setClipScrubCaptureConfig(bool armed, const char* clipNameFilter)
+    {
+        std::scoped_lock lock(s_hookMutex);
+        // Disarming does not end an active session — the runtime owns that
+        // decision through endClipScrubSession (mode switch, idle timeout).
+        s_scrubCaptureArmed = armed;
+        s_scrubCaptureFilter = {};
+        if (clipNameFilter) {
+            std::size_t length = 0;
+            while (length < s_scrubCaptureFilter.size() - 1 && clipNameFilter[length] != '\0') {
+                s_scrubCaptureFilter[length] = clipNameFilter[length];
+                ++length;
+            }
+        }
+    }
+
+    ClipScrubSessionState clipScrubSessionState()
+    {
+        ClipScrubSessionState state{};
+        // acquire pairs with the capture's release publish, so the
+        // graph-thread-seeded duration fields below are visible whenever
+        // active reads true.
+        state.active = s_scrubClip.load(std::memory_order_acquire) != 0;
+        state.sessionId = s_scrubSessionId.load(std::memory_order_relaxed);
+        state.fraction = s_scrubObservedFraction.load(std::memory_order_relaxed);
+        if (state.active) {
+            state.durationSeconds = s_scrubClipDuration;
+            state.croppedDurationSeconds = s_scrubCroppedDuration;
+        }
+        return state;
+    }
+
+    void setClipScrubDesiredFraction(float fraction)
+    {
+        if (!std::isfinite(fraction)) {
+            return;
+        }
+        s_scrubDesiredFraction.store(
+            fraction < 0.0f ? 0.0f : (fraction > 1.0f ? 1.0f : fraction), std::memory_order_relaxed);
+    }
+
+    void endClipScrubSession()
+    {
+        // Flag only; the swept clip's own update shim performs the restore
+        // on the graph thread (the main thread never touches the clip).
+        if (s_scrubClip.load(std::memory_order_acquire) != 0) {
+            s_scrubEndRequested.store(true, std::memory_order_relaxed);
         }
     }
 

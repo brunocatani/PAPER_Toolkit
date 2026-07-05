@@ -21,6 +21,16 @@ namespace redux
         AuthoredOnly = 1,
         // Only runtime-learned paths drive parts.
         LearnedOnly = 2,
+        /*
+         * Clip scrub: the hand drives the live reload CLIP's time (Havok
+         * user-controlled mode on the captured hkbClipGenerator) and the
+         * ENGINE poses every part — no stored path geometry is replayed.
+         * Stored paths are still consulted for their EXISTENCE only (the
+         * "must move" eligibility gate uses a Hybrid lookup), never for
+         * drive-time data, so this mode is immune to the authored basis
+         * conversion. Learned/authored collection keeps running.
+         */
+        ClipScrub = 3,
     };
 
     [[nodiscard]] inline constexpr const char* motionPathModeName(MotionPathMode mode)
@@ -30,6 +40,8 @@ namespace redux
             return "authored";
         case MotionPathMode::LearnedOnly:
             return "learned";
+        case MotionPathMode::ClipScrub:
+            return "scrub";
         case MotionPathMode::Hybrid:
         default:
             return "hybrid";
@@ -62,6 +74,10 @@ namespace redux
         }
         if (equalsIgnoreCase(text, "learned")) {
             outMode = MotionPathMode::LearnedOnly;
+            return true;
+        }
+        if (equalsIgnoreCase(text, "scrub")) {
+            outMode = MotionPathMode::ClipScrub;
             return true;
         }
         return false;
