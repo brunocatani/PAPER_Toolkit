@@ -27,11 +27,16 @@ namespace redux
 
         bool slotMatches(
             std::uint32_t slotFormId,
+            std::uint32_t slotOmodFormId,
             const std::array<char, WeaponPartMotionLearner::kMaxSourceName>& name,
-            std::uint32_t weaponFormId,
-            std::string_view sourceName)
+            const WeaponPartMotionLearner::PartKey& key)
         {
-            return slotFormId == weaponFormId && slotName(name) == sourceName;
+            // STRICT identity: the OMOD component must match exactly — no
+            // cross-omod fallback, or a swapped part could serve a
+            // lookalike's data (the mismatch class this key eliminates).
+            return slotFormId == key.weaponFormId &&
+                   slotOmodFormId == key.omodFormId &&
+                   slotName(name) == key.sourceName;
         }
     }
 
@@ -47,7 +52,8 @@ namespace redux
         }
         ++_observationCounter;
 
-        auto* recorder = acquireRecorderSlot(observation.weaponFormId, observation.sourceName);
+        auto* recorder = acquireRecorderSlot(
+            PartKey{ observation.weaponFormId, observation.omodFormId, observation.sourceName });
         if (!recorder) {
             return;
         }
@@ -91,12 +97,10 @@ namespace redux
         }
     }
 
-    const WeaponPartMotionLearner::PathSlot* WeaponPartMotionLearner::findSlot(
-        std::uint32_t weaponFormId,
-        std::string_view sourceName) const
+    const WeaponPartMotionLearner::PathSlot* WeaponPartMotionLearner::findSlot(const PartKey& key) const
     {
         for (const auto& slot : _paths) {
-            if (slot.used && slotMatches(slot.weaponFormId, slot.sourceName, weaponFormId, sourceName)) {
+            if (slot.used && slotMatches(slot.weaponFormId, slot.omodFormId, slot.sourceName, key)) {
                 return &slot;
             }
         }
@@ -104,23 +108,21 @@ namespace redux
     }
 
     const weapon_part_motion_path::MotionPath* WeaponPartMotionLearner::findPath(
-        std::uint32_t weaponFormId,
-        std::string_view sourceName,
+        const PartKey& key,
         MotionPathMode mode) const
     {
         // lastUseCounter is an eviction hint, not behavior; keeping this
         // accessor const outweighs refreshing it on reads.
-        const auto* slot = findSlot(weaponFormId, sourceName);
+        const auto* slot = findSlot(key);
         const auto* primary = slot ? selectPrimary(*slot, mode) : nullptr;
         return primary ? &primary->path : nullptr;
     }
 
     WeaponPartMotionLearner::GroupView WeaponPartMotionLearner::findGroup(
-        std::uint32_t weaponFormId,
-        std::string_view sourceName,
+        const PartKey& key,
         MotionPathMode mode) const
     {
-        const auto* slot = findSlot(weaponFormId, sourceName);
+        const auto* slot = findSlot(key);
         const auto* primary = slot ? selectPrimary(*slot, mode) : nullptr;
         if (!primary) {
             return {};
@@ -143,10 +145,9 @@ namespace redux
     }
 
     WeaponPartMotionLearner::SourceAvailability WeaponPartMotionLearner::sourceAvailability(
-        std::uint32_t weaponFormId,
-        std::string_view sourceName) const
+        const PartKey& key) const
     {
-        const auto* slot = findSlot(weaponFormId, sourceName);
+        const auto* slot = findSlot(key);
         if (!slot) {
             return {};
         }
@@ -158,15 +159,14 @@ namespace redux
     }
 
     WeaponPartMotionLearner::PathSlot* WeaponPartMotionLearner::findOrClaimSlot(
-        std::uint32_t weaponFormId,
-        std::string_view sourceName,
+        const PartKey& key,
         bool preferSlotsWithoutLearnedData)
     {
         PathSlot* freeSlot = nullptr;
         PathSlot* preferredEviction = nullptr;
         PathSlot* anyEviction = nullptr;
         for (auto& slot : _paths) {
-            if (slot.used && slotMatches(slot.weaponFormId, slot.sourceName, weaponFormId, sourceName)) {
+            if (slot.used && slotMatches(slot.weaponFormId, slot.omodFormId, slot.sourceName, key)) {
                 return &slot;
             }
             if (!slot.used) {
@@ -190,31 +190,32 @@ namespace redux
         }
         if (claimed->used) {
             RDX_LOG_DEBUG(Weapon,
-                "WeaponPartMotionLearner: evicting path slot for part '{}' on weapon {:08X} (learned={} authored={})",
+                "WeaponPartMotionLearner: evicting path slot for part '{}' (omod {:08X}) on weapon {:08X} (learned={} authored={})",
                 slotName(claimed->sourceName),
+                claimed->omodFormId,
                 claimed->weaponFormId,
                 claimed->learnedPrimary.used,
                 claimed->authored.used);
         }
         *claimed = {};
         claimed->used = true;
-        claimed->weaponFormId = weaponFormId;
-        copySlotName(claimed->sourceName, sourceName);
+        claimed->weaponFormId = key.weaponFormId;
+        claimed->omodFormId = key.omodFormId;
+        copySlotName(claimed->sourceName, key.sourceName);
         return claimed;
     }
 
     void WeaponPartMotionLearner::storeAuthoredGroup(
-        std::uint32_t weaponFormId,
-        std::string_view sourceName,
+        const PartKey& key,
         const weapon_clip_stroke::AuthoredStrokeGroup& group,
         bool fallbackSource)
     {
-        if (weaponFormId == 0 || sourceName.empty() || !group.leaderPath.valid) {
+        if (key.weaponFormId == 0 || key.sourceName.empty() || !group.leaderPath.valid) {
             return;
         }
         ++_observationCounter;
 
-        auto* target = findOrClaimSlot(weaponFormId, sourceName, true);
+        auto* target = findOrClaimSlot(key, true);
         if (!target) {
             return;
         }
@@ -250,11 +251,12 @@ namespace redux
         const auto& firstKey = group.leaderPath.keys.front();
         const auto& lastKey = group.leaderPath.keys.back();
         RDX_LOG_INFO(Weapon,
-            "WeaponPartMotionLearner: {} AUTHORED [{}] stroke group for part '{}' on weapon {:08X} (leader arc {:.2f} game units, {} followers, learned record {}) start=({:.2f},{:.2f},{:.2f}) end=({:.2f},{:.2f},{:.2f})",
+            "WeaponPartMotionLearner: {} AUTHORED [{}] stroke group for part '{}' (omod {:08X}) on weapon {:08X} (leader arc {:.2f} game units, {} followers, learned record {}) start=({:.2f},{:.2f},{:.2f}) end=({:.2f},{:.2f},{:.2f})",
             replaced ? "updated" : "stored",
             fallbackSource ? "fallback-loaded" : "weapon-clip",
-            sourceName,
-            weaponFormId,
+            key.sourceName,
+            key.omodFormId,
+            key.weaponFormId,
             group.leaderPath.totalArcLength,
             record.followerCount,
             target->learnedPrimary.used ? "also present" : "absent",
@@ -286,14 +288,12 @@ namespace redux
         ++_revision;
     }
 
-    WeaponPartMotionLearner::RecorderSlot* WeaponPartMotionLearner::acquireRecorderSlot(
-        std::uint32_t weaponFormId,
-        std::string_view sourceName)
+    WeaponPartMotionLearner::RecorderSlot* WeaponPartMotionLearner::acquireRecorderSlot(const PartKey& key)
     {
         RecorderSlot* freeSlot = nullptr;
         RecorderSlot* staleSlot = nullptr;
         for (auto& slot : _recorders) {
-            if (slot.used && slotMatches(slot.weaponFormId, slot.sourceName, weaponFormId, sourceName)) {
+            if (slot.used && slotMatches(slot.weaponFormId, slot.omodFormId, slot.sourceName, key)) {
                 return &slot;
             }
             if (!slot.used) {
@@ -309,8 +309,9 @@ namespace redux
             return nullptr;
         }
         claimed->used = true;
-        claimed->weaponFormId = weaponFormId;
-        copySlotName(claimed->sourceName, sourceName);
+        claimed->weaponFormId = key.weaponFormId;
+        claimed->omodFormId = key.omodFormId;
+        copySlotName(claimed->sourceName, key.sourceName);
         claimed->lastSeenCounter = _observationCounter;
         claimed->state = {};
         return claimed;
@@ -333,7 +334,8 @@ namespace redux
          * primary. Which motion becomes "primary" is simply whichever was
          * learned first; the scrub stage machine is symmetric.
          */
-        auto* target = findOrClaimSlot(recorder.weaponFormId, slotName(recorder.sourceName), false);
+        auto* target = findOrClaimSlot(
+            PartKey{ recorder.weaponFormId, recorder.omodFormId, slotName(recorder.sourceName) }, false);
         if (!target) {
             return;
         }
@@ -520,10 +522,11 @@ namespace redux
         const auto& firstKey = candidate.keys.front();
         const auto& lastKey = candidate.keys.back();
         RDX_LOG_INFO(Weapon,
-            "WeaponPartMotionLearner: {} LEARNED {} motion path for part '{}' on weapon {:08X} (stroke arc {:.2f} game units, {} raw samples, followers: {} rigid + {} co-timed, authored record {}) start=({:.2f},{:.2f},{:.2f}) end=({:.2f},{:.2f},{:.2f})",
+            "WeaponPartMotionLearner: {} LEARNED {} motion path for part '{}' (omod {:08X}) on weapon {:08X} (stroke arc {:.2f} game units, {} raw samples, followers: {} rigid + {} co-timed, authored record {}) start=({:.2f},{:.2f},{:.2f}) end=({:.2f},{:.2f},{:.2f})",
             replaced ? "updated" : "learned",
             isReturnStage ? "RETURN-stage" : "primary",
             slotName(recorder.sourceName),
+            recorder.omodFormId,
             recorder.weaponFormId,
             candidate.totalArcLength,
             recorder.state.sampleCount,

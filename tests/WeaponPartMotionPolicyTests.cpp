@@ -295,16 +295,16 @@ int main()
         }
         fallbackGroup.leaderPath.totalArcLength = 4.0f;
         fallbackGroup.leaderPath.valid = true;
-        learner.storeAuthoredGroup(kWeapon, kPart, fallbackGroup, true);
+        learner.storeAuthoredGroup({ kWeapon, 0, kPart }, fallbackGroup, true);
 
         ok &= expectTrue("authored-only serves the fallback stroke",
-            learner.findPath(kWeapon, kPart, MotionPathMode::AuthoredOnly) != nullptr);
+            learner.findPath({ kWeapon, 0, kPart }, MotionPathMode::AuthoredOnly) != nullptr);
         ok &= expectTrue("hybrid serves authored while nothing is learned",
-            learner.findGroup(kWeapon, kPart, MotionPathMode::Hybrid).authored);
+            learner.findGroup({ kWeapon, 0, kPart }, MotionPathMode::Hybrid).authored);
         ok &= expectTrue("hybrid reports the fallback tier",
-            learner.findGroup(kWeapon, kPart, MotionPathMode::Hybrid).fallbackSource);
+            learner.findGroup({ kWeapon, 0, kPart }, MotionPathMode::Hybrid).fallbackSource);
         ok &= expectTrue("learned-only has nothing before learning",
-            learner.findPath(kWeapon, kPart, MotionPathMode::LearnedOnly) == nullptr);
+            learner.findPath({ kWeapon, 0, kPart }, MotionPathMode::LearnedOnly) == nullptr);
 
         // Activated-clip stroke outranks the fallback even when shorter...
         weapon_clip_stroke::AuthoredStrokeGroup activatedGroup = fallbackGroup;
@@ -313,17 +313,37 @@ int main()
         }
         activatedGroup.leaderPath.totalArcLength = 3.0f;
         activatedGroup.activatedClip = true;
-        learner.storeAuthoredGroup(kWeapon, kPart, activatedGroup, false);
+        learner.storeAuthoredGroup({ kWeapon, 0, kPart }, activatedGroup, false);
         {
-            const auto view = learner.findGroup(kWeapon, kPart, MotionPathMode::AuthoredOnly);
+            const auto view = learner.findGroup({ kWeapon, 0, kPart }, MotionPathMode::AuthoredOnly);
             ok &= expectTrue("activated stroke replaces the fallback tier", view.leaderPath && !view.fallbackSource);
             ok &= expectTrue("activated stroke arc stored",
                 view.leaderPath && std::abs(view.leaderPath->totalArcLength - 3.0f) < 0.01f);
         }
         // ...and a later fallback store never demotes it.
-        learner.storeAuthoredGroup(kWeapon, kPart, fallbackGroup, true);
+        learner.storeAuthoredGroup({ kWeapon, 0, kPart }, fallbackGroup, true);
         ok &= expectFalse("fallback store cannot demote an activated stroke",
-            learner.findGroup(kWeapon, kPart, MotionPathMode::AuthoredOnly).fallbackSource);
+            learner.findGroup({ kWeapon, 0, kPart }, MotionPathMode::AuthoredOnly).fallbackSource);
+
+        // OMOD identity isolation: two parts sharing a node name but owned
+        // by different OMODs (two receiver mods both named "WeaponBolt")
+        // keep separate records — a workbench part swap can only ever find
+        // ITS OWN data or none, never a lookalike's.
+        constexpr std::uint32_t kOmodA = 0x00112233;
+        constexpr std::uint32_t kOmodB = 0x00445566;
+        weapon_clip_stroke::AuthoredStrokeGroup omodAGroup = fallbackGroup;
+        omodAGroup.leaderPath.totalArcLength = 6.0f;
+        learner.storeAuthoredGroup({ kWeapon, kOmodA, kPart }, omodAGroup, false);
+        ok &= expectTrue("omod-keyed record found under its own key",
+            learner.findPath({ kWeapon, kOmodA, kPart }, MotionPathMode::AuthoredOnly) != nullptr);
+        ok &= expectTrue("different omod, same name: no data served",
+            learner.findPath({ kWeapon, kOmodB, kPart }, MotionPathMode::AuthoredOnly) == nullptr);
+        {
+            // The omod-A store must not have touched the base (omod 0) record.
+            const auto baseView = learner.findGroup({ kWeapon, 0, kPart }, MotionPathMode::AuthoredOnly);
+            ok &= expectTrue("base-key record untouched by omod-keyed store",
+                baseView.leaderPath && std::abs(baseView.leaderPath->totalArcLength - 3.0f) < 0.01f);
+        }
 
         // Teach a learned stroke through real observations.
         PoseSample rest{};
@@ -354,7 +374,7 @@ int main()
             feed(rest);
         }
 
-        const auto* learnedPath = learner.findPath(kWeapon, kPart, MotionPathMode::LearnedOnly);
+        const auto* learnedPath = learner.findPath({ kWeapon, 0, kPart }, MotionPathMode::LearnedOnly);
         ok &= expectTrue("observed stroke lands in the learned record", learnedPath != nullptr);
         ok &= expectTrue("learned stroke arc covers the observed pull",
             learnedPath && learnedPath->totalArcLength > 5.5f && learnedPath->totalArcLength < 6.5f);
@@ -362,13 +382,13 @@ int main()
         // The regression this redesign prevents: learning must NOT destroy
         // the authored record, and each mode serves its own source.
         {
-            const auto authoredView = learner.findGroup(kWeapon, kPart, MotionPathMode::AuthoredOnly);
+            const auto authoredView = learner.findGroup({ kWeapon, 0, kPart }, MotionPathMode::AuthoredOnly);
             ok &= expectTrue("authored record survives learning", authoredView.leaderPath != nullptr);
             ok &= expectTrue("authored-only still serves the authored stroke",
                 authoredView.leaderPath && std::abs(authoredView.leaderPath->totalArcLength - 3.0f) < 0.01f);
-            const auto hybridView = learner.findGroup(kWeapon, kPart, MotionPathMode::Hybrid);
+            const auto hybridView = learner.findGroup({ kWeapon, 0, kPart }, MotionPathMode::Hybrid);
             ok &= expectTrue("hybrid now serves the learned stroke", hybridView.leaderPath && !hybridView.authored);
-            const auto availability = learner.sourceAvailability(kWeapon, kPart);
+            const auto availability = learner.sourceAvailability({ kWeapon, 0, kPart });
             ok &= expectTrue("availability reports both sources", availability.learned && availability.authored);
         }
 
@@ -379,11 +399,11 @@ int main()
             biggerActivated.leaderPath.keys[key].translate.y *= 2.0f;
         }
         biggerActivated.leaderPath.totalArcLength = 6.0f;
-        learner.storeAuthoredGroup(kWeapon, kPart, biggerActivated, false);
+        learner.storeAuthoredGroup({ kWeapon, 0, kPart }, biggerActivated, false);
         ok &= expectTrue("learned record survives an authored update",
-            learner.findPath(kWeapon, kPart, MotionPathMode::LearnedOnly) != nullptr);
+            learner.findPath({ kWeapon, 0, kPart }, MotionPathMode::LearnedOnly) != nullptr);
         {
-            const auto authoredView = learner.findGroup(kWeapon, kPart, MotionPathMode::AuthoredOnly);
+            const auto authoredView = learner.findGroup({ kWeapon, 0, kPart }, MotionPathMode::AuthoredOnly);
             ok &= expectTrue("larger same-tier authored stroke replaced the stored one",
                 authoredView.leaderPath && std::abs(authoredView.leaderPath->totalArcLength - 6.0f) < 0.01f);
         }
@@ -437,7 +457,7 @@ int main()
                 feedPair(0.0f);
             }
 
-            const auto group = learner.findGroup(kWeapon2, kLeader, MotionPathMode::LearnedOnly);
+            const auto group = learner.findGroup({ kWeapon2, 0, kLeader }, MotionPathMode::LearnedOnly);
             ok &= expectTrue("co-moved pair learns a leader group", group.leaderPath != nullptr);
             ok &= expectTrue("rigid co-mover rides as a learned follower", group.followerCount >= 1);
             if (group.followerCount >= 1) {
@@ -510,7 +530,7 @@ int main()
                 frame3(-8.0f, 2.0f, -4.0f);
             }
 
-            const auto slideGroup = learner.findGroup(kWeapon3, kSlide, MotionPathMode::LearnedOnly);
+            const auto slideGroup = learner.findGroup({ kWeapon3, 0, kSlide }, MotionPathMode::LearnedOnly);
             ok &= expectTrue("slide stroke learned", slideGroup.leaderPath != nullptr);
             bool barrelIsFollower = false;
             bool earlyMoverIsFollower = false;
@@ -563,10 +583,10 @@ int main()
             for (std::uint32_t i = 0; i < weapon_part_motion_path::kRestReturnFramesToComplete + 2; ++i) {
                 feed4(out);
             }
-            const auto* primaryPath = learner.findPath(kWeapon4, kMag, MotionPathMode::LearnedOnly);
+            const auto* primaryPath = learner.findPath({ kWeapon4, 0, kMag }, MotionPathMode::LearnedOnly);
             ok &= expectTrue("extraction stroke learned as primary", primaryPath != nullptr);
             ok &= expectTrue("no return stage before the insertion is observed",
-                learner.findGroup(kWeapon4, kMag, MotionPathMode::LearnedOnly).returnPath == nullptr);
+                learner.findGroup({ kWeapon4, 0, kMag }, MotionPathMode::LearnedOnly).returnPath == nullptr);
 
             // Insertion: re-arm at OUT, push back to seated, settle.
             for (std::uint32_t i = 0; i <= weapon_part_motion_path::kRestStableFramesToArm; ++i) {
@@ -579,7 +599,7 @@ int main()
                 feed4(seated);
             }
 
-            const auto magGroup = learner.findGroup(kWeapon4, kMag, MotionPathMode::LearnedOnly);
+            const auto magGroup = learner.findGroup({ kWeapon4, 0, kMag }, MotionPathMode::LearnedOnly);
             ok &= expectTrue("primary stage survives the insertion", magGroup.leaderPath != nullptr);
             ok &= expectTrue("insertion stroke stored as the return stage", magGroup.returnPath != nullptr);
             if (magGroup.leaderPath && magGroup.returnPath) {

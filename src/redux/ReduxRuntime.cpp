@@ -430,6 +430,7 @@ namespace redux
             entry.node = node;
             entry.partKind = detail.partKind;
             entry.actionRole = detail.actionRole;
+            entry.omodFormId = detail.omodFormId;
             entry.sourceName = {};
             std::memcpy(
                 entry.sourceName.data(),
@@ -491,7 +492,9 @@ namespace redux
                 // "Must move": without a motion path under the active mode
                 // the part is not attach-only and not grouped — it keeps its
                 // normal grip even though its class is allowlisted.
-                if (!_learner.findPath(weaponFormId, sourceName, g_reduxConfig.motionPathMode)) {
+                if (!_learner.findPath(
+                        WeaponPartMotionLearner::PartKey{ weaponFormId, entry.omodFormId, sourceName },
+                        g_reduxConfig.motionPathMode)) {
                     appendName(unmappedNames, unmappedLength, sourceName);
                     continue;
                 }
@@ -573,6 +576,7 @@ namespace redux
             pose.rotate = weapon_part_motion_path::Quat{ quaternion[3], quaternion[0], quaternion[1], quaternion[2] };
             _learner.observe(WeaponPartMotionLearner::Observation{
                 .weaponFormId = weaponFormId,
+                .omodFormId = entry.omodFormId,
                 .sourceName = providerFixedStringView(entry.sourceName.data(), entry.sourceName.size()),
                 .pose = pose,
                 .scale = partWeaponLocal.scale,
@@ -1228,8 +1232,10 @@ namespace redux
                         ++groupForEntry.followerCount;
                     }
                     _learner.storeAuthoredGroup(
-                        weaponFormId,
-                        providerFixedStringView(entry.sourceName.data(), entry.sourceName.size()),
+                        WeaponPartMotionLearner::PartKey{
+                            weaponFormId,
+                            entry.omodFormId,
+                            providerFixedStringView(entry.sourceName.data(), entry.sourceName.size()) },
                         groupForEntry,
                         fallbackSource);
                     storedForEvidence = true;
@@ -1237,10 +1243,16 @@ namespace redux
             }
 
             if (!storedForEvidence) {
-                // No collider evidence under this bone yet; keep the stroke
-                // under the rig-bone name so future parts can find it.
+                // No collider evidence under this bone yet: stored under the
+                // rig-bone name with omod 0 (no concrete part identity). A
+                // paired part appearing later looks up with ITS omod and
+                // will not see this record — strict keying accepts that
+                // authored-coverage gap over serving cross-part data.
                 if (convertLeaderPath(group, leaderRestWeaponLocal, nullptr, converted.leaderPath)) {
-                    _learner.storeAuthoredGroup(weaponFormId, leaderName, converted, fallbackSource);
+                    _learner.storeAuthoredGroup(
+                        WeaponPartMotionLearner::PartKey{ weaponFormId, 0, leaderName },
+                        converted,
+                        fallbackSource);
                 }
             }
         }
@@ -1403,6 +1415,7 @@ namespace redux
                         handInput.sourceName = providerFixedStringView(
                             _drivePartCache.entries[i].sourceName.data(),
                             _drivePartCache.entries[i].sourceName.size());
+                        handInput.omodFormId = _drivePartCache.entries[i].omodFormId;
                         if (_drivePartCache.entries[i].restPoseValid) {
                             handInput.restPoseValid = true;
                             handInput.restPose = _drivePartCache.entries[i].restPose;

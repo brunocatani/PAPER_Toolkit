@@ -65,6 +65,9 @@ namespace redux
             bool triggerHeld{ false };
             std::uint64_t gripSequence{ 0 };
             std::uint32_t bodyId{ 0x7FFF'FFFFu };
+            // Installed OMOD occupying the gripped part's slot (ROCK record
+            // identity, 0 for base/unpaired) — part of the learner key.
+            std::uint32_t omodFormId{ 0 };
             std::string_view sourceName{};
             // All positions weapon-root-local, valid only when resolvable.
             bool transformsValid{ false };
@@ -170,6 +173,8 @@ namespace redux
             std::uint32_t bodyId{ 0x7FFF'FFFFu };
             std::uint64_t weaponGenerationKey{ 0 };
             std::uint32_t weaponFormId{ 0 };
+            // Learner-key OMOD identity pinned at grip start (see HandInput).
+            std::uint32_t omodFormId{ 0 };
             // Path source pinned at grip start (see FrameInput).
             MotionPathMode mode{ MotionPathMode::Hybrid };
             // Which learned stage the session is scrubbing; flips at the

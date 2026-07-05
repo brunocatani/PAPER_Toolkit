@@ -61,9 +61,31 @@ namespace redux
         // stale (weapon switched / part removed) and may be reclaimed.
         static constexpr std::uint64_t kRecorderStaleObservationAge = 300;
 
+        /*
+         * Identity of one concrete part (Bruno, 2026-07-05 long-term
+         * scalability): the weapon form, the installed OMOD occupying the
+         * part's slot (ROCK record identity; 0 for base-weapon/unpaired
+         * parts), and the nif node name. The OMOD component is what makes
+         * learned data workbench-safe — two mods sharing a node name (two
+         * receivers both named "Receiver") keep separate records, so a part
+         * swap can only ever find ITS OWN data or none, never a lookalike's.
+         * With a pre-record-identity ROCK every omodFormId arrives 0 and
+         * keying degrades to the old (weapon, name) behavior. Runtime
+         * formIDs only — persistence (phase 2) normalizes to plugin-local
+         * ids at the disk boundary, never here.
+         */
+        struct PartKey
+        {
+            std::uint32_t weaponFormId{ 0 };
+            std::uint32_t omodFormId{ 0 };
+            std::string_view sourceName{};
+        };
+
         struct Observation
         {
             std::uint32_t weaponFormId{ 0 };
+            // Installed OMOD occupying this part's slot; see PartKey.
+            std::uint32_t omodFormId{ 0 };
             std::string_view sourceName{};
             weapon_part_motion_path::PoseSample pose{};
             /*
@@ -109,8 +131,7 @@ namespace redux
         void observe(const Observation& observation);
 
         [[nodiscard]] const weapon_part_motion_path::MotionPath* findPath(
-            std::uint32_t weaponFormId,
-            std::string_view sourceName,
+            const PartKey& key,
             MotionPathMode mode) const;
 
         /*
@@ -132,7 +153,7 @@ namespace redux
             // clip rather than one the weapon activated.
             bool fallbackSource{ false };
         };
-        [[nodiscard]] GroupView findGroup(std::uint32_t weaponFormId, std::string_view sourceName, MotionPathMode mode) const;
+        [[nodiscard]] GroupView findGroup(const PartKey& key, MotionPathMode mode) const;
 
         // Which sources hold data for a part; for source-selection logging
         // ("mode=authored but only learned data exists").
@@ -142,7 +163,7 @@ namespace redux
             bool authored{ false };
             bool authoredFallback{ false };
         };
-        [[nodiscard]] SourceAvailability sourceAvailability(std::uint32_t weaponFormId, std::string_view sourceName) const;
+        [[nodiscard]] SourceAvailability sourceAvailability(const PartKey& key) const;
 
         /*
          * Store a clip-harvested stroke group (already converted to
@@ -154,8 +175,7 @@ namespace redux
          * exists. Within the same tier the largest leader stroke wins.
          */
         void storeAuthoredGroup(
-            std::uint32_t weaponFormId,
-            std::string_view sourceName,
+            const PartKey& key,
             const weapon_clip_stroke::AuthoredStrokeGroup& group,
             bool fallbackSource);
 
@@ -180,6 +200,7 @@ namespace redux
         {
             bool used{ false };
             std::uint32_t weaponFormId{ 0 };
+            std::uint32_t omodFormId{ 0 };
             std::array<char, kMaxSourceName> sourceName{};
             std::uint64_t lastUseCounter{ 0 };
             StrokeGroup learnedPrimary{};
@@ -196,6 +217,7 @@ namespace redux
         {
             bool used{ false };
             std::uint32_t weaponFormId{ 0 };
+            std::uint32_t omodFormId{ 0 };
             std::array<char, kMaxSourceName> sourceName{};
             std::uint64_t lastSeenCounter{ 0 };
             // Last observed weapon-root-local scale of the part; stamped on
@@ -209,11 +231,11 @@ namespace redux
         };
 
         [[nodiscard]] static const StrokeGroup* selectPrimary(const PathSlot& slot, MotionPathMode mode);
-        [[nodiscard]] const PathSlot* findSlot(std::uint32_t weaponFormId, std::string_view sourceName) const;
+        [[nodiscard]] const PathSlot* findSlot(const PartKey& key) const;
         // preferSlotsWithoutLearnedData: authored stores must not evict a
         // slot holding a learned stroke while a purely-authored slot exists.
-        PathSlot* findOrClaimSlot(std::uint32_t weaponFormId, std::string_view sourceName, bool preferSlotsWithoutLearnedData);
-        RecorderSlot* acquireRecorderSlot(std::uint32_t weaponFormId, std::string_view sourceName);
+        PathSlot* findOrClaimSlot(const PartKey& key, bool preferSlotsWithoutLearnedData);
+        RecorderSlot* acquireRecorderSlot(const PartKey& key);
         void storeCompletedPath(const RecorderSlot& recorder);
 
         std::array<PathSlot, kMaxStoredPaths> _paths{};

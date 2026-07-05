@@ -68,6 +68,11 @@ namespace redux
             // against the INI allowlist when resolving attach-only targets.
             std::uint32_t partKind{ 0 };
             std::uint32_t actionRole{ 0 };
+            // ROCK record identity: the installed OMOD occupying this part's
+            // slot (0 for base/unpaired, and always 0 on a pre-record-
+            // identity ROCK). Part of the learner key, so a workbench part
+            // swap can never serve a lookalike's motion data.
+            std::uint32_t omodFormId{ 0 };
             std::array<char, WeaponPartMotionLearner::kMaxSourceName> sourceName{};
             /*
              * Rest-pose capture (weapon-local): the pose the part settles at

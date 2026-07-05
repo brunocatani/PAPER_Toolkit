@@ -250,14 +250,17 @@ namespace redux
                     }
                     continue;
                 }
-                const auto group = learner.findGroup(input.weaponFormId, hand.sourceName, input.motionPathMode);
+                const auto group = learner.findGroup(
+                    WeaponPartMotionLearner::PartKey{ input.weaponFormId, hand.omodFormId, hand.sourceName },
+                    input.motionPathMode);
                 if (!group.leaderPath) {
                     if (_lastNoPathGripSequence[handIndex] != hand.gripSequence) {
                         _lastNoPathGripSequence[handIndex] = hand.gripSequence;
                         // Say what DOES exist so a mode mismatch is readable
                         // straight from the log ("authored data present but
                         // mode=learned").
-                        const auto available = learner.sourceAvailability(input.weaponFormId, hand.sourceName);
+                        const auto available = learner.sourceAvailability(
+                            WeaponPartMotionLearner::PartKey{ input.weaponFormId, hand.omodFormId, hand.sourceName });
                         RDX_LOG_INFO(Weapon,
                             "WeaponPartDriveSandbox: no motion path for part '{}' on weapon {:08X} under mode={} (available: learned={} authored={}{})",
                             hand.sourceName,
@@ -278,6 +281,7 @@ namespace redux
                 session.bodyId = hand.bodyId;
                 session.weaponGenerationKey = input.weaponGenerationKey;
                 session.weaponFormId = input.weaponFormId;
+                session.omodFormId = hand.omodFormId;
                 session.mode = input.motionPathMode;
                 session.sourceName = {};
                 std::memcpy(session.sourceName.data(), hand.sourceName.data(), (std::min)(hand.sourceName.size(), session.sourceName.size() - 1));
@@ -327,7 +331,9 @@ namespace redux
             }
             // Session-pinned mode: a hot-reload switch never swaps the path
             // under a hand mid-scrub.
-            const auto liveGroup = learner.findGroup(session.weaponFormId, sessionName(session.sourceName), session.mode);
+            const auto liveGroup = learner.findGroup(
+                WeaponPartMotionLearner::PartKey{ session.weaponFormId, session.omodFormId, sessionName(session.sourceName) },
+                session.mode);
             const weapon_part_motion_path::MotionPath* path =
                 session.onReturnStage ? liveGroup.returnPath : liveGroup.leaderPath;
             if (!path) {
