@@ -316,21 +316,252 @@ namespace redux
          * or zero generation, so holstered/transition frames only end the
          * drive sessions.
          */
+        // Library first: an equip-time import must land before this frame's
+        // observation/eligibility read the learner.
+        updateMotionLibrary(weaponFormId);
         observeWeaponPartMotion(weaponNode, generationKey, weaponFormId);
         drainWeaponClipHarvest(weaponNode, generationKey, weaponFormId);
         updateWeaponClipHarvestWalk(weaponNode, generationKey, weaponFormId);
         updateWeaponPartDriveSandbox(weaponNode, generationKey, weaponFormId, snapshot);
     }
 
+    void ReduxRuntime::updateMotionLibrary(std::uint32_t weaponFormId)
+    {
+        if (!g_reduxConfig.motionLibrary) {
+            return;
+        }
+        if (weaponFormId != _libraryWeaponFormId) {
+            // Weapon switch: persist what the previous weapon learned, then
+            // seed the new one from disk.
+            flushMotionLibrarySave();
+            _libraryWeaponFormId = weaponFormId;
+            _libraryWeaponRef = {};
+            _libraryLoaded.reset();
+            _libraryStableFrames = 0;
+            _librarySyncedRevision = _learner.revision();
+            _libraryLastRevision = _librarySyncedRevision;
+            if (weaponFormId != 0) {
+                loadMotionLibraryForWeapon(weaponFormId);
+            }
+            return;
+        }
+        if (weaponFormId == 0) {
+            return;
+        }
+        // Debounce: save once the learner revision has been STABLE past the
+        // window — mid-mapping stroke bursts coalesce into one write.
+        constexpr std::uint32_t kSaveDebounceFrames = 300;
+        const auto revision = _learner.revision();
+        if (revision != _libraryLastRevision) {
+            _libraryLastRevision = revision;
+            _libraryStableFrames = 0;
+            return;
+        }
+        if (revision == _librarySyncedRevision) {
+            return;
+        }
+        if (++_libraryStableFrames >= kSaveDebounceFrames) {
+            _libraryStableFrames = 0;
+            flushMotionLibrarySave();
+        }
+    }
+
+    void ReduxRuntime::loadMotionLibraryForWeapon(std::uint32_t weaponFormId)
+    {
+        _libraryWeaponRef = motion_library::MotionLibraryStore::formRefFromRuntimeId(weaponFormId);
+        if (_libraryWeaponRef.empty()) {
+            RDX_LOG_DEBUG(Weapon,
+                "Motion library: weapon {:08X} has no resolvable plugin identity — not persisted",
+                weaponFormId);
+            return;
+        }
+        auto library = std::make_unique<motion_library::WeaponLibrary>();
+        std::string error;
+        if (!_libraryStore.load(_libraryWeaponRef, *library, &error)) {
+            if (!error.empty()) {
+                RDX_LOG_WARN(Weapon,
+                    "Motion library: file for '{}' {:08X} is unusable ({}) — starting fresh, the file will not be overwritten until new data is learned",
+                    _libraryWeaponRef.plugin,
+                    _libraryWeaponRef.localFormId,
+                    error);
+            }
+            return;
+        }
+        if (!error.empty()) {
+            RDX_LOG_WARN(Weapon, "Motion library: '{}' partially loaded — {}", _libraryWeaponRef.plugin, error);
+        }
+
+        std::uint32_t applied = 0;
+        std::uint32_t skippedOmods = 0;
+        for (const auto& part : library->parts) {
+            std::uint32_t omodRuntimeId = 0;
+            if (!part.omod.empty()) {
+                omodRuntimeId = motion_library::MotionLibraryStore::runtimeIdFromFormRef(part.omod);
+                if (omodRuntimeId == 0) {
+                    // The OMOD's plugin is gone from the load order: the
+                    // data is inert (its part cannot exist), never re-keyed.
+                    ++skippedOmods;
+                    continue;
+                }
+            }
+            const auto stageView = [](const motion_library::StageData& stage) {
+                return stage.used
+                    ? WeaponPartMotionLearner::StageView{ &stage.path, stage.followers.data(), stage.followerCount }
+                    : WeaponPartMotionLearner::StageView{};
+            };
+            const WeaponPartMotionLearner::RecordView record{
+                .omodFormId = omodRuntimeId,
+                .sourceName = part.sourceName,
+                .learnedPrimary = stageView(part.learnedPrimary),
+                .learnedReturn = stageView(part.learnedReturn),
+                .authored = stageView(part.authored),
+                .authoredFallback = part.authoredFallback,
+            };
+            if (_learner.importRecord(
+                    WeaponPartMotionLearner::PartKey{ weaponFormId, omodRuntimeId, part.sourceName }, record)) {
+                ++applied;
+            }
+        }
+        RDX_LOG_INFO(Weapon,
+            "Motion library: '{}' {:08X} loaded — {} part record(s), {} imported{}{}",
+            _libraryWeaponRef.plugin,
+            _libraryWeaponRef.localFormId,
+            library->parts.size(),
+            applied,
+            library->curated ? " [CURATED — runtime never overwrites this file]" : "",
+            skippedOmods > 0 ? " (some skipped: omod plugin not in load order)" : "");
+        _libraryLoaded = std::move(library);
+        // Imported state counts as synced; only NEW learning dirties.
+        _librarySyncedRevision = _learner.revision();
+        _libraryLastRevision = _librarySyncedRevision;
+    }
+
+    void ReduxRuntime::flushMotionLibrarySave()
+    {
+        const auto revision = _learner.revision();
+        if (_libraryWeaponFormId == 0 || revision == _librarySyncedRevision) {
+            return;
+        }
+        // Every early-out below still marks the revision synced so the
+        // debounce does not retry a save that can never happen.
+        if (!g_reduxConfig.motionLibrary || g_reduxConfig.motionLibraryReadOnly ||
+            _libraryWeaponRef.empty() || (_libraryLoaded && _libraryLoaded->curated)) {
+            _librarySyncedRevision = revision;
+            return;
+        }
+
+        std::array<WeaponPartMotionLearner::RecordView, WeaponPartMotionLearner::kMaxStoredPaths> records{};
+        const auto count = _learner.exportWeaponRecords(
+            _libraryWeaponFormId, records.data(), static_cast<std::uint32_t>(records.size()));
+        if (count == 0) {
+            // Never write (or overwrite with) an empty library.
+            _librarySyncedRevision = revision;
+            return;
+        }
+
+        motion_library::WeaponLibrary library;
+        library.weapon = _libraryWeaponRef;
+        if (auto* weapon = RE::TESForm::GetFormByID<RE::TESObjectWEAP>(_libraryWeaponFormId)) {
+            if (const char* fullName = weapon->GetFullName()) {
+                library.weaponName = fullName;
+            }
+        }
+        library.parts.reserve(count);
+        const auto fillStage = [](const WeaponPartMotionLearner::StageView& view, motion_library::StageData& out) {
+            if (!view.path || !view.path->valid) {
+                return;
+            }
+            out.used = true;
+            out.path = *view.path;
+            out.followerCount = 0;
+            if (view.followers) {
+                out.followerCount =
+                    (std::min)(view.followerCount, static_cast<std::uint32_t>(out.followers.size()));
+                for (std::uint32_t i = 0; i < out.followerCount; ++i) {
+                    out.followers[i] = view.followers[i];
+                }
+            }
+        };
+        std::uint32_t skippedOmods = 0;
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const auto& record = records[i];
+            motion_library::PartRecord part;
+            if (record.omodFormId != 0) {
+                part.omod = motion_library::MotionLibraryStore::formRefFromRuntimeId(record.omodFormId);
+                if (part.omod.empty()) {
+                    // Unresolvable OMOD identity cannot round-trip; fail
+                    // closed rather than persist an ambiguous record.
+                    ++skippedOmods;
+                    continue;
+                }
+            }
+            part.sourceName = std::string(record.sourceName);
+            fillStage(record.learnedPrimary, part.learnedPrimary);
+            fillStage(record.learnedReturn, part.learnedReturn);
+            fillStage(record.authored, part.authored);
+            part.authoredFallback = record.authoredFallback;
+            // Curation-text merge: stageName/notes live only in the files.
+            if (_libraryLoaded) {
+                for (const auto& old : _libraryLoaded->parts) {
+                    if (old.sourceName == part.sourceName &&
+                        old.omod.plugin == part.omod.plugin &&
+                        old.omod.localFormId == part.omod.localFormId) {
+                        part.learnedPrimary.stageName = old.learnedPrimary.stageName;
+                        part.learnedPrimary.notes = old.learnedPrimary.notes;
+                        part.learnedReturn.stageName = old.learnedReturn.stageName;
+                        part.learnedReturn.notes = old.learnedReturn.notes;
+                        part.authored.stageName = old.authored.stageName;
+                        part.authored.notes = old.authored.notes;
+                        break;
+                    }
+                }
+            }
+            if (part.learnedPrimary.used || part.authored.used) {
+                library.parts.push_back(std::move(part));
+            }
+        }
+
+        const auto partCount = library.parts.size();
+        _libraryStore.save(library);
+        _librarySyncedRevision = revision;
+        RDX_LOG_INFO(Weapon,
+            "Motion library: save queued for '{}' {:08X} ({} part record(s){})",
+            _libraryWeaponRef.plugin,
+            _libraryWeaponRef.localFormId,
+            partCount,
+            skippedOmods > 0 ? ", some omods unresolvable and skipped" : "");
+    }
+
     void ReduxRuntime::wipeLearnedPaths()
     {
         _learner.reset();
+        std::uint32_t deletedFiles = 0;
+        if (g_reduxConfig.motionLibrary) {
+            deletedFiles = _libraryStore.deleteAllExceptCurated();
+        }
+        // Force the library path to re-resolve the (still equipped) weapon
+        // next frame — its file is gone, so it starts a fresh recording.
+        _libraryLoaded.reset();
+        _libraryWeaponFormId = 0;
+        _libraryWeaponRef = {};
+        _libraryStableFrames = 0;
         RDX_LOG_INFO(Weapon,
-            "Learned motion data WIPED (bResetLearnedPaths) — reloads re-record from scratch; authored strokes re-harvest on the next equip/clip playback");
+            "Learned motion data WIPED (bResetLearnedPaths) — {} library file(s) deleted (curated kept); reloads re-record from scratch, authored strokes re-harvest on the next equip/clip playback",
+            deletedFiles);
     }
 
     void ReduxRuntime::shutdown()
     {
+        // Persist before the learner is dropped; then drain the writer.
+        flushMotionLibrarySave();
+        _libraryStore.shutdown();
+        _libraryLoaded.reset();
+        _libraryWeaponFormId = 0;
+        _libraryWeaponRef = {};
+        _librarySyncedRevision = 0;
+        _libraryLastRevision = 0;
+        _libraryStableFrames = 0;
+
         _sandbox.shutdown();
         _learner.reset();
         _drivePartCache = {};
@@ -437,6 +668,55 @@ namespace redux
                 sourceName.data(),
                 (std::min)(sourceName.size(), entry.sourceName.size() - 1));
         }
+        /*
+         * Full-subtree observation (phase 3, Bruno's "no one left behind"):
+         * every NAMED node under the weapon root that has no evidence entry
+         * joins the cache as observation-only — the learner (and library)
+         * see purely visual movers too. Never grip-eligible, never targets;
+         * capacity left over from evidence parts bounds the walk.
+         */
+        if (sawCurrentGeneration && weaponNode && g_reduxConfig.fullSubtreeObservation) {
+            const auto nameTaken = [this](std::string_view name) {
+                for (std::uint32_t i = 0; i < _drivePartCache.count; ++i) {
+                    if (providerFixedStringView(
+                            _drivePartCache.entries[i].sourceName.data(),
+                            _drivePartCache.entries[i].sourceName.size()) == name) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+            const auto walk = [&](auto&& self, RE::NiAVObject* object, int depth) -> void {
+                if (!object || depth > 12 || _drivePartCache.count >= _drivePartCache.entries.size()) {
+                    return;
+                }
+                const char* name = object->name.c_str();
+                const std::string_view nameView = name ? std::string_view(name) : std::string_view{};
+                if (object != weaponNode && !nameView.empty() && !nameTaken(nameView)) {
+                    auto& entry = _drivePartCache.entries[_drivePartCache.count++];
+                    entry = {};
+                    entry.node = object;
+                    entry.observationOnly = true;
+                    std::memcpy(entry.sourceName.data(), nameView.data(),
+                        (std::min)(nameView.size(), entry.sourceName.size() - 1));
+                }
+                if (auto* node = object->IsNode()) {
+                    auto& children = node->GetRuntimeData().children;
+                    for (std::uint16_t i = 0; i < children.size(); ++i) {
+                        self(self, children[i].get(), depth + 1);
+                    }
+                }
+            };
+            const auto beforeCount = _drivePartCache.count;
+            walk(walk, weaponNode, 0);
+            if (_drivePartCache.count > beforeCount) {
+                RDX_LOG_DEBUG(Weapon,
+                    "Drive-part cache: +{} observation-only node(s) from the full weapon subtree ({} entries total)",
+                    _drivePartCache.count - beforeCount,
+                    _drivePartCache.count);
+            }
+        }
+
         if (sawCurrentGeneration) {
             _drivePartCache.generationKey = generationKey;
         }
@@ -468,6 +748,7 @@ namespace redux
         // answered by the log ("must move" gate).
         std::array<char, 512> unmappedNames{};
         std::size_t unmappedLength = 0;
+        std::uint32_t unmappedCount = 0;
         const auto appendName = [](std::array<char, 512>& buffer, std::size_t& length, std::string_view name) {
             if (length + name.size() + 1 >= buffer.size()) {
                 return;
@@ -483,6 +764,11 @@ namespace redux
             const auto& allowList = g_reduxConfig.attachOnlyParts;
             for (std::uint32_t i = 0; i < _drivePartCache.count; ++i) {
                 const auto& entry = _drivePartCache.entries[i];
+                // Observation-only subtree nodes feed the learner but are
+                // never grip-eligible.
+                if (entry.observationOnly) {
+                    continue;
+                }
                 if (!allowList.allows(
                         static_cast<::rock::provider::RockProviderWeaponActionRoleV1>(entry.actionRole),
                         static_cast<::rock::provider::RockProviderWeaponPartKindV1>(entry.partKind))) {
@@ -496,6 +782,7 @@ namespace redux
                         WeaponPartMotionLearner::PartKey{ weaponFormId, entry.omodFormId, sourceName },
                         g_reduxConfig.motionPathMode)) {
                     appendName(unmappedNames, unmappedLength, sourceName);
+                    ++unmappedCount;
                     continue;
                 }
                 if (_eligiblePartCount >= _eligibleParts.size()) {
@@ -519,12 +806,15 @@ namespace redux
                 appendName(eligibleNames, eligibleLength,
                     providerFixedStringView(_eligibleParts[i].sourceName.data(), _eligibleParts[i].sourceName.size()));
             }
+            // Coverage: mapped / (mapped + allowlisted-but-unmapped) — the
+            // per-weapon "what still needs one rack/reload" report.
             RDX_LOG_INFO(Weapon,
-                "AttachOnly eligibility resolved (mode={}): {} moving part(s) [{}]{}{}",
+                "AttachOnly eligibility resolved (mode={}): coverage {}/{} allowlisted part(s) mapped [{}]{}{}",
                 motionPathModeName(g_reduxConfig.motionPathMode),
                 _eligiblePartCount,
+                _eligiblePartCount + unmappedCount,
                 std::string_view(eligibleNames.data(), eligibleLength),
-                unmappedLength > 0 ? " — allowlisted but unmapped (no motion path, normal grip): " : "",
+                unmappedLength > 0 ? " — unmapped (no motion path, normal grip): " : "",
                 std::string_view(unmappedNames.data(), unmappedLength));
         }
     }

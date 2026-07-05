@@ -179,6 +179,40 @@ namespace redux
             const weapon_clip_stroke::AuthoredStrokeGroup& group,
             bool fallbackSource);
 
+        /*
+         * Motion-library bridge (phase 2). StageView pointers are non-owning
+         * views into learner storage (export) or caller storage (import),
+         * valid only for the duration of the call chain — never retained.
+         */
+        struct StageView
+        {
+            const weapon_part_motion_path::MotionPath* path{ nullptr };
+            const weapon_clip_stroke::AuthoredFollower* followers{ nullptr };
+            std::uint32_t followerCount{ 0 };
+        };
+        struct RecordView
+        {
+            std::uint32_t omodFormId{ 0 };
+            std::string_view sourceName{};
+            StageView learnedPrimary{};
+            StageView learnedReturn{};
+            StageView authored{};
+            bool authoredFallback{ false };
+        };
+
+        // Read-only visit of every stored record for a weapon; returns the
+        // number written to out (capacity max). Used by the save path.
+        std::uint32_t exportWeaponRecords(std::uint32_t weaponFormId, RecordView* out, std::uint32_t max) const;
+
+        /*
+         * Seed a record from the disk library. DISK SEEDS, LIVE LEARNING
+         * WINS: each stage is applied only when the in-RAM record for that
+         * stage is unused, so a fresher stroke learned this session is never
+         * clobbered by an equip re-import. Returns true when anything was
+         * applied (revision bumps once).
+         */
+        bool importRecord(const PartKey& key, const RecordView& record);
+
         // Bumped on every stored/replaced path (either source) and on
         // reset; consumers re-resolve path-dependent state (per-part
         // attach-only targets) when it moves.

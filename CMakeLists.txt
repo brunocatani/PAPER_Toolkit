@@ -91,7 +91,8 @@ target_link_libraries(${PROJECT_NAME}
 find_package(cpptrace CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(mmio CONFIG REQUIRED)
-target_link_libraries(${PROJECT_NAME} PRIVATE cpptrace::cpptrace)
+find_package(nlohmann_json CONFIG REQUIRED)
+target_link_libraries(${PROJECT_NAME} PRIVATE cpptrace::cpptrace nlohmann_json::nlohmann_json)
 
 target_precompile_headers(${PROJECT_NAME} PRIVATE src/PCH.h)
 
@@ -173,16 +174,20 @@ option(BUILD_PAPER_REDUX_TESTS "Build PAPER Redux focused regression tests" OFF)
 if(BUILD_PAPER_REDUX_TESTS)
   enable_testing()
 
-  # Pure-policy tests: the motion path / scrub / clip stroke policies and the
-  # learner are engine-free by design, so the test binary needs no CommonLib
-  # or F4SE (the learner's logging compiles out via the test define).
+  # Pure-policy tests: the motion path / scrub / clip stroke policies, the
+  # learner, and the motion-library FORMAT are engine-free by design, so the
+  # test binary needs no CommonLib or F4SE (the learner's logging compiles
+  # out via the test define; nlohmann is header-only).
+  find_package(nlohmann_json CONFIG REQUIRED)
   add_executable(PAPERReduxWeaponPartMotionPolicyTests
     "${ROOT_DIR}/tests/WeaponPartMotionPolicyTests.cpp"
     "${SOURCE_DIR}/redux/WeaponPartMotionLearner.cpp"
+    "${SOURCE_DIR}/redux/MotionLibraryFormat.cpp"
   )
   target_compile_features(PAPERReduxWeaponPartMotionPolicyTests PRIVATE cxx_std_23)
   target_include_directories(PAPERReduxWeaponPartMotionPolicyTests PRIVATE ${SOURCE_DIR})
   target_compile_definitions(PAPERReduxWeaponPartMotionPolicyTests PRIVATE REDUX_POLICY_TEST_NO_RUNTIME_LOGGER=1)
+  target_link_libraries(PAPERReduxWeaponPartMotionPolicyTests PRIVATE nlohmann_json::nlohmann_json)
   add_test(NAME PAPERReduxWeaponPartMotionPolicyTests COMMAND $<TARGET_FILE:PAPERReduxWeaponPartMotionPolicyTests>)
   set_tests_properties(PAPERReduxWeaponPartMotionPolicyTests PROPERTIES LABELS "policy")
 endif()

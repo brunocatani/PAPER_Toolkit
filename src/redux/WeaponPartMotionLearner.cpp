@@ -268,6 +268,79 @@ namespace redux
             lastKey.translate.z);
     }
 
+    std::uint32_t WeaponPartMotionLearner::exportWeaponRecords(
+        std::uint32_t weaponFormId,
+        RecordView* out,
+        std::uint32_t max) const
+    {
+        if (!out || max == 0 || weaponFormId == 0) {
+            return 0;
+        }
+        const auto stageView = [](const StrokeGroup& group) {
+            return group.used
+                ? StageView{ &group.path, group.followers.data(), group.followerCount }
+                : StageView{};
+        };
+        std::uint32_t count = 0;
+        for (const auto& slot : _paths) {
+            if (!slot.used || slot.weaponFormId != weaponFormId || count >= max) {
+                continue;
+            }
+            out[count++] = RecordView{
+                .omodFormId = slot.omodFormId,
+                .sourceName = slotName(slot.sourceName),
+                .learnedPrimary = stageView(slot.learnedPrimary),
+                .learnedReturn = stageView(slot.learnedReturn),
+                .authored = stageView(slot.authored),
+                .authoredFallback = slot.authoredFallback,
+            };
+        }
+        return count;
+    }
+
+    bool WeaponPartMotionLearner::importRecord(const PartKey& key, const RecordView& record)
+    {
+        if (key.weaponFormId == 0 || key.sourceName.empty()) {
+            return false;
+        }
+        auto* target = findOrClaimSlot(key, true);
+        if (!target) {
+            return false;
+        }
+        const auto applyStage = [](StrokeGroup& group, const StageView& stage) {
+            if (group.used || !stage.path || !stage.path->valid) {
+                return false;  // live learning wins; invalid stages never seed
+            }
+            group.used = true;
+            group.path = *stage.path;
+            group.followerCount = 0;
+            if (stage.followers) {
+                group.followerCount =
+                    (std::min)(stage.followerCount, static_cast<std::uint32_t>(group.followers.size()));
+                for (std::uint32_t i = 0; i < group.followerCount; ++i) {
+                    group.followers[i] = stage.followers[i];
+                }
+            }
+            return true;
+        };
+        bool applied = applyStage(target->learnedPrimary, record.learnedPrimary);
+        // A seeded return stage only makes sense against the primary it was
+        // saved with; never chain a disk return stage onto a live primary.
+        if (applied) {
+            applied |= applyStage(target->learnedReturn, record.learnedReturn);
+        }
+        if (applyStage(target->authored, record.authored)) {
+            target->authoredFallback = record.authoredFallback;
+            applied = true;
+        }
+        if (applied) {
+            ++_observationCounter;
+            target->lastUseCounter = _observationCounter;
+            ++_revision;
+        }
+        return applied;
+    }
+
     void WeaponPartMotionLearner::reset()
     {
         /*

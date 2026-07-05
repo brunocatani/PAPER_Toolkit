@@ -96,10 +96,30 @@ namespace redux
          * learner-held motion data (learned strokes AND drained authored
          * strokes; authored re-harvests on the next equip / clip playback),
          * so reloads re-record from scratch under the current grouping
-         * settings. Leave true during a re-record session, set false when
-         * done. The runtime performs the wipe on the frame thread.
+         * settings. With the motion library on, the wipe also deletes the
+         * on-disk library files (curated files are kept). Leave true during
+         * a re-record session, set false when done. The runtime performs
+         * the wipe on the frame thread.
          */
         bool resetLearnedPaths = false;
+        /*
+         * Motion library (phase 2): one human-editable JSON per weapon under
+         * PAPERRedux_Config\MotionLibrary — learning survives restarts, and
+         * the files are the fine-tuning surface. Loaded on weapon equip
+         * ("disk seeds, live learning wins"), saved by a background writer
+         * when learning settles. ReadOnly: load but never write (global
+         * curated mode); per-file "curated": true does the same for one file.
+         */
+        bool motionLibrary = true;
+        bool motionLibraryReadOnly = false;
+        /*
+         * Full-subtree observation (phase 3): the learner watches EVERY
+         * named node under the weapon root, not only collider-evidence
+         * parts, so purely visual movers (bullets in a mag, small linkages)
+         * are recorded and persisted too. Observation-only parts are never
+         * grip-eligible.
+         */
+        bool fullSubtreeObservation = true;
         /*
          * Bumped whenever a value that changes the eligible-part set changed
          * (mode or allowlist); the runtime recomputes per-part targets when

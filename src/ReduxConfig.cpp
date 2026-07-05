@@ -85,9 +85,28 @@ namespace redux
             "; Re-record mode: while true, EVERY save of this INI (and every game\n"
             "; start) wipes all learned motion data so reloads re-record from scratch\n"
             "; under the current grouping settings (drained authored strokes are wiped\n"
-            "; too and re-harvest on the next equip / clip playback). Leave true during\n"
-            "; a re-record session, set false when done.\n"
+            "; too and re-harvest on the next equip / clip playback). With the motion\n"
+            "; library on, the wipe also deletes the on-disk library files (files\n"
+            "; marked \"curated\": true are kept). Leave true during a re-record\n"
+            "; session, set false when done.\n"
             "bResetLearnedPaths = false\n"
+            "\n"
+            "; Motion library: one human-editable JSON per weapon in\n"
+            "; PAPERRedux_Config\\MotionLibrary — mapped reloads survive game restarts\n"
+            "; and the files are the fine-tuning surface (stageName/notes fields are\n"
+            "; yours; they round-trip untouched). Loaded on weapon equip; disk data\n"
+            "; seeds the learner, anything learned live always wins. Saves happen on a\n"
+            "; background writer once learning settles. ReadOnly = load but never\n"
+            "; write; a per-file \"curated\": true protects a single hand-tuned file\n"
+            "; from being overwritten or wiped.\n"
+            "bMotionLibrary = true\n"
+            "bMotionLibraryReadOnly = false\n"
+            "\n"
+            "; Full-subtree observation: the mapper watches EVERY named node under\n"
+            "; the weapon root, not only parts with colliders — bullets riding a mag,\n"
+            "; small linkages — so the full animation gets mapped and persisted.\n"
+            "; Observation-only parts are never grabbable.\n"
+            "bFullSubtreeObservation = true\n"
             "\n"
             "; AttachOnly allowlist — which part classes MAY become attach-only grips.\n"
             "; Hot-reloadable. The class switch is only half the gate: a part must ALSO\n"
@@ -207,6 +226,9 @@ namespace redux
         const float previousChainTolerance = stageChainToleranceGameUnits;
         const bool previousShellEject = shellEjectOnMaxTravel;
         const bool previousResetLearned = resetLearnedPaths;
+        const bool previousMotionLibrary = motionLibrary;
+        const bool previousLibraryReadOnly = motionLibraryReadOnly;
+        const bool previousFullSubtree = fullSubtreeObservation;
 
         const bool previousRequireTriggerUnlock = requireTriggerUnlock;
         enabled = ini.GetBoolValue(kSection, "bEnabled", enabled);
@@ -249,6 +271,9 @@ namespace redux
         travelExtremeTolerance = readClampedFloat("fTravelExtremeTolerance", travelExtremeTolerance, 0.02f, 0.45f);
         shellEjectOnMaxTravel = ini.GetBoolValue(kSection, "bShellEjectOnMaxTravel", shellEjectOnMaxTravel);
         resetLearnedPaths = ini.GetBoolValue(kSection, "bResetLearnedPaths", resetLearnedPaths);
+        motionLibrary = ini.GetBoolValue(kSection, "bMotionLibrary", motionLibrary);
+        motionLibraryReadOnly = ini.GetBoolValue(kSection, "bMotionLibraryReadOnly", motionLibraryReadOnly);
+        fullSubtreeObservation = ini.GetBoolValue(kSection, "bFullSubtreeObservation", fullSubtreeObservation);
 
         // AttachOnly allowlist booleans, composed into the class masks.
         for (std::size_t i = 0; i < std::size(kAttachOnlyPartKeys); ++i) {
@@ -298,6 +323,18 @@ namespace redux
                     previousResetLearned,
                     resetLearnedPaths);
             }
+            if (motionLibrary != previousMotionLibrary || motionLibraryReadOnly != previousLibraryReadOnly) {
+                RDX_LOG_INFO(Config,
+                    "Motion library: enabled={} readOnly={} (loads apply on the next weapon equip)",
+                    motionLibrary,
+                    motionLibraryReadOnly);
+            }
+            if (fullSubtreeObservation != previousFullSubtree) {
+                RDX_LOG_INFO(Config,
+                    "bFullSubtreeObservation: {} -> {} (applies on the next weapon generation)",
+                    previousFullSubtree,
+                    fullSubtreeObservation);
+            }
             const bool groupingChanged = coTimedFollowers != previousCoTimed || coTimedMinOverlap != previousCoTimedOverlap ||
                 coTimedMaxArcRatio != previousCoTimedRatio || stageTransitions != previousStageTransitions ||
                 travelExtremeTolerance != previousExtremeTolerance || stageChainToleranceGameUnits != previousChainTolerance;
@@ -325,7 +362,9 @@ namespace redux
             }
             if (enabled == previousEnabled && motionPathMode == previousMode && logLevel == previousLogLevel &&
                 requireTriggerUnlock == previousRequireTriggerUnlock && !allowListChangedKeys && !groupingChanged &&
-                shellEjectOnMaxTravel == previousShellEject && resetLearnedPaths == previousResetLearned) {
+                shellEjectOnMaxTravel == previousShellEject && resetLearnedPaths == previousResetLearned &&
+                motionLibrary == previousMotionLibrary && motionLibraryReadOnly == previousLibraryReadOnly &&
+                fullSubtreeObservation == previousFullSubtree) {
                 RDX_LOG_INFO(Config, "Reload applied, no value changes (enabled={} mode={} logLevel={})",
                     enabled,
                     motionPathModeName(motionPathMode),

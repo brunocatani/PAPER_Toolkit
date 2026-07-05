@@ -2,8 +2,10 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 
 #include "api/ROCKProviderApi.h"
+#include "redux/MotionLibraryStore.h"
 #include "redux/WeaponClipStrokePolicy.h"
 #include "redux/WeaponPartDriveSandbox.h"
 #include "redux/WeaponPartMotionLearner.h"
@@ -73,6 +75,13 @@ namespace redux
             // identity ROCK). Part of the learner key, so a workbench part
             // swap can never serve a lookalike's motion data.
             std::uint32_t omodFormId{ 0 };
+            /*
+             * Full-subtree observation (phase 3): named weapon nodes with no
+             * collider evidence — bullets riding a mag, small linkages. They
+             * feed the learner (and the library) but are never grip-eligible
+             * and never install provider targets.
+             */
+            bool observationOnly{ false };
             std::array<char, WeaponPartMotionLearner::kMaxSourceName> sourceName{};
             /*
              * Rest-pose capture (weapon-local): the pose the part settles at
@@ -129,6 +138,16 @@ namespace redux
         [[nodiscard]] bool partRecentlyDriven(const DrivePartCacheEntry& entry) const;
         void ageDrivenPartLeases();
 
+        /*
+         * Motion library (phase 2): equip-time import ("disk seeds, live
+         * learning wins"), debounced background save when the learner
+         * revision settles, flush on weapon switch and shutdown. Curated
+         * files and unresolvable identities are never written.
+         */
+        void updateMotionLibrary(std::uint32_t weaponFormId);
+        void loadMotionLibraryForWeapon(std::uint32_t weaponFormId);
+        void flushMotionLibrarySave();
+
         WeaponPartMotionLearner _learner{};
         WeaponPartDriveSandbox _sandbox{};
         DrivePartCache _drivePartCache{};
@@ -153,6 +172,19 @@ namespace redux
         // absorbed by the stationary-frame requirement.
         std::array<std::uint32_t, 2> _grippedBodyIds{ 0x7FFF'FFFFu, 0x7FFF'FFFFu };
         std::array<DrivenPartLease, WeaponPartDriveSandbox::kMaxSentDrives> _drivenPartLeases{};
+
+        motion_library::MotionLibraryStore _libraryStore{};
+        // The loaded file is kept for the curation-text merge on save:
+        // stageName/notes live only in the files, and a runtime save must
+        // never drop hand edits. Heap-held; replaced per weapon.
+        std::unique_ptr<motion_library::WeaponLibrary> _libraryLoaded{};
+        std::uint32_t _libraryWeaponFormId{ 0 };
+        motion_library::FormRef _libraryWeaponRef{};
+        // Learner revision already persisted/imported; differing revision
+        // marks the library dirty.
+        std::uint64_t _librarySyncedRevision{ 0 };
+        std::uint64_t _libraryLastRevision{ 0 };
+        std::uint32_t _libraryStableFrames{ 0 };
         // Scratch for the per-frame harvest drain; member storage because one
         // full batch of stroke groups is far too large for the stack.
         std::array<weapon_clip_stroke::AuthoredStrokeGroup, weapon_clip_stroke::kMaxGroupsPerClip> _clipHarvestDrainGroups{};
