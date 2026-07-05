@@ -409,6 +409,152 @@ int main()
                     std::abs(group.followers[0].restScale - kShellScale) < 0.001f);
             }
         }
+
+        // Co-timed (non-rigid) follower tier: a part moving on its own axis
+        // but only INSIDE the leader's stroke window rides along (P320
+        // barrel tilt during the slide travel); a part whose motion happened
+        // in a different phase never groups.
+        {
+            constexpr std::uint32_t kWeapon3 = 0x0003CAFE;
+            constexpr const char* kSlide = "P320Slide";
+            constexpr const char* kBarrel = "P320Barrel";
+            constexpr const char* kEarlyMover = "P320Mag";
+
+            PoseSample slideRest{};
+            slideRest.translate = Vec3{ 0.0f, 8.0f, 0.0f };
+            PoseSample barrelRest{};
+            barrelRest.translate = Vec3{ 0.0f, 6.0f, 1.0f };
+            PoseSample earlyRest{};
+            earlyRest.translate = Vec3{ 0.0f, 4.0f, -3.0f };
+
+            auto feed3 = [&](const char* part, const PoseSample& pose) {
+                learner.observe(WeaponPartMotionLearner::Observation{
+                    .weaponFormId = kWeapon3,
+                    .sourceName = part,
+                    .pose = pose,
+                    .scale = 1.0f,
+                    .trusted = true,
+                });
+            };
+            auto frame3 = [&](float slideOffsetY, float barrelOffsetZ, float earlyOffsetZ) {
+                learner.beginObservationFrame();
+                PoseSample slidePose = slideRest;
+                slidePose.translate.y += slideOffsetY;
+                feed3(kSlide, slidePose);
+                PoseSample barrelPose = barrelRest;
+                barrelPose.translate.z += barrelOffsetZ;
+                feed3(kBarrel, barrelPose);
+                PoseSample earlyPose = earlyRest;
+                earlyPose.translate.z += earlyOffsetZ;
+                feed3(kEarlyMover, earlyPose);
+            };
+
+            // Phase 0: everything at rest (arm all recorders).
+            for (std::uint32_t i = 0; i <= weapon_part_motion_path::kRestStableFramesToArm; ++i) {
+                frame3(0.0f, 0.0f, 0.0f);
+            }
+            // Phase 1: the early mover does its own thing while the slide is
+            // still at rest, then settles well before the slide stroke.
+            for (int i = 1; i <= 10; ++i) {
+                frame3(0.0f, 0.0f, -0.4f * static_cast<float>(i));
+            }
+            for (std::uint32_t i = 0; i < weapon_part_motion_path::kRestReturnFramesToComplete + 10; ++i) {
+                frame3(0.0f, 0.0f, -4.0f);
+            }
+            // Phase 2: slide stroke; the barrel tilts only during the middle
+            // of the stroke (non-rigid: different axis, varying distance).
+            for (int i = 1; i <= 16; ++i) {
+                const float barrelOffset = (i >= 5 && i <= 12) ? 0.25f * static_cast<float>(i - 4) : (i > 12 ? 2.0f : 0.0f);
+                frame3(-0.5f * static_cast<float>(i), barrelOffset, -4.0f);
+            }
+            // Hold peak, then settle so the slide recording completes.
+            for (std::uint32_t i = 0; i < weapon_part_motion_path::kRestReturnFramesToComplete + 2; ++i) {
+                frame3(-8.0f, 2.0f, -4.0f);
+            }
+
+            const auto slideGroup = learner.findGroup(kWeapon3, kSlide, MotionPathMode::LearnedOnly);
+            ok &= expectTrue("slide stroke learned", slideGroup.leaderPath != nullptr);
+            bool barrelIsFollower = false;
+            bool earlyMoverIsFollower = false;
+            for (std::uint32_t i = 0; i < slideGroup.followerCount; ++i) {
+                if (std::strcmp(slideGroup.followers[i].boneName.data(), kBarrel) == 0) {
+                    barrelIsFollower = true;
+                }
+                if (std::strcmp(slideGroup.followers[i].boneName.data(), kEarlyMover) == 0) {
+                    earlyMoverIsFollower = true;
+                }
+            }
+            ok &= expectTrue("non-rigid co-timed barrel rides the slide stroke", barrelIsFollower);
+            ok &= expectFalse("different-phase mover never groups with the slide", earlyMoverIsFollower);
+        }
+
+        // Stage chaining: a stroke starting where the primary ends becomes
+        // the RETURN stage (mag-in after mag-out) instead of losing to the
+        // largest-stroke rule; both stages stay available.
+        {
+            constexpr std::uint32_t kWeapon4 = 0x0004F00D;
+            constexpr const char* kMag = "GlockMag";
+
+            PoseSample seated{};
+            seated.translate = Vec3{ 0.0f, 2.0f, -1.0f };
+            PoseSample out{};
+            out.translate = Vec3{ 0.0f, -1.0f, -7.0f };
+
+            auto feed4 = [&](const PoseSample& pose) {
+                learner.beginObservationFrame();
+                learner.observe(WeaponPartMotionLearner::Observation{
+                    .weaponFormId = kWeapon4,
+                    .sourceName = kMag,
+                    .pose = pose,
+                    .scale = 1.0f,
+                    .trusted = true,
+                });
+            };
+            auto lerpPose4 = [&](const PoseSample& a, const PoseSample& b, float t) {
+                return weapon_part_motion_path::lerpPose(a, b, t);
+            };
+
+            // Extraction: seated -> out, settle at OUT so the recording
+            // completes with the out pose as its peak.
+            for (std::uint32_t i = 0; i <= weapon_part_motion_path::kRestStableFramesToArm; ++i) {
+                feed4(seated);
+            }
+            for (int i = 1; i <= 12; ++i) {
+                feed4(lerpPose4(seated, out, static_cast<float>(i) / 12.0f));
+            }
+            for (std::uint32_t i = 0; i < weapon_part_motion_path::kRestReturnFramesToComplete + 2; ++i) {
+                feed4(out);
+            }
+            const auto* primaryPath = learner.findPath(kWeapon4, kMag, MotionPathMode::LearnedOnly);
+            ok &= expectTrue("extraction stroke learned as primary", primaryPath != nullptr);
+            ok &= expectTrue("no return stage before the insertion is observed",
+                learner.findGroup(kWeapon4, kMag, MotionPathMode::LearnedOnly).returnPath == nullptr);
+
+            // Insertion: re-arm at OUT, push back to seated, settle.
+            for (std::uint32_t i = 0; i <= weapon_part_motion_path::kRestStableFramesToArm; ++i) {
+                feed4(out);
+            }
+            for (int i = 1; i <= 12; ++i) {
+                feed4(lerpPose4(out, seated, static_cast<float>(i) / 12.0f));
+            }
+            for (std::uint32_t i = 0; i < weapon_part_motion_path::kRestReturnFramesToComplete + 2; ++i) {
+                feed4(seated);
+            }
+
+            const auto magGroup = learner.findGroup(kWeapon4, kMag, MotionPathMode::LearnedOnly);
+            ok &= expectTrue("primary stage survives the insertion", magGroup.leaderPath != nullptr);
+            ok &= expectTrue("insertion stroke stored as the return stage", magGroup.returnPath != nullptr);
+            if (magGroup.leaderPath && magGroup.returnPath) {
+                ok &= expectTrue("return stage starts at the primary's end",
+                    weapon_part_motion_path::poseDistance(
+                        magGroup.returnPath->keys.front(),
+                        magGroup.leaderPath->keys.back()) < 2.0f);
+                ok &= expectTrue("return stage ends near the primary's start",
+                    weapon_part_motion_path::poseDistance(
+                        magGroup.returnPath->keys.back(),
+                        magGroup.leaderPath->keys.front()) < 2.0f);
+            }
+        }
     }
 
     {

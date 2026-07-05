@@ -21,10 +21,27 @@ namespace redux
      * (weapon form ID, part source name) key: collection is unrestricted in
      * every mode, and the INI-selected MotionPathMode picks the serving
      * source at lookup time only — so a hot-reload mode switch applies
-     * instantly with whatever both sources have accumulated, and neither
-     * source can destroy the other's data (previously a learned stroke
-     * overwrote the authored record in place, which would starve
-     * authored-only mode the moment learning kicked in).
+     * instantly with whatever data both sources have accumulated, and
+     * neither source can destroy the other's data.
+     *
+     * The learned source additionally keeps a RETURN STAGE per part: a
+     * completed stroke whose start pose chains onto the primary stroke's
+     * end pose (mag-in observed after mag-out). The scrub consumer flips
+     * between the stages at the path extremes, so extraction and insertion
+     * keep their own paths and their own min/max instead of the insertion
+     * stroke being discarded by the largest-stroke rule.
+     *
+     * Followers come in two tiers, both recovered from frame-aligned
+     * concurrent recordings:
+     *  - RIGID: constant leader distance over the stroke (a slide carrying
+     *    its sights, a mag carrying its bullets) — the original criterion.
+     *  - CO-TIMED (staged, tunable/gated): moves non-rigidly but
+     *    temporally CONTAINED in the leader's stroke window — the P320
+     *    barrel tilting while the slide travels, a bullet advancing during
+     *    the bolt pull. Containment (fraction of the follower's total
+     *    motion inside the window) is what keeps separate reload phases
+     *    out: a mag dropped in another phase of the same animation shares
+     *    no window with the bolt stroke and never groups.
      *
      * Fixed-capacity with oldest-use eviction; no allocation after
      * construction and no I/O. Main-thread only (ROCK frame callback).
@@ -35,10 +52,9 @@ namespace redux
         static constexpr std::size_t kMaxStoredPaths = 64;
         // One recorder per evidence part — the learner observes EVERY part,
         // unfiltered by grab eligibility, so every mover of a reload records
-        // simultaneously: co-movement grouping (a mag pulls its bullets, a
-        // slide carries its sights) needs concurrent recordings to compare,
-        // and later-phase motions (mag insertion, lever-action feeding) need
-        // parts that are still at grab time to be watched too.
+        // simultaneously: co-movement grouping needs concurrent recordings
+        // to compare, and later-phase motions need parts that are still at
+        // grab time to be watched too.
         static constexpr std::size_t kMaxActiveRecorders = 48;
         static constexpr std::size_t kMaxSourceName = 64;
         // A recorder whose part was not observed for this many observations is
@@ -63,6 +79,28 @@ namespace redux
             bool trusted{ true };
         };
 
+        /*
+         * Grouping/staging tuning, INI-backed and hot-reloadable; applies to
+         * FUTURE completed recordings (stored groups are not regrouped).
+         */
+        struct GroupingTuning
+        {
+            // Enable the co-timed (non-rigid) follower tier.
+            bool coTimedFollowers{ true };
+            // Fraction of the follower's total recorded motion that must
+            // fall inside the leader's stroke window.
+            float coTimedMinOverlapFraction{ 0.7f };
+            // Follower motion inside the window may be at most this many
+            // times the leader's stroke arc (blocks unrelated big movers).
+            float coTimedMaxArcRatio{ 1.5f };
+            // Enable return-stage capture (mag-in chaining onto mag-out).
+            bool stageCapture{ true };
+            // Pose distance within which a stroke's start "chains" onto the
+            // primary stroke's end.
+            float stageChainToleranceGameUnits{ 2.0f };
+        };
+        void setGroupingTuning(const GroupingTuning& tuning) { _tuning = tuning; }
+
         // Call once per frame before the frame's observe() calls: recorder
         // samples are frame-aligned through this counter so concurrent
         // recordings can be compared sample-for-sample.
@@ -77,15 +115,18 @@ namespace redux
 
         /*
          * Full stroke-group view for a part under the given mode: the leader
-         * path plus any followers — authored (assembly parts the clip moves
-         * with it) or learned (parts observed moving rigidly with the leader
-         * during the same stroke). Hybrid serves learned over authored.
+         * path plus its followers, and — learned source only — the return
+         * stage the scrub consumer flips to at the path extremes. Hybrid
+         * serves learned over authored.
          */
         struct GroupView
         {
             const weapon_part_motion_path::MotionPath* leaderPath{ nullptr };
             const weapon_clip_stroke::AuthoredFollower* followers{ nullptr };
             std::uint32_t followerCount{ 0 };
+            const weapon_part_motion_path::MotionPath* returnPath{ nullptr };
+            const weapon_clip_stroke::AuthoredFollower* returnFollowers{ nullptr };
+            std::uint32_t returnFollowerCount{ 0 };
             bool authored{ false };
             // Authored-only: stroke came from a merely-loaded (fallback)
             // clip rather than one the weapon activated.
@@ -126,13 +167,10 @@ namespace redux
         void reset();
 
     private:
-        // One source's stroke for a part: leader path plus followers.
-        struct PathRecord
+        // One stage of one source: leader path plus followers.
+        struct StrokeGroup
         {
             bool used{ false };
-            // Authored-only: stroke from a merely-loaded (fallback) clip;
-            // outranked by the weapon's own activated-clip strokes.
-            bool fallbackSource{ false };
             weapon_part_motion_path::MotionPath path{};
             std::uint32_t followerCount{ 0 };
             std::array<weapon_clip_stroke::AuthoredFollower, weapon_clip_stroke::kMaxFollowers> followers{};
@@ -144,8 +182,14 @@ namespace redux
             std::uint32_t weaponFormId{ 0 };
             std::array<char, kMaxSourceName> sourceName{};
             std::uint64_t lastUseCounter{ 0 };
-            PathRecord learned{};
-            PathRecord authored{};
+            StrokeGroup learnedPrimary{};
+            // Chains off learnedPrimary's END pose (insertion after
+            // extraction); dropped when a replaced primary breaks the chain.
+            StrokeGroup learnedReturn{};
+            StrokeGroup authored{};
+            // Authored stroke came from a merely-loaded (fallback) clip;
+            // outranked by the weapon's own activated-clip strokes.
+            bool authoredFallback{ false };
         };
 
         struct RecorderSlot
@@ -164,7 +208,7 @@ namespace redux
             std::array<weapon_part_motion_path::PoseSample, weapon_part_motion_path::kMaxRecordingSamples> buffer{};
         };
 
-        [[nodiscard]] static const PathRecord* selectRecord(const PathSlot& slot, MotionPathMode mode);
+        [[nodiscard]] static const StrokeGroup* selectPrimary(const PathSlot& slot, MotionPathMode mode);
         [[nodiscard]] const PathSlot* findSlot(std::uint32_t weaponFormId, std::string_view sourceName) const;
         // preferSlotsWithoutLearnedData: authored stores must not evict a
         // slot holding a learned stroke while a purely-authored slot exists.
@@ -174,6 +218,7 @@ namespace redux
 
         std::array<PathSlot, kMaxStoredPaths> _paths{};
         std::array<RecorderSlot, kMaxActiveRecorders> _recorders{};
+        GroupingTuning _tuning{};
         std::uint64_t _observationCounter{ 0 };
         std::uint64_t _frameCounter{ 0 };
         std::uint64_t _revision{ 0 };

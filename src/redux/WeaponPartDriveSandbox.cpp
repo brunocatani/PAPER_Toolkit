@@ -290,14 +290,15 @@ namespace redux
                     }
                 }
                 RDX_LOG_INFO(Weapon,
-                    "WeaponPartDriveSandbox: scrub session started hand={} part='{}' arc={:.2f}/{:.2f} mode={} source={} followers={}",
+                    "WeaponPartDriveSandbox: scrub session started hand={} part='{}' arc={:.2f}/{:.2f} mode={} source={} followers={} returnStage={}",
                     handIndex == 1 ? "left" : "right",
                     hand.sourceName,
                     seeded.arcPosition,
                     group.leaderPath->totalArcLength,
                     motionPathModeName(session.mode),
                     !group.authored ? "runtime-learned" : (group.fallbackSource ? "authored-fallback" : "authored-clip"),
-                    session.followerCount);
+                    session.followerCount,
+                    group.returnPath != nullptr);
             }
 
             if (!session.active || !hand.transformsValid) {
@@ -305,7 +306,9 @@ namespace redux
             }
             // Session-pinned mode: a hot-reload switch never swaps the path
             // under a hand mid-scrub.
-            const auto* path = learner.findPath(session.weaponFormId, sessionName(session.sourceName), session.mode);
+            const auto liveGroup = learner.findGroup(session.weaponFormId, sessionName(session.sourceName), session.mode);
+            const weapon_part_motion_path::MotionPath* path =
+                session.onReturnStage ? liveGroup.returnPath : liveGroup.leaderPath;
             if (!path) {
                 endSession(session);
                 continue;
@@ -316,11 +319,62 @@ namespace redux
                 session.pathAnchorTranslate.y + (hand.handTranslate.y - session.handStartTranslate.y),
                 session.pathAnchorTranslate.z + (hand.handTranslate.z - session.handStartTranslate.z),
             };
-            const auto scrubbed = weapon_part_motion_scrub::scrub(*path, session.arcPosition, desired);
+            auto scrubbed = weapon_part_motion_scrub::scrub(*path, session.arcPosition, desired);
             if (!scrubbed.valid) {
                 continue;
             }
             session.arcPosition = scrubbed.arcPosition;
+
+            /*
+             * Stage handoff at the extremes (Bruno, 2026-07-05): reaching
+             * the end of the active stage hands the session to the OTHER
+             * learned stage — mag pulled fully out continues onto the
+             * insertion path with its own min/max, and completing the
+             * insertion re-arms the extraction. The handoff re-seeds the
+             * path anchor and the hand baseline, so displacement measures
+             * from the handoff pose; the seed must land near the next
+             * stage's BEGINNING or the handoff is refused (a stage whose
+             * geometry doesn't start here would be skipped end-to-end in
+             * one frame otherwise). Grabbing a part already resting at the
+             * primary's end hands off on the first update, so an out-mag
+             * grab starts directly on the insertion stage.
+             */
+            if (input.stageTransitionsEnabled &&
+                scrubbed.arcPosition >= path->totalArcLength - input.stageEndEpsilonArcUnits) {
+                const auto* nextPath = session.onReturnStage ? liveGroup.leaderPath : liveGroup.returnPath;
+                const auto* nextFollowers = session.onReturnStage ? liveGroup.followers : liveGroup.returnFollowers;
+                const auto nextFollowerCount = session.onReturnStage ? liveGroup.followerCount : liveGroup.returnFollowerCount;
+                if (nextPath && nextPath->valid) {
+                    const auto seeded = weapon_part_motion_scrub::initialScrubPosition(*nextPath, scrubbed.target.translate);
+                    // Accept only near-start seeds (chained stages start at
+                    // the previous stage's end by construction).
+                    constexpr float kStageHandoffMaxSeedArcFraction = 0.25f;
+                    if (seeded.valid &&
+                        seeded.arcPosition <= (std::max)(input.stageEndEpsilonArcUnits, kStageHandoffMaxSeedArcFraction * nextPath->totalArcLength)) {
+                        session.onReturnStage = !session.onReturnStage;
+                        session.arcPosition = seeded.arcPosition;
+                        session.pathAnchorTranslate = seeded.target.translate;
+                        session.handStartTranslate = hand.handTranslate;
+                        session.followerCount = 0;
+                        if (nextFollowers) {
+                            session.followerCount = (std::min)(nextFollowerCount, static_cast<std::uint32_t>(session.followers.size()));
+                            for (std::uint32_t i = 0; i < session.followerCount; ++i) {
+                                session.followers[i] = nextFollowers[i];
+                            }
+                        }
+                        path = nextPath;
+                        scrubbed = seeded;
+                        RDX_LOG_INFO(Weapon,
+                            "WeaponPartDriveSandbox: stage handoff hand={} part='{}' -> {} stage (arc {:.2f}/{:.2f}, {} followers)",
+                            handIndex == 1 ? "left" : "right",
+                            sessionName(session.sourceName),
+                            session.onReturnStage ? "return" : "primary",
+                            seeded.arcPosition,
+                            nextPath->totalArcLength,
+                            session.followerCount);
+                    }
+                }
+            }
 
             // One drive per node: if both hands somehow grip the same body,
             // the first (right) hand keeps authority for this frame.

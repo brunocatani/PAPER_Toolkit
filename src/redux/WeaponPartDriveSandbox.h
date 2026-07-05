@@ -93,6 +93,15 @@ namespace redux
             // start so a hot-reload mode switch never swaps the path under a
             // hand mid-scrub; it applies to the next grip.
             MotionPathMode motionPathMode{ MotionPathMode::Hybrid };
+            /*
+             * Stage handoff at the path extremes: reaching the end of the
+             * active stage hands the session over to the learned return
+             * stage (mag-out end -> mag-in path, and back), each stage with
+             * its own min/max. Epsilon is how close to the end (in arc
+             * units) the scrub must reach to hand off.
+             */
+            bool stageTransitionsEnabled{ true };
+            float stageEndEpsilonArcUnits{ 0.35f };
             // Per-part attach-only whitelist for the current weapon
             // generation; targets reinstall only when this set changes.
             std::uint32_t eligiblePartCount{ 0 };
@@ -121,6 +130,9 @@ namespace redux
             std::uint32_t weaponFormId{ 0 };
             // Path source pinned at grip start (see FrameInput).
             MotionPathMode mode{ MotionPathMode::Hybrid };
+            // Which learned stage the session is scrubbing; flips at the
+            // stage ends when a chained return stage exists.
+            bool onReturnStage{ false };
             std::array<char, kMaxSourceName> sourceName{};
             float arcPosition{ 0.0f };
             weapon_part_motion_path::Vec3 handStartTranslate{};

@@ -7,6 +7,8 @@
 
 #include <ShlObj.h>
 
+#include <algorithm>
+#include <cmath>
 #include <filesystem>
 
 namespace redux
@@ -46,6 +48,27 @@ namespace redux
             "; firing grip, so firing never flips the other hand's grabs.\n"
             "; false = eligible parts are always attach-only (scrub on grab).\n"
             "bRequireTriggerUnlock = true\n"
+            "\n"
+            "; Learner grouping (mapper side, hot-reloadable; applies to strokes learned\n"
+            "; AFTER a change). Co-timed followers: parts that move NON-rigidly but only\n"
+            "; during the leader's stroke window ride the scrub (P320 barrel tilting\n"
+            "; while the slide travels, a bullet advancing during the bolt pull).\n"
+            "; fCoTimedMinOverlap = fraction of the part's total motion that must fall\n"
+            "; inside the leader's window (keeps separate reload phases apart);\n"
+            "; fCoTimedMaxArcRatio = max follower motion relative to the leader stroke.\n"
+            "bCoTimedFollowers = true\n"
+            "fCoTimedMinOverlap = 0.70\n"
+            "fCoTimedMaxArcRatio = 1.50\n"
+            "\n"
+            "; Stage transitions: a learned stroke that starts where the primary stroke\n"
+            "; ends (mag-in after mag-out) is kept as a RETURN stage, and the scrub\n"
+            "; hands over between stages at the path extremes — each direction keeps\n"
+            "; its own path and min/max. Epsilon = how close (arc units) to a stage end\n"
+            "; the scrub must reach to hand over; chain tolerance = how close the\n"
+            "; return stroke's start must be to the primary's end to count as chained.\n"
+            "bStageTransitions = true\n"
+            "fStageEndEpsilonArcUnits = 0.35\n"
+            "fStageChainToleranceGameUnits = 2.0\n"
             "\n"
             "; AttachOnly allowlist — which part classes MAY become attach-only grips.\n"
             "; Hot-reloadable. The class switch is only half the gate: a part must ALSO\n"
@@ -157,6 +180,12 @@ namespace redux
         const int previousLogLevel = logLevel;
         const auto previousAllowList = attachOnlyParts;
         const auto previousPartEnabled = attachOnlyPartEnabled;
+        const bool previousCoTimed = coTimedFollowers;
+        const float previousCoTimedOverlap = coTimedMinOverlap;
+        const float previousCoTimedRatio = coTimedMaxArcRatio;
+        const bool previousStageTransitions = stageTransitions;
+        const float previousStageEpsilon = stageEndEpsilonArcUnits;
+        const float previousChainTolerance = stageChainToleranceGameUnits;
 
         const bool previousRequireTriggerUnlock = requireTriggerUnlock;
         enabled = ini.GetBoolValue(kSection, "bEnabled", enabled);
@@ -179,6 +208,23 @@ namespace redux
             RDX_LOG_WARN(Config, "Invalid iLogLevel={} — keeping {}", parsedLogLevel, logLevel);
         }
         logger::setLogLevelAndPattern(logLevel, "");
+
+        // Learner grouping/staging tuning; clamped to sane ranges so a typo
+        // degrades into a bound, never into NaN-shaped grouping.
+        const auto readClampedFloat = [&](const char* key, float current, float minValue, float maxValue) {
+            const auto value = static_cast<float>(ini.GetDoubleValue(kSection, key, current));
+            if (!std::isfinite(value)) {
+                RDX_LOG_WARN(Config, "Invalid {}={} — keeping {:.2f}", key, value, current);
+                return current;
+            }
+            return std::clamp(value, minValue, maxValue);
+        };
+        coTimedFollowers = ini.GetBoolValue(kSection, "bCoTimedFollowers", coTimedFollowers);
+        coTimedMinOverlap = readClampedFloat("fCoTimedMinOverlap", coTimedMinOverlap, 0.05f, 1.0f);
+        coTimedMaxArcRatio = readClampedFloat("fCoTimedMaxArcRatio", coTimedMaxArcRatio, 0.1f, 10.0f);
+        stageTransitions = ini.GetBoolValue(kSection, "bStageTransitions", stageTransitions);
+        stageEndEpsilonArcUnits = readClampedFloat("fStageEndEpsilonArcUnits", stageEndEpsilonArcUnits, 0.05f, 5.0f);
+        stageChainToleranceGameUnits = readClampedFloat("fStageChainToleranceGameUnits", stageChainToleranceGameUnits, 0.25f, 10.0f);
 
         // AttachOnly allowlist booleans, composed into the class masks.
         for (std::size_t i = 0; i < std::size(kAttachOnlyPartKeys); ++i) {
@@ -216,6 +262,19 @@ namespace redux
                     previousRequireTriggerUnlock,
                     requireTriggerUnlock);
             }
+            const bool groupingChanged = coTimedFollowers != previousCoTimed || coTimedMinOverlap != previousCoTimedOverlap ||
+                coTimedMaxArcRatio != previousCoTimedRatio || stageTransitions != previousStageTransitions ||
+                stageEndEpsilonArcUnits != previousStageEpsilon || stageChainToleranceGameUnits != previousChainTolerance;
+            if (groupingChanged) {
+                RDX_LOG_INFO(Config,
+                    "Grouping tuning: coTimed={} overlap={:.2f} arcRatio={:.2f} stages={} endEps={:.2f} chainTol={:.2f} (applies to strokes learned from now on)",
+                    coTimedFollowers,
+                    coTimedMinOverlap,
+                    coTimedMaxArcRatio,
+                    stageTransitions,
+                    stageEndEpsilonArcUnits,
+                    stageChainToleranceGameUnits);
+            }
             bool allowListChangedKeys = false;
             for (std::size_t i = 0; i < std::size(kAttachOnlyPartKeys); ++i) {
                 if (attachOnlyPartEnabled[i] != previousPartEnabled[i]) {
@@ -229,7 +288,7 @@ namespace redux
                 }
             }
             if (enabled == previousEnabled && motionPathMode == previousMode && logLevel == previousLogLevel &&
-                requireTriggerUnlock == previousRequireTriggerUnlock && !allowListChangedKeys) {
+                requireTriggerUnlock == previousRequireTriggerUnlock && !allowListChangedKeys && !groupingChanged) {
                 RDX_LOG_INFO(Config, "Reload applied, no value changes (enabled={} mode={} logLevel={})",
                     enabled,
                     motionPathModeName(motionPathMode),

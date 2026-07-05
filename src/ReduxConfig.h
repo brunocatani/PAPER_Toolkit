@@ -59,6 +59,23 @@ namespace redux
         std::array<bool, std::size(kAttachOnlyPartKeys)> attachOnlyPartEnabled{};
         AttachOnlyAllowList attachOnlyParts = defaultAttachOnlyAllowList();
         /*
+         * Learner grouping/staging (mapper-side, hot-reloadable; applies to
+         * strokes learned AFTER the change):
+         *  - co-timed followers: non-rigid parts temporally contained in
+         *    the leader's stroke (P320 barrel tilt during the slide travel)
+         *    ride the scrub alongside the rigid tier;
+         *  - stage transitions: a stroke chaining onto the primary's end
+         *    (mag-in after mag-out) is kept as a return stage, and the
+         *    scrub hands over between stages at the path extremes so each
+         *    direction keeps its own path and min/max.
+         */
+        bool coTimedFollowers = true;
+        float coTimedMinOverlap = 0.70f;
+        float coTimedMaxArcRatio = 1.5f;
+        bool stageTransitions = true;
+        float stageEndEpsilonArcUnits = 0.35f;
+        float stageChainToleranceGameUnits = 2.0f;
+        /*
          * Bumped whenever a value that changes the eligible-part set changed
          * (mode or allowlist); the runtime recomputes per-part targets when
          * this moves. Starts at 1 so a zero-initialized consumer always

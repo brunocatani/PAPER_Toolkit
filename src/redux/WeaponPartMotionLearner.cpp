@@ -70,7 +70,7 @@ namespace redux
         }
     }
 
-    const WeaponPartMotionLearner::PathRecord* WeaponPartMotionLearner::selectRecord(
+    const WeaponPartMotionLearner::StrokeGroup* WeaponPartMotionLearner::selectPrimary(
         const PathSlot& slot,
         MotionPathMode mode)
     {
@@ -78,14 +78,14 @@ namespace redux
         case MotionPathMode::AuthoredOnly:
             return slot.authored.used ? &slot.authored : nullptr;
         case MotionPathMode::LearnedOnly:
-            return slot.learned.used ? &slot.learned : nullptr;
+            return slot.learnedPrimary.used ? &slot.learnedPrimary : nullptr;
         case MotionPathMode::Hybrid:
         default:
             // Learner priority (Bruno, 2026-07-04): a real observed stroke
             // outranks authored clip data; authored fills the gap until the
             // part is taught.
-            if (slot.learned.used) {
-                return &slot.learned;
+            if (slot.learnedPrimary.used) {
+                return &slot.learnedPrimary;
             }
             return slot.authored.used ? &slot.authored : nullptr;
         }
@@ -111,8 +111,8 @@ namespace redux
         // lastUseCounter is an eviction hint, not behavior; keeping this
         // accessor const outweighs refreshing it on reads.
         const auto* slot = findSlot(weaponFormId, sourceName);
-        const auto* record = slot ? selectRecord(*slot, mode) : nullptr;
-        return record ? &record->path : nullptr;
+        const auto* primary = slot ? selectPrimary(*slot, mode) : nullptr;
+        return primary ? &primary->path : nullptr;
     }
 
     WeaponPartMotionLearner::GroupView WeaponPartMotionLearner::findGroup(
@@ -121,17 +121,25 @@ namespace redux
         MotionPathMode mode) const
     {
         const auto* slot = findSlot(weaponFormId, sourceName);
-        const auto* record = slot ? selectRecord(*slot, mode) : nullptr;
-        if (!record) {
+        const auto* primary = slot ? selectPrimary(*slot, mode) : nullptr;
+        if (!primary) {
             return {};
         }
-        return GroupView{
-            .leaderPath = &record->path,
-            .followers = record->followers.data(),
-            .followerCount = record->followerCount,
-            .authored = record == &slot->authored,
-            .fallbackSource = record == &slot->authored && record->fallbackSource,
+        GroupView view{
+            .leaderPath = &primary->path,
+            .followers = primary->followers.data(),
+            .followerCount = primary->followerCount,
+            .authored = primary == &slot->authored,
+            .fallbackSource = primary == &slot->authored && slot->authoredFallback,
         };
+        // The return stage is learned data chained onto the learned primary;
+        // it only serves when the learned primary is the serving stage.
+        if (!view.authored && slot->learnedReturn.used) {
+            view.returnPath = &slot->learnedReturn.path;
+            view.returnFollowers = slot->learnedReturn.followers.data();
+            view.returnFollowerCount = slot->learnedReturn.followerCount;
+        }
+        return view;
     }
 
     WeaponPartMotionLearner::SourceAvailability WeaponPartMotionLearner::sourceAvailability(
@@ -143,9 +151,9 @@ namespace redux
             return {};
         }
         return SourceAvailability{
-            .learned = slot->learned.used,
+            .learned = slot->learnedPrimary.used,
             .authored = slot->authored.used,
-            .authoredFallback = slot->authored.used && slot->authored.fallbackSource,
+            .authoredFallback = slot->authored.used && slot->authoredFallback,
         };
     }
 
@@ -168,7 +176,7 @@ namespace redux
             if (!anyEviction || slot.lastUseCounter < anyEviction->lastUseCounter) {
                 anyEviction = &slot;
             }
-            if (preferSlotsWithoutLearnedData && slot.learned.used) {
+            if (preferSlotsWithoutLearnedData && slot.learnedPrimary.used) {
                 continue;
             }
             if (!preferredEviction || slot.lastUseCounter < preferredEviction->lastUseCounter) {
@@ -185,7 +193,7 @@ namespace redux
                 "WeaponPartMotionLearner: evicting path slot for part '{}' on weapon {:08X} (learned={} authored={})",
                 slotName(claimed->sourceName),
                 claimed->weaponFormId,
-                claimed->learned.used,
+                claimed->learnedPrimary.used,
                 claimed->authored.used);
         }
         *claimed = {};
@@ -218,7 +226,7 @@ namespace redux
             // same part; fallback data only stands while nothing else
             // exists. Within the same tier the largest leader stroke wins
             // (a reload stroke beats a fire nudge).
-            if (record.fallbackSource != fallbackSource) {
+            if (target->authoredFallback != fallbackSource) {
                 if (fallbackSource) {
                     return;
                 }
@@ -229,7 +237,7 @@ namespace redux
 
         const bool replaced = record.used;
         record.used = true;
-        record.fallbackSource = fallbackSource;
+        target->authoredFallback = fallbackSource;
         record.path = group.leaderPath;
         record.followerCount = (std::min)(group.followerCount, static_cast<std::uint32_t>(record.followers.size()));
         record.followers = group.followers;
@@ -249,7 +257,7 @@ namespace redux
             weaponFormId,
             group.leaderPath.totalArcLength,
             record.followerCount,
-            target->learned.used ? "also present" : "absent",
+            target->learnedPrimary.used ? "also present" : "absent",
             firstKey.translate.x,
             firstKey.translate.y,
             firstKey.translate.z,
@@ -262,11 +270,11 @@ namespace redux
     {
         /*
          * Slot-by-slot on purpose: `_paths = {}` / `_recorders = {}`
-         * materialize full temporary ARRAYS on the stack (~1MB each with
-         * dual-record slots), and both temporaries share one frame — this
-         * overflowed the game main thread's stack in the load-game reset
-         * (in-game 2026-07-04, EXCEPTION_STACK_OVERFLOW in __chkstk).
-         * Per-slot temporaries keep the frame at one slot (~20KB).
+         * materialize full temporary ARRAYS on the stack (megabytes), and
+         * both temporaries share one frame — this overflowed the game main
+         * thread's stack in the load-game reset (in-game 2026-07-04,
+         * EXCEPTION_STACK_OVERFLOW in __chkstk). Per-slot temporaries keep
+         * the frame at one slot.
          */
         for (auto& slot : _paths) {
             slot = {};
@@ -318,21 +326,56 @@ namespace redux
         }
 
         /*
-         * Co-movement grouping (Bruno, 2026-07-04): parts whose distance to
-         * this stroke's part stayed constant while both were moving traveled
-         * as one rigid assembly (a magazine and its bullets, a slide and its
-         * sights) — the same signal the authored clips encode as followers,
-         * recovered here from observation. Concurrent recordings are
-         * frame-aligned via startFrame; followers are resampled at the same
-         * source positions as the leader's keys so they stay time-locked.
+         * Stage assignment (Bruno, 2026-07-05): a stroke whose START pose
+         * chains onto the stored primary's END pose is the part's RETURN
+         * stage (mag-in observed after mag-out) and gets its own path and
+         * min/max instead of competing with — and losing to — the larger
+         * primary. Which motion becomes "primary" is simply whichever was
+         * learned first; the scrub stage machine is symmetric.
+         */
+        auto* target = findOrClaimSlot(recorder.weaponFormId, slotName(recorder.sourceName), false);
+        if (!target) {
+            return;
+        }
+        bool isReturnStage = false;
+        if (_tuning.stageCapture && target->learnedPrimary.used) {
+            const auto& primaryPath = target->learnedPrimary.path;
+            const float startToPrimaryEnd = weapon_part_motion_path::poseDistance(
+                candidate.keys.front(),
+                primaryPath.keys.back());
+            const float startToPrimaryStart = weapon_part_motion_path::poseDistance(
+                candidate.keys.front(),
+                primaryPath.keys.front());
+            isReturnStage = startToPrimaryEnd <= _tuning.stageChainToleranceGameUnits &&
+                startToPrimaryEnd < startToPrimaryStart;
+        }
+        auto& record = isReturnStage ? target->learnedReturn : target->learnedPrimary;
+        // Within a stage the larger stroke wins; the other stage and the
+        // authored record are untouched either way (dual storage).
+        if (record.used && !weapon_part_motion_path::shouldReplacePath(record.path, candidate)) {
+            return;
+        }
+
+        /*
+         * Follower recovery from frame-aligned concurrent recordings, two
+         * tiers (see header): RIGID (constant leader distance) and CO-TIMED
+         * (non-rigid but temporally contained in the leader's window — the
+         * P320 barrel tilting while the slide travels). Containment is the
+         * gate that keeps separate phases of one animation apart: a mag
+         * moving in another phase shares no window with this stroke, and a
+         * part whose motion mostly happens OUTSIDE the window (a carry
+         * mover spanning phases) fails the overlap fraction.
          */
         struct FollowerCandidate
         {
             const RecorderSlot* recorder{ nullptr };
             std::int64_t frameOffset{ 0 };
+            bool rigid{ false };
         };
         std::array<FollowerCandidate, weapon_clip_stroke::kMaxFollowers> followerCandidates{};
         std::uint32_t followerCandidateCount = 0;
+        std::uint32_t rigidCount = 0;
+        std::uint32_t coTimedCount = 0;
         constexpr float kRigidDistanceToleranceGameUnits =
             weapon_clip_stroke::kRigidFollowerDistanceToleranceGameUnits;
         constexpr std::int64_t kMinOverlapSamples = 8;
@@ -348,6 +391,7 @@ namespace redux
                 static_cast<std::int64_t>(recorder.startFrame) - static_cast<std::int64_t>(other.startFrame);
             float minDistance = 0.0f;
             float maxDistance = 0.0f;
+            float insideArc = 0.0f;
             std::int64_t overlap = 0;
             std::int64_t firstOtherIndex = -1;
             std::int64_t lastOtherIndex = -1;
@@ -366,73 +410,109 @@ namespace redux
                 } else {
                     minDistance = (std::min)(minDistance, distance);
                     maxDistance = (std::max)(maxDistance, distance);
+                    // Overlapped indices advance by one per leader sample, so
+                    // consecutive terms measure the follower's motion INSIDE
+                    // the leader's window.
+                    insideArc += weapon_part_motion_path::poseDistance(
+                        other.buffer[static_cast<std::size_t>(otherIndex)],
+                        other.buffer[static_cast<std::size_t>(otherIndex - 1)]);
                 }
                 lastOtherIndex = otherIndex;
                 ++overlap;
             }
-            if (overlap < kMinOverlapSamples || maxDistance - minDistance > kRigidDistanceToleranceGameUnits) {
+            if (overlap < kMinOverlapSamples) {
                 continue;
             }
             // Constant distance to a purely ROTATING leader does not prove
             // co-movement; the follower itself must have traveled.
-            if (weapon_part_motion_path::poseDistance(
+            const bool followerMovedInWindow = weapon_part_motion_path::poseDistance(
                     other.buffer[static_cast<std::size_t>(firstOtherIndex)],
-                    other.buffer[static_cast<std::size_t>(lastOtherIndex)]) <
-                weapon_clip_stroke::kFollowerMinExcursionGameUnits) {
+                    other.buffer[static_cast<std::size_t>(lastOtherIndex)]) >=
+                weapon_clip_stroke::kFollowerMinExcursionGameUnits;
+
+            const bool rigid = followerMovedInWindow &&
+                maxDistance - minDistance <= kRigidDistanceToleranceGameUnits;
+            bool coTimed = false;
+            if (!rigid && _tuning.coTimedFollowers && followerMovedInWindow &&
+                insideArc >= weapon_clip_stroke::kFollowerMinExcursionGameUnits &&
+                insideArc <= _tuning.coTimedMaxArcRatio * candidate.totalArcLength) {
+                float totalArc = 0.0f;
+                for (std::uint32_t s = 1; s < other.state.sampleCount; ++s) {
+                    totalArc += weapon_part_motion_path::poseDistance(other.buffer[s], other.buffer[s - 1]);
+                }
+                coTimed = totalArc > 0.0f && insideArc / totalArc >= _tuning.coTimedMinOverlapFraction;
+            }
+            if (!rigid && !coTimed) {
                 continue;
             }
-            followerCandidates[followerCandidateCount++] = FollowerCandidate{ &other, offset };
-        }
-
-        auto* target = findOrClaimSlot(recorder.weaponFormId, slotName(recorder.sourceName), false);
-        if (!target) {
-            return;
-        }
-        auto& record = target->learned;
-        // Between learned strokes the larger stroke wins; the authored
-        // record is untouched either way (dual storage — see header).
-        if (record.used && !weapon_part_motion_path::shouldReplacePath(record.path, candidate)) {
-            return;
+            followerCandidates[followerCandidateCount++] = FollowerCandidate{ &other, offset, rigid };
         }
 
         const bool replaced = record.used;
         record.used = true;
-        record.fallbackSource = false;
         record.path = candidate;
         target->lastUseCounter = _observationCounter;
-        ++_revision;
 
-        // Followers: the rigid co-movers, resampled at the leader's key
-        // positions (frame-aligned) so they replay time-locked to the stroke.
+        // Followers resampled at the leader's key positions (frame-aligned)
+        // so they replay time-locked to the stroke; rigid tier first — it is
+        // the stronger evidence when capacity runs out.
         record.followerCount = 0;
-        for (std::uint32_t c = 0; c < followerCandidateCount &&
-             record.followerCount < static_cast<std::uint32_t>(record.followers.size());
-             ++c) {
-            const auto& followerRecorder = *followerCandidates[c].recorder;
-            const auto offset = followerCandidates[c].frameOffset;
-            auto& slot = record.followers[record.followerCount];
-            slot = {};
-            slot.boneName = followerRecorder.sourceName;
-            // The follower's OBSERVED weapon-local scale, not 1: drives
-            // restate scale, and forcing 1 rescaled modder meshes authored
-            // at non-1 node scales (giant Glock slide piece / hunting-rifle
-            // bullet, in-game 2026-07-04).
-            slot.restScale = followerRecorder.lastScale;
-            const auto lastIndex = static_cast<float>(followerRecorder.state.sampleCount - 1);
-            for (std::uint32_t key = 0; key < weapon_part_motion_path::kResampledKeyCount; ++key) {
-                const float position = (std::min)(
-                    lastIndex,
-                    (std::max)(0.0f, keyPositions[key] + static_cast<float>(offset)));
-                const auto base = static_cast<std::size_t>(position);
-                const float t = position - static_cast<float>(base);
-                const auto next = (std::min)(base + 1, static_cast<std::size_t>(lastIndex));
-                slot.keys[key] = weapon_part_motion_path::lerpPose(
-                    followerRecorder.buffer[base],
-                    followerRecorder.buffer[next],
-                    t);
+        for (const bool rigidPass : { true, false }) {
+            for (std::uint32_t c = 0; c < followerCandidateCount &&
+                 record.followerCount < static_cast<std::uint32_t>(record.followers.size());
+                 ++c) {
+                if (followerCandidates[c].rigid != rigidPass) {
+                    continue;
+                }
+                const auto& followerRecorder = *followerCandidates[c].recorder;
+                const auto offset = followerCandidates[c].frameOffset;
+                auto& slot = record.followers[record.followerCount];
+                slot = {};
+                slot.boneName = followerRecorder.sourceName;
+                // The follower's OBSERVED weapon-local scale, not 1: drives
+                // restate scale, and forcing 1 rescaled modder meshes.
+                slot.restScale = followerRecorder.lastScale;
+                const auto lastIndex = static_cast<float>(followerRecorder.state.sampleCount - 1);
+                for (std::uint32_t key = 0; key < weapon_part_motion_path::kResampledKeyCount; ++key) {
+                    const float position = (std::min)(
+                        lastIndex,
+                        (std::max)(0.0f, keyPositions[key] + static_cast<float>(offset)));
+                    const auto base = static_cast<std::size_t>(position);
+                    const float t = position - static_cast<float>(base);
+                    const auto next = (std::min)(base + 1, static_cast<std::size_t>(lastIndex));
+                    slot.keys[key] = weapon_part_motion_path::lerpPose(
+                        followerRecorder.buffer[base],
+                        followerRecorder.buffer[next],
+                        t);
+                }
+                ++record.followerCount;
+                if (followerCandidates[c].rigid) {
+                    ++rigidCount;
+                } else {
+                    ++coTimedCount;
+                }
             }
-            ++record.followerCount;
         }
+
+        /*
+         * A replaced PRIMARY may break the chain to the stored return stage
+         * (different rest, different end); a return stage that no longer
+         * starts at the primary's end is stale and dropped, never served.
+         */
+        if (!isReturnStage && target->learnedReturn.used) {
+            const float chainGap = weapon_part_motion_path::poseDistance(
+                target->learnedReturn.path.keys.front(),
+                candidate.keys.back());
+            if (chainGap > _tuning.stageChainToleranceGameUnits) {
+                target->learnedReturn = {};
+                RDX_LOG_INFO(Weapon,
+                    "WeaponPartMotionLearner: dropped return stage for part '{}' on weapon {:08X} — replaced primary broke the chain (gap {:.2f})",
+                    slotName(recorder.sourceName),
+                    recorder.weaponFormId,
+                    chainGap);
+            }
+        }
+        ++_revision;
 
         // Once per completed stroke, never per frame. Path endpoints in the
         // stored frame — the learned counterpart of the AUTHORED endpoint
@@ -440,14 +520,15 @@ namespace redux
         const auto& firstKey = candidate.keys.front();
         const auto& lastKey = candidate.keys.back();
         RDX_LOG_INFO(Weapon,
-            "WeaponPartMotionLearner: {} LEARNED motion path for part '{}' on weapon {:08X} (stroke arc {:.2f} game units, {} keys, {} raw samples, {} co-moving followers, authored record {}) start=({:.2f},{:.2f},{:.2f}) end=({:.2f},{:.2f},{:.2f})",
+            "WeaponPartMotionLearner: {} LEARNED {} motion path for part '{}' on weapon {:08X} (stroke arc {:.2f} game units, {} raw samples, followers: {} rigid + {} co-timed, authored record {}) start=({:.2f},{:.2f},{:.2f}) end=({:.2f},{:.2f},{:.2f})",
             replaced ? "updated" : "learned",
+            isReturnStage ? "RETURN-stage" : "primary",
             slotName(recorder.sourceName),
             recorder.weaponFormId,
             candidate.totalArcLength,
-            weapon_part_motion_path::kResampledKeyCount,
             recorder.state.sampleCount,
-            record.followerCount,
+            rigidCount,
+            coTimedCount,
             target->authored.used ? "also present" : "absent",
             firstKey.translate.x,
             firstKey.translate.y,

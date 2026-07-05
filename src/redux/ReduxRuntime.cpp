@@ -482,6 +482,15 @@ namespace redux
         }
 
         const RE::NiTransform weaponWorldInverse = transform_math::invertTransform(weaponNode->world);
+        // Hot-reloadable grouping/staging tuning; cheap by-value refresh so
+        // an INI change applies to the very next completed stroke.
+        _learner.setGroupingTuning(WeaponPartMotionLearner::GroupingTuning{
+            .coTimedFollowers = g_reduxConfig.coTimedFollowers,
+            .coTimedMinOverlapFraction = g_reduxConfig.coTimedMinOverlap,
+            .coTimedMaxArcRatio = g_reduxConfig.coTimedMaxArcRatio,
+            .stageCapture = g_reduxConfig.stageTransitions,
+            .stageChainToleranceGameUnits = g_reduxConfig.stageChainToleranceGameUnits,
+        });
         // Frame-align every recorder before this frame's observations so
         // concurrent recordings can be compared for co-movement grouping.
         _learner.beginObservationFrame();
@@ -1173,6 +1182,8 @@ namespace redux
         input.weaponGenerationKey = generationKey;
         input.weaponFormId = weaponNode && generationKey != 0 ? weaponFormId : 0;
         input.motionPathMode = g_reduxConfig.motionPathMode;
+        input.stageTransitionsEnabled = g_reduxConfig.stageTransitions;
+        input.stageEndEpsilonArcUnits = g_reduxConfig.stageEndEpsilonArcUnits;
 
         const auto* api = ::rock::provider::RockProviderApi::inst;
         // Trigger-arming support probe, once: an older ROCK without raw wand
