@@ -286,6 +286,7 @@ namespace redux
         _eligibleLearnerRevision = 0;
         _eligibleConfigRevision = 0;
         _eligibleResolvedOnce = false;
+        _lastAttachModeArmed = false;
         weapon_clip_motion_harvest::clearPending();
         weapon_clip_motion_harvest::resetWalk();
         weapon_clip_motion_harvest::clearClipActivationTargets();
@@ -1172,12 +1173,88 @@ namespace redux
         input.weaponGenerationKey = generationKey;
         input.weaponFormId = weaponNode && generationKey != 0 ? weaponFormId : 0;
         input.motionPathMode = g_reduxConfig.motionPathMode;
+
+        const auto* api = ::rock::provider::RockProviderApi::inst;
+        // Trigger-arming support probe, once: an older ROCK without raw wand
+        // button reads must not dead-lock attach-only grips — fall back to
+        // always-armed (scrub-on-grab) with a one-time warning.
+        if (!_rawWandSupportChecked && g_reduxConfig.requireTriggerUnlock && api) {
+            _rawWandSupportChecked = true;
+            _rawWandButtonsAvailable = ::rock::provider::supportsRawWandButtonStateV1();
+            _pipboySuppressionAvailable = ::rock::provider::supportsPipboyInputSuppressionV1();
+            if (!_rawWandButtonsAvailable) {
+                RDX_LOG_WARN(Weapon,
+                    "bRequireTriggerUnlock is set but the loaded ROCK has no raw wand button API — eligible parts stay always attach-only");
+            } else {
+                RDX_LOG_INFO(Weapon,
+                    "Trigger arming active (raw wand buttons available, pipboy suppression query {})",
+                    _pipboySuppressionAvailable ? "available" : "missing");
+            }
+        }
+
+        // Grip reports up front: arming stickiness must know about active
+        // attach-only grips BEFORE the target set is gated below.
+        std::array<::rock::provider::RockProviderWeaponPartGripStateV1, 2> gripReports{};
+        std::array<bool, 2> gripReportValid{};
+        for (const bool isLeft : { false, true }) {
+            const auto handEnum = isLeft ? ::rock::provider::RockProviderHand::Left : ::rock::provider::RockProviderHand::Right;
+            gripReportValid[isLeft ? 1u : 0u] = api && api->getWeaponPartGripStateV1 &&
+                api->getWeaponPartGripStateV1(handEnum, &gripReports[isLeft ? 1u : 0u]);
+        }
+
+        /*
+         * Trigger selects the grip type (Bruno, 2026-07-04): grab alone is a
+         * normal ROCK authority grab; grab with the OFFHAND trigger held
+         * makes the part attach-only. Arming installs the per-part targets,
+         * so ROCK resolves the grab as AttachOnly only while armed. Once an
+         * attach-only grip of ours is live, arming is STICKY until the part
+         * is released — required mechanically too: removing the target
+         * mid-grip would make ROCK drop the glue. The offhand trigger is the
+         * selector because the firing hand's trigger fires the weapon; the
+         * pipboy-suppression state is logged for diagnosis but not gated on
+         * (ROCK decides press consumption; refusing to arm here cannot
+         * un-open a Pip-Boy and only creates re-grab races).
+         */
+        const bool triggerSelectionActive = g_reduxConfig.requireTriggerUnlock && _rawWandButtonsAvailable;
+        bool offhandTriggerHeld = false;
+        auto offhandEnum = ::rock::provider::RockProviderHand::None;
+        if (triggerSelectionActive && api && api->getRawWandButtonStateV1 && api->getOffhandHandV1) {
+            offhandEnum = api->getOffhandHandV1();
+            ::rock::provider::RockProviderRawWandButtonStateV1 buttonState{};
+            if (offhandEnum != ::rock::provider::RockProviderHand::None &&
+                api->getRawWandButtonStateV1(offhandEnum, kOpenVrTriggerButtonId, &buttonState) &&
+                buttonState.available != 0 && buttonState.held != 0) {
+                offhandTriggerHeld = true;
+            }
+        }
+        bool attachGripActive = false;
+        for (std::size_t handIndex = 0; handIndex < 2; ++handIndex) {
+            const auto& report = gripReports[handIndex];
+            if (gripReportValid[handIndex] && report.active != 0 && report.attachOnly != 0 &&
+                report.providerOwnerToken == _sandbox.ownerToken() &&
+                report.weaponGenerationKey == generationKey) {
+                attachGripActive = true;
+            }
+        }
+        const bool attachModeArmed = !triggerSelectionActive || offhandTriggerHeld || attachGripActive;
+        if (attachModeArmed != _lastAttachModeArmed) {
+            _lastAttachModeArmed = attachModeArmed;
+            RDX_LOG_INFO(Weapon,
+                "AttachOnly arming {} (offhandTrigger={} stickyAttachGrip={} pipboySuppressed={})",
+                attachModeArmed ? "ON" : "off",
+                offhandTriggerHeld,
+                attachGripActive,
+                _pipboySuppressionAvailable && api && api->isNativePipboyInputSuppressedV1 ? api->isNativePipboyInputSuppressedV1() : false);
+        }
+
         // Per-part attach-only whitelist: allowlisted class + motion path
-        // present ("must move"); the sandbox reinstalls provider targets
-        // only when this set changes.
+        // present ("must move"), installed only while armed; the sandbox
+        // reinstalls provider targets only when this set changes.
         refreshEligibleParts(input.weaponFormId);
-        input.eligiblePartCount = _eligiblePartCount;
-        input.eligibleParts = _eligibleParts;
+        if (attachModeArmed) {
+            input.eligiblePartCount = _eligiblePartCount;
+            input.eligibleParts = _eligibleParts;
+        }
 
         RE::NiTransform weaponWorldInverse{};
         bool hasWeaponInverse = false;
@@ -1186,31 +1263,13 @@ namespace redux
             hasWeaponInverse = true;
         }
 
-        const auto* api = ::rock::provider::RockProviderApi::inst;
-        // Trigger-arming support probe, once: an older ROCK without raw wand
-        // button reads must not dead-lock every grip — fall back to
-        // grab-only activation with a one-time warning.
-        if (!_rawWandSupportChecked && g_reduxConfig.requireTriggerUnlock && api) {
-            _rawWandSupportChecked = true;
-            _rawWandButtonsAvailable = ::rock::provider::supportsRawWandButtonStateV1();
-            _pipboySuppressionAvailable = ::rock::provider::supportsPipboyInputSuppressionV1();
-            if (!_rawWandButtonsAvailable) {
-                RDX_LOG_WARN(Weapon,
-                    "bRequireTriggerUnlock is set but the loaded ROCK has no raw wand button API — falling back to grab-only activation");
-            } else {
-                RDX_LOG_INFO(Weapon,
-                    "Trigger arming active (raw wand buttons available, pipboy suppression query {})",
-                    _pipboySuppressionAvailable ? "available" : "missing");
-            }
-        }
         for (const bool isLeft : { false, true }) {
             auto& handInput = input.hands[isLeft ? 1u : 0u];
             const auto handEnum = isLeft ? ::rock::provider::RockProviderHand::Left : ::rock::provider::RockProviderHand::Right;
-            ::rock::provider::RockProviderWeaponPartGripStateV1 report{};
-            if (!api || !api->getWeaponPartGripStateV1 ||
-                !api->getWeaponPartGripStateV1(handEnum, &report)) {
+            if (!gripReportValid[isLeft ? 1u : 0u]) {
                 continue;
             }
+            const auto& report = gripReports[isLeft ? 1u : 0u];
             // Ownership IS the policy: an AttachOnly grip carrying our owner
             // token matched one of our per-part targets, which by
             // construction are allowlisted AND moving — no separate class or
@@ -1225,29 +1284,11 @@ namespace redux
             handInput.gripSequence = report.gripSequence;
             handInput.bodyId = report.bodyId;
 
-            /*
-             * Trigger arming (level state — a press or an already-held
-             * trigger both unlock). On the pipboy hand the button only
-             * counts as ours while ROCK is swallowing the native pipboy
-             * action; otherwise a press would also open the Pip-Boy or
-             * toggle the flashlight, so it stays ignored (and logged by the
-             * sandbox's awaiting-unlock hint).
-             */
-            if (!g_reduxConfig.requireTriggerUnlock || !_rawWandButtonsAvailable) {
-                handInput.triggerHeld = true;
-            } else if (api->getRawWandButtonStateV1) {
-                ::rock::provider::RockProviderRawWandButtonStateV1 buttonState{};
-                if (api->getRawWandButtonStateV1(handEnum, kOpenVrTriggerButtonId, &buttonState) &&
-                    buttonState.available != 0 && buttonState.held != 0) {
-                    bool triggerIsOurs = true;
-                    if (_pipboySuppressionAvailable && api->getOffhandHandV1 && api->isNativePipboyInputSuppressedV1 &&
-                        api->getOffhandHandV1() == handEnum) {
-                        triggerIsOurs = api->isNativePipboyInputSuppressedV1();
-                    }
-                    handInput.triggerHeld = triggerIsOurs;
-                    handInput.triggerBlockedByPipboy = !triggerIsOurs;
-                }
-            }
+            // Session unlock (level state — press or already-held both
+            // count): the offhand tracks its trigger, the selector button.
+            // A firing-hand attach grip only exists while armed, and its
+            // trigger fires the weapon, so it unlocks immediately.
+            handInput.triggerHeld = !triggerSelectionActive || handEnum != offhandEnum || offhandTriggerHeld;
 
             // Names and nodes come from the member cache (stable storage) so
             // the string_views handed to the sandbox outlive this scope.

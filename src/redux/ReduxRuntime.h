@@ -123,6 +123,8 @@ namespace redux
         bool _rawWandSupportChecked{ false };
         bool _rawWandButtonsAvailable{ false };
         bool _pipboySuppressionAvailable{ false };
+        // Last attach-arming state, for transition logging only.
+        bool _lastAttachModeArmed{ false };
         std::array<DrivenPartLease, WeaponPartDriveSandbox::kMaxSentDrives> _drivenPartLeases{};
         // Scratch for the per-frame harvest drain; member storage because one
         // full batch of stroke groups is far too large for the stack.

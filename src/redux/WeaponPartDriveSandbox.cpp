@@ -239,10 +239,9 @@ namespace redux
                     if (_lastAwaitingUnlockGripSequence[handIndex] != hand.gripSequence) {
                         _lastAwaitingUnlockGripSequence[handIndex] = hand.gripSequence;
                         RDX_LOG_INFO(Weapon,
-                            "WeaponPartDriveSandbox: hand={} glued to part '{}' — awaiting trigger unlock{}",
+                            "WeaponPartDriveSandbox: hand={} glued to part '{}' — awaiting trigger unlock",
                             handIndex == 1 ? "left" : "right",
-                            hand.sourceName,
-                            hand.triggerBlockedByPipboy ? " (trigger held but native pipboy action not suppressed — ignored)" : "");
+                            hand.sourceName);
                     }
                     continue;
                 }

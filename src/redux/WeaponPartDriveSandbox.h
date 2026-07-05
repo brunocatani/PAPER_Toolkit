@@ -56,16 +56,13 @@ namespace redux
             bool gripActive{ false };
             /*
              * Trigger arming: true when this hand's trigger is currently
-             * held AND the button is ours to use (native pipboy action
-             * suppressed on the pipboy hand). A scrub session only STARTS
-             * while this is true; once started it runs until the grip ends
-             * — the trigger is never rechecked, so "press or hold to
-             * unlock, stays unlocked until the part is released".
+             * held (or trigger selection is disabled/unavailable). A scrub
+             * session only STARTS while this is true; once started it runs
+             * until the grip ends — the trigger is never rechecked, so
+             * "press or hold to unlock, stays unlocked until the part is
+             * released".
              */
             bool triggerHeld{ false };
-            // Diagnostics: trigger is physically held but pressing it would
-            // also fire the native pipboy action, so it was ignored.
-            bool triggerBlockedByPipboy{ false };
             std::uint64_t gripSequence{ 0 };
             std::uint32_t bodyId{ 0x7FFF'FFFFu };
             std::string_view sourceName{};
