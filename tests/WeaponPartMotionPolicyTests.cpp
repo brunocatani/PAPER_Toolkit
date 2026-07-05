@@ -1,3 +1,4 @@
+#include "redux/MotionLibraryFormat.h"
 #include "redux/WeaponClipStrokePolicy.h"
 #include "redux/WeaponPartEligibility.h"
 #include "redux/WeaponPartMotionLearner.h"
@@ -650,6 +651,113 @@ int main()
             custom.allows(ActionRole::Bolt, PartKind::Other));
         ok &= expectTrue("bolt key also enables the bolt part kind",
             custom.allows(ActionRole::None, PartKind::Bolt));
+    }
+
+    {
+        // Motion-library format: serialize -> parse must round-trip identity,
+        // curation text, paths, and followers; garbage fails closed.
+        using namespace redux;
+        using namespace redux::motion_library;
+
+        WeaponLibrary library;
+        library.weapon = FormRef{ "Fallout4.esm", 0x0004822D };
+        library.weaponName = "Hunting Rifle";
+        library.curated = true;
+        PartRecord part;
+        part.omod = FormRef{ "SomeMod.esp", 0x000123 };
+        part.sourceName = "WeaponBolt";
+        part.learnedPrimary.used = true;
+        part.learnedPrimary.path.valid = true;
+        part.learnedPrimary.path.totalArcLength = 6.5f;
+        part.learnedPrimary.stageName = "boltPull";
+        part.learnedPrimary.notes = "hand tuned";
+        for (std::uint32_t key = 0; key < weapon_part_motion_path::kResampledKeyCount; ++key) {
+            part.learnedPrimary.path.keys[key].translate.y = static_cast<float>(key) * 0.25f;
+        }
+        part.learnedPrimary.followerCount = 1;
+        auto& follower = part.learnedPrimary.followers[0];
+        std::memcpy(follower.boneName.data(), "Bullet01", 8);
+        follower.restScale = 0.5f;
+        for (std::uint32_t key = 0; key < weapon_part_motion_path::kResampledKeyCount; ++key) {
+            follower.keys[key].translate.z = static_cast<float>(key) * 0.1f;
+        }
+        library.parts.push_back(part);
+
+        const auto text = serialize(library);
+        WeaponLibrary parsed;
+        std::string error;
+        ok &= expectTrue("library JSON parses back", parse(text, parsed, &error));
+        ok &= expectTrue("library parse reports no error", error.empty());
+        ok &= expectTrue("weapon identity round-trips",
+            parsed.weapon.plugin == "Fallout4.esm" && parsed.weapon.localFormId == 0x0004822D);
+        ok &= expectTrue("curated flag round-trips", parsed.curated);
+        ok &= expectEqual("part count round-trips", parsed.parts.size(), std::size_t{ 1 });
+        if (parsed.parts.size() == 1) {
+            const auto& p = parsed.parts[0];
+            ok &= expectTrue("omod ref round-trips",
+                p.omod.plugin == "SomeMod.esp" && p.omod.localFormId == 0x000123u);
+            ok &= expectTrue("stage flags round-trip", p.learnedPrimary.used && !p.learnedReturn.used && !p.authored.used);
+            ok &= expectTrue("stage curation text round-trips",
+                p.learnedPrimary.stageName == "boltPull" && p.learnedPrimary.notes == "hand tuned");
+            ok &= expectTrue("path arc round-trips",
+                p.learnedPrimary.path.valid &&
+                    std::abs(p.learnedPrimary.path.totalArcLength - 6.5f) < 0.001f);
+            ok &= expectTrue("path keys round-trip",
+                std::abs(p.learnedPrimary.path.keys[23].translate.y - 23.0f * 0.25f) < 0.001f);
+            ok &= expectEqual("follower count round-trips", p.learnedPrimary.followerCount, 1u);
+            ok &= expectTrue("follower data round-trips",
+                std::strncmp(p.learnedPrimary.followers[0].boneName.data(), "Bullet01", 8) == 0 &&
+                    std::abs(p.learnedPrimary.followers[0].restScale - 0.5f) < 0.001f);
+        }
+
+        WeaponLibrary garbage;
+        ok &= expectFalse("garbage text fails closed", parse("not json at all {", garbage, nullptr));
+        ok &= expectFalse("future format version fails closed",
+            parse(R"({"format": 999, "weapon": {"plugin": "a.esp", "id": "0x1"}, "parts": []})", garbage, nullptr));
+    }
+
+    {
+        // Learner export/import: records round-trip through the view API,
+        // and import NEVER overwrites live in-RAM data ("disk seeds, live
+        // learning wins").
+        using namespace redux;
+
+        constexpr std::uint32_t kWeapon = 0x0002BEEF;
+        constexpr std::uint32_t kOmod = 0x00777777;
+        constexpr const char* kPart = "WeaponSlide";
+        static WeaponPartMotionLearner source{};
+        static WeaponPartMotionLearner destination{};
+
+        weapon_clip_stroke::AuthoredStrokeGroup group{};
+        std::memcpy(group.leaderBoneName.data(), kPart, std::strlen(kPart));
+        for (std::uint32_t key = 0; key < weapon_part_motion_path::kResampledKeyCount; ++key) {
+            group.leaderPath.keys[key].translate.x = static_cast<float>(key) * 0.2f;
+        }
+        group.leaderPath.totalArcLength = 4.6f;
+        group.leaderPath.valid = true;
+        group.activatedClip = true;
+        source.storeAuthoredGroup({ kWeapon, kOmod, kPart }, group, false);
+
+        std::array<WeaponPartMotionLearner::RecordView, WeaponPartMotionLearner::kMaxStoredPaths> records{};
+        const auto exported = source.exportWeaponRecords(kWeapon, records.data(),
+            static_cast<std::uint32_t>(records.size()));
+        ok &= expectEqual("one record exported for the weapon", exported, 1u);
+        if (exported == 1) {
+            ok &= expectTrue("exported record carries the omod key",
+                records[0].omodFormId == kOmod && records[0].sourceName == kPart);
+            ok &= expectTrue("exported record carries the authored stage",
+                records[0].authored.path != nullptr && records[0].learnedPrimary.path == nullptr);
+
+            ok &= expectTrue("import seeds an empty learner",
+                destination.importRecord({ kWeapon, kOmod, kPart }, records[0]));
+            const auto* imported = destination.findPath({ kWeapon, kOmod, kPart }, MotionPathMode::AuthoredOnly);
+            ok &= expectTrue("imported path serves under the same key",
+                imported && std::abs(imported->totalArcLength - 4.6f) < 0.001f);
+
+            // A second import against now-populated records applies nothing.
+            ok &= expectFalse("import never overwrites live data",
+                destination.importRecord({ kWeapon, kOmod, kPart }, records[0]));
+        }
     }
 
     return ok ? 0 : 1;
