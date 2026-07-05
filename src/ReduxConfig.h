@@ -73,8 +73,16 @@ namespace redux
         float coTimedMinOverlap = 0.70f;
         float coTimedMaxArcRatio = 1.5f;
         bool stageTransitions = true;
-        float stageEndEpsilonArcUnits = 0.35f;
         float stageChainToleranceGameUnits = 2.0f;
+        /*
+         * Max/min trigger zone as a FRACTION of each part's full travel
+         * (the delta-curve height). Percentage-based on purpose: an
+         * absolute arc-unit epsilon meant a pistol slide's zone and a bolt
+         * pull's zone were different fractions of their strokes, failing
+         * short-travel weapons. Drives max-travel events AND stage-
+         * transition triggers.
+         */
+        float travelExtremeTolerance = 0.10f;
         /*
          * Shell-eject test (2026-07-05): reaching max travel on a scrubbed
          * bolt/slide-class part fires the engine's own shell-casing ejection
@@ -83,6 +91,15 @@ namespace redux
          * inside the engine.
          */
         bool shellEjectOnMaxTravel = true;
+        /*
+         * Re-record mode: while true, EVERY config (re)load wipes all
+         * learner-held motion data (learned strokes AND drained authored
+         * strokes; authored re-harvests on the next equip / clip playback),
+         * so reloads re-record from scratch under the current grouping
+         * settings. Leave true during a re-record session, set false when
+         * done. The runtime performs the wipe on the frame thread.
+         */
+        bool resetLearnedPaths = false;
         /*
          * Bumped whenever a value that changes the eligible-part set changed
          * (mode or allowlist); the runtime recomputes per-part targets when

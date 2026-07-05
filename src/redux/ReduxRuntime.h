@@ -54,6 +54,11 @@ namespace redux
         // Used when the config disables the runtime and on session resets.
         void shutdown();
 
+        // Re-record mode (bResetLearnedPaths): wipe all learner-held motion
+        // data so reloads re-record under the current grouping settings.
+        // Frame thread only; the revision bump re-resolves eligible parts.
+        void wipeLearnedPaths();
+
     private:
         struct DrivePartCacheEntry
         {

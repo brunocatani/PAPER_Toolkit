@@ -7,7 +7,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cmath>
 #include <cstring>
 
 namespace redux
@@ -288,8 +287,13 @@ namespace redux
                 const auto& seedRestReference = hand.restPoseValid ? hand.restPose : group.leaderPath->keys[0];
                 const auto seedExtreme =
                     weapon_part_motion_path::travelExtremeFromRest(*group.leaderPath, seedRestReference);
-                session.maxTravelLatched = seedExtreme.valid &&
-                    std::abs(seeded.arcPosition - seedExtreme.arcPosition) <= input.stageEndEpsilonArcUnits;
+                session.maxTravelLatched = false;
+                if (seedExtreme.valid) {
+                    const float seedDelta = weapon_part_motion_path::poseDistance(seeded.target, seedRestReference);
+                    const float seedRange = seedExtreme.peakDelta - seedExtreme.restDelta;
+                    session.maxTravelLatched = seedDelta >=
+                        seedExtreme.restDelta + (1.0f - input.travelExtremeToleranceFraction) * seedRange;
+                }
                 session.handStartTranslate = hand.handTranslate;
                 session.pathAnchorTranslate = seeded.target.translate;
                 session.partScale = hand.partScale;
@@ -355,6 +359,19 @@ namespace redux
              */
             const auto& restReference = hand.restPoseValid ? hand.restPose : path->keys[0];
             const auto extreme = weapon_part_motion_path::travelExtremeFromRest(*path, restReference);
+            /*
+             * Percentage zones on the delta curve (Bruno, 2026-07-05): the
+             * scrub is "at max" / "at rest" when its displacement from rest
+             * is within a travel FRACTION of the respective extreme, so the
+             * zones scale with each part's own stroke — a 4-unit pistol
+             * slide and a 10-unit bolt pull behave identically.
+             */
+            const float scrubDelta = weapon_part_motion_path::poseDistance(scrubbed.target, restReference);
+            const float travelRange = extreme.valid ? extreme.peakDelta - extreme.restDelta : 0.0f;
+            const bool atMaxTravel = extreme.valid &&
+                scrubDelta >= extreme.restDelta + (1.0f - input.travelExtremeToleranceFraction) * travelRange;
+            const bool atRestPoint = extreme.valid &&
+                scrubDelta <= extreme.restDelta + input.travelExtremeToleranceFraction * travelRange;
 
             /*
              * Max-travel event (shell-eject test), checked BEFORE the stage
@@ -364,8 +381,6 @@ namespace redux
              * least halfway back down the delta curve toward rest.
              */
             if (!session.onReturnStage && extreme.valid) {
-                const bool atMaxTravel =
-                    std::abs(scrubbed.arcPosition - extreme.arcPosition) <= input.stageEndEpsilonArcUnits;
                 if (atMaxTravel && !session.maxTravelLatched) {
                     session.maxTravelLatched = true;
                     if (outMaxTravelEvents && outMaxTravelEventCount &&
@@ -377,11 +392,9 @@ namespace redux
                         event.extremeArcPosition = extreme.arcPosition;
                         event.peakDelta = extreme.peakDelta;
                     }
-                } else if (!atMaxTravel && session.maxTravelLatched) {
-                    const float scrubDelta = weapon_part_motion_path::poseDistance(scrubbed.target, restReference);
-                    if (scrubDelta <= extreme.restDelta + 0.5f * (extreme.peakDelta - extreme.restDelta)) {
-                        session.maxTravelLatched = false;
-                    }
+                } else if (!atMaxTravel && session.maxTravelLatched &&
+                           scrubDelta <= extreme.restDelta + 0.5f * travelRange) {
+                    session.maxTravelLatched = false;
                 }
             }
 
@@ -399,7 +412,7 @@ namespace redux
              * primary's end hands off on the first update, so an out-mag
              * grab starts directly on the insertion stage.
              */
-            // Transition trigger on the SAME delta-curve anchors: a stage
+            // Transition trigger on the SAME delta-curve zones: a stage
             // hands over at either physical travel extreme — the far point
             // (mag fully out -> insertion path) or the rest point (seated ->
             // extraction re-arms) — not at the recorded key order's end. The
@@ -407,9 +420,8 @@ namespace redux
             // chained stage actually begins at the reached extreme. Old
             // arc-end trigger remains only as the no-delta-curve fallback.
             const bool atTransitionPoint = extreme.valid
-                ? (std::abs(scrubbed.arcPosition - extreme.arcPosition) <= input.stageEndEpsilonArcUnits ||
-                      std::abs(scrubbed.arcPosition - extreme.restArcPosition) <= input.stageEndEpsilonArcUnits)
-                : scrubbed.arcPosition >= path->totalArcLength - input.stageEndEpsilonArcUnits;
+                ? (atMaxTravel || atRestPoint)
+                : scrubbed.arcPosition >= path->totalArcLength * (1.0f - input.travelExtremeToleranceFraction);
             if (input.stageTransitionsEnabled && atTransitionPoint) {
                 const auto* nextPath = session.onReturnStage ? liveGroup.leaderPath : liveGroup.returnPath;
                 const auto* nextFollowers = session.onReturnStage ? liveGroup.followers : liveGroup.returnFollowers;
@@ -420,7 +432,7 @@ namespace redux
                     // the previous stage's end by construction).
                     constexpr float kStageHandoffMaxSeedArcFraction = 0.25f;
                     if (seeded.valid &&
-                        seeded.arcPosition <= (std::max)(input.stageEndEpsilonArcUnits, kStageHandoffMaxSeedArcFraction * nextPath->totalArcLength)) {
+                        seeded.arcPosition <= kStageHandoffMaxSeedArcFraction * nextPath->totalArcLength) {
                         session.onReturnStage = !session.onReturnStage;
                         // The handoff seed lands at a stage START, so the
                         // max-travel latch re-arms with the new stage.

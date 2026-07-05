@@ -62,20 +62,32 @@ namespace redux
             "\n"
             "; Stage transitions: a learned stroke that starts where the primary stroke\n"
             "; ends (mag-in after mag-out) is kept as a RETURN stage, and the scrub\n"
-            "; hands over between stages at the path extremes — each direction keeps\n"
-            "; its own path and min/max. Epsilon = how close (arc units) to a stage end\n"
-            "; the scrub must reach to hand over; chain tolerance = how close the\n"
-            "; return stroke's start must be to the primary's end to count as chained.\n"
+            "; hands over between stages at the physical travel extremes — each\n"
+            "; direction keeps its own path and min/max. Chain tolerance = how close\n"
+            "; the return stroke's start must be to the primary's end to count chained.\n"
             "bStageTransitions = true\n"
-            "fStageEndEpsilonArcUnits = 0.35\n"
             "fStageChainToleranceGameUnits = 2.0\n"
+            "\n"
+            "; Max/min trigger zone as a FRACTION of each part's full travel: the part\n"
+            "; counts as at-max / at-rest when its displacement from rest is within\n"
+            "; this percentage of the extreme. Percentage-based so short pistol slides\n"
+            "; and long bolt pulls trigger identically. Drives max-travel events\n"
+            "; (shell eject) AND stage-transition triggers. 0.02 - 0.45.\n"
+            "fTravelExtremeTolerance = 0.10\n"
             "\n"
             "; Shell-eject test: reaching max travel on a scrubbed bolt/slide-class part\n"
             "; (bolt, slide, charging handle, pump) fires the engine's own shell-casing\n"
             "; ejection for the equipped weapon — the same P-Casing debris spawn used\n"
-            "; when firing. One eject per full stroke (re-arms once the part retreats\n"
-            "; past half travel); weapons without a casing model simply do nothing.\n"
+            "; when firing. One eject per full stroke (re-arms once the part comes\n"
+            "; halfway back toward rest); weapons without a casing model do nothing.\n"
             "bShellEjectOnMaxTravel = true\n"
+            "\n"
+            "; Re-record mode: while true, EVERY save of this INI (and every game\n"
+            "; start) wipes all learned motion data so reloads re-record from scratch\n"
+            "; under the current grouping settings (drained authored strokes are wiped\n"
+            "; too and re-harvest on the next equip / clip playback). Leave true during\n"
+            "; a re-record session, set false when done.\n"
+            "bResetLearnedPaths = false\n"
             "\n"
             "; AttachOnly allowlist — which part classes MAY become attach-only grips.\n"
             "; Hot-reloadable. The class switch is only half the gate: a part must ALSO\n"
@@ -191,9 +203,10 @@ namespace redux
         const float previousCoTimedOverlap = coTimedMinOverlap;
         const float previousCoTimedRatio = coTimedMaxArcRatio;
         const bool previousStageTransitions = stageTransitions;
-        const float previousStageEpsilon = stageEndEpsilonArcUnits;
+        const float previousExtremeTolerance = travelExtremeTolerance;
         const float previousChainTolerance = stageChainToleranceGameUnits;
         const bool previousShellEject = shellEjectOnMaxTravel;
+        const bool previousResetLearned = resetLearnedPaths;
 
         const bool previousRequireTriggerUnlock = requireTriggerUnlock;
         enabled = ini.GetBoolValue(kSection, "bEnabled", enabled);
@@ -231,9 +244,11 @@ namespace redux
         coTimedMinOverlap = readClampedFloat("fCoTimedMinOverlap", coTimedMinOverlap, 0.05f, 1.0f);
         coTimedMaxArcRatio = readClampedFloat("fCoTimedMaxArcRatio", coTimedMaxArcRatio, 0.1f, 10.0f);
         stageTransitions = ini.GetBoolValue(kSection, "bStageTransitions", stageTransitions);
-        stageEndEpsilonArcUnits = readClampedFloat("fStageEndEpsilonArcUnits", stageEndEpsilonArcUnits, 0.05f, 5.0f);
         stageChainToleranceGameUnits = readClampedFloat("fStageChainToleranceGameUnits", stageChainToleranceGameUnits, 0.25f, 10.0f);
+        // Cap keeps the max/rest zones clear of the 50%-of-travel re-arm point.
+        travelExtremeTolerance = readClampedFloat("fTravelExtremeTolerance", travelExtremeTolerance, 0.02f, 0.45f);
         shellEjectOnMaxTravel = ini.GetBoolValue(kSection, "bShellEjectOnMaxTravel", shellEjectOnMaxTravel);
+        resetLearnedPaths = ini.GetBoolValue(kSection, "bResetLearnedPaths", resetLearnedPaths);
 
         // AttachOnly allowlist booleans, composed into the class masks.
         for (std::size_t i = 0; i < std::size(kAttachOnlyPartKeys); ++i) {
@@ -277,17 +292,23 @@ namespace redux
                     previousShellEject,
                     shellEjectOnMaxTravel);
             }
+            if (resetLearnedPaths != previousResetLearned) {
+                RDX_LOG_INFO(Config,
+                    "bResetLearnedPaths: {} -> {} (while true, every reload wipes learned motion data)",
+                    previousResetLearned,
+                    resetLearnedPaths);
+            }
             const bool groupingChanged = coTimedFollowers != previousCoTimed || coTimedMinOverlap != previousCoTimedOverlap ||
                 coTimedMaxArcRatio != previousCoTimedRatio || stageTransitions != previousStageTransitions ||
-                stageEndEpsilonArcUnits != previousStageEpsilon || stageChainToleranceGameUnits != previousChainTolerance;
+                travelExtremeTolerance != previousExtremeTolerance || stageChainToleranceGameUnits != previousChainTolerance;
             if (groupingChanged) {
                 RDX_LOG_INFO(Config,
-                    "Grouping tuning: coTimed={} overlap={:.2f} arcRatio={:.2f} stages={} endEps={:.2f} chainTol={:.2f} (applies to strokes learned from now on)",
+                    "Grouping tuning: coTimed={} overlap={:.2f} arcRatio={:.2f} stages={} extremeTol={:.2f} chainTol={:.2f} (applies to strokes learned from now on; extremeTol applies immediately)",
                     coTimedFollowers,
                     coTimedMinOverlap,
                     coTimedMaxArcRatio,
                     stageTransitions,
-                    stageEndEpsilonArcUnits,
+                    travelExtremeTolerance,
                     stageChainToleranceGameUnits);
             }
             bool allowListChangedKeys = false;
@@ -304,7 +325,7 @@ namespace redux
             }
             if (enabled == previousEnabled && motionPathMode == previousMode && logLevel == previousLogLevel &&
                 requireTriggerUnlock == previousRequireTriggerUnlock && !allowListChangedKeys && !groupingChanged &&
-                shellEjectOnMaxTravel == previousShellEject) {
+                shellEjectOnMaxTravel == previousShellEject && resetLearnedPaths == previousResetLearned) {
                 RDX_LOG_INFO(Config, "Reload applied, no value changes (enabled={} mode={} logLevel={})",
                     enabled,
                     motionPathModeName(motionPathMode),

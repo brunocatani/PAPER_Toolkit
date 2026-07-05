@@ -322,6 +322,13 @@ namespace redux
         updateWeaponPartDriveSandbox(weaponNode, generationKey, weaponFormId, snapshot);
     }
 
+    void ReduxRuntime::wipeLearnedPaths()
+    {
+        _learner.reset();
+        RDX_LOG_INFO(Weapon,
+            "Learned motion data WIPED (bResetLearnedPaths) — reloads re-record from scratch; authored strokes re-harvest on the next equip/clip playback");
+    }
+
     void ReduxRuntime::shutdown()
     {
         _sandbox.shutdown();
@@ -1253,7 +1260,7 @@ namespace redux
         input.weaponFormId = weaponNode && generationKey != 0 ? weaponFormId : 0;
         input.motionPathMode = g_reduxConfig.motionPathMode;
         input.stageTransitionsEnabled = g_reduxConfig.stageTransitions;
-        input.stageEndEpsilonArcUnits = g_reduxConfig.stageEndEpsilonArcUnits;
+        input.travelExtremeToleranceFraction = g_reduxConfig.travelExtremeTolerance;
 
         const auto* api = ::rock::provider::RockProviderApi::inst;
         // Trigger-arming support probe, once: an older ROCK without raw wand

@@ -126,14 +126,21 @@ namespace redux
             // hand mid-scrub; it applies to the next grip.
             MotionPathMode motionPathMode{ MotionPathMode::Hybrid };
             /*
-             * Stage handoff at the path extremes: reaching the end of the
-             * active stage hands the session over to the learned return
-             * stage (mag-out end -> mag-in path, and back), each stage with
-             * its own min/max. Epsilon is how close to the end (in arc
-             * units) the scrub must reach to hand off.
+             * Stage handoff at the physical travel extremes (delta-curve
+             * max/min): reaching either extreme of the active stage hands
+             * the session over to the chained stage (mag-out end -> mag-in
+             * path, and back), each stage with its own min/max.
              */
             bool stageTransitionsEnabled{ true };
-            float stageEndEpsilonArcUnits{ 0.35f };
+            /*
+             * Max/min trigger zone as a FRACTION of the part's full travel
+             * (the delta-curve height): the scrub counts as at-max / at-rest
+             * when its displacement from rest is within this fraction of the
+             * extreme. Percentage-based so a short pistol slide and a long
+             * bolt pull trigger identically (absolute arc units did not
+             * scale — Bruno, 2026-07-05).
+             */
+            float travelExtremeToleranceFraction{ 0.10f };
             // Per-part attach-only whitelist for the current weapon
             // generation; targets reinstall only when this set changes.
             std::uint32_t eligiblePartCount{ 0 };
