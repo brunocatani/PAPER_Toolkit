@@ -204,6 +204,14 @@ namespace redux::weapon_clip_motion_harvest
         constexpr std::int32_t kMaxPlausibleAnnotationTracks = 64;
         constexpr std::int32_t kMaxPlausibleAnnotations = 256;
         constexpr std::int32_t kMaxPlausibleTriggers = 128;
+        /*
+         * Per-weapon-generation line budget for the stage-marker dump. The
+         * processed-binding registry (128 slots) can overflow on weapons
+         * with hundreds of bindings, after which activations re-dump every
+         * reload; the budget keeps the log bounded no matter what. Reset
+         * where the registry resets (new walk generation).
+         */
+        constexpr std::uint32_t kStageMarkerLogBudgetPerGeneration = 160;
 
         constexpr float kMinClipDurationSeconds = 0.01f;
         constexpr float kMaxClipDurationSeconds = 300.0f;
@@ -313,6 +321,8 @@ namespace redux::weapon_clip_motion_harvest
         };
         std::array<ProcessedBinding, 128> s_processedBindings{};
         std::uint32_t s_processedBindingCount = 0;
+        // Guarded by s_hookMutex like the registry above.
+        std::uint32_t s_stageMarkerLogBudget = kStageMarkerLogBudgetPerGeneration;
 
         [[nodiscard]] bool bindingProcessedLocked(std::uintptr_t binding, bool fromActivation)
         {
@@ -505,18 +515,29 @@ namespace redux::weapon_clip_motion_harvest
          *    table (hkbBehaviorGraphStringData::eventNames) is not yet
          *    verified, so triggers log numeric ids.
          * Offsets are destructor/walker-verified (see the constants above);
-         * every hop is plausibility-gated and degrades into a logged skip.
-         * Runs once per binding per weapon generation on the activation
-         * path, so the log volume is a handful of lines per equip.
+         * every hop is plausibility-gated and degrades into a logged skip,
+         * and every dumped clip emits exactly one INFO summary line with
+         * raw structure counts. Runs on the activation path, deduped by
+         * the processed-binding registry and hard-capped by
+         * s_stageMarkerLogBudget per weapon generation.
          */
         void dumpClipStageMarkers(std::uintptr_t clipGenerator, std::uintptr_t binding, const char* clipName)
         {
+            if (s_stageMarkerLogBudget == 0) {
+                return;
+            }
             const auto animation = *reinterpret_cast<std::uintptr_t*>(binding + kBindingAnimationOffset);
             if (!plausiblePointer(animation)) {
+                --s_stageMarkerLogBudget;
+                RDX_LOG_INFO(Weapon,
+                    "STAGE-MARKER summary clip='{}': skipped, animation pointer implausible", clipName);
                 return;
             }
             const float duration = *reinterpret_cast<float*>(animation + kAnimationDurationOffset);
             if (!std::isfinite(duration) || duration <= 0.0f || duration > kMaxClipDurationSeconds) {
+                --s_stageMarkerLogBudget;
+                RDX_LOG_INFO(Weapon,
+                    "STAGE-MARKER summary clip='{}': skipped, duration {:.3f} implausible", clipName, duration);
                 return;
             }
 
@@ -556,27 +577,32 @@ namespace redux::weapon_clip_motion_harvest
                             continue;
                         }
                         ++annotationLines;
-                        RDX_LOG_INFO(Weapon,
-                            "STAGE-MARKER [annotation] clip='{}' track='{}' t={:.3f}/{:.3f}s text='{}'",
-                            clipName,
-                            trackName,
-                            time,
-                            duration,
-                            text);
+                        if (s_stageMarkerLogBudget > 1) {
+                            --s_stageMarkerLogBudget;
+                            RDX_LOG_INFO(Weapon,
+                                "STAGE-MARKER [annotation] clip='{}' track='{}' t={:.3f}/{:.3f}s text='{}'",
+                                clipName,
+                                trackName,
+                                time,
+                                duration,
+                                text);
+                        }
                     }
                 }
             }
 
             std::uint32_t triggerLines = 0;
+            std::int32_t triggerCountRaw = 0;
             const auto triggersObject =
                 *reinterpret_cast<std::uintptr_t*>(clipGenerator + kClipGeneratorTriggersOffset);
             if (plausiblePointer(triggersObject)) {
-                const auto triggerCount =
+                triggerCountRaw =
                     *reinterpret_cast<std::int32_t*>(triggersObject + kTriggerArrayCountOffset);
                 const auto triggerData =
                     *reinterpret_cast<std::uintptr_t*>(triggersObject + kTriggerArrayDataOffset);
-                if (triggerCount > 0 && triggerCount <= kMaxPlausibleTriggers && plausiblePointer(triggerData)) {
-                    for (std::int32_t i = 0; i < triggerCount; ++i) {
+                if (triggerCountRaw > 0 && triggerCountRaw <= kMaxPlausibleTriggers &&
+                    plausiblePointer(triggerData)) {
+                    for (std::int32_t i = 0; i < triggerCountRaw; ++i) {
                         const auto trigger = triggerData + static_cast<std::uintptr_t>(i) * kTriggerStride;
                         const float localTime = *reinterpret_cast<float*>(trigger + kTriggerLocalTimeOffset);
                         // relativeToEndOfClip triggers carry negative times.
@@ -587,19 +613,36 @@ namespace redux::weapon_clip_motion_harvest
                         const auto eventId =
                             *reinterpret_cast<std::int32_t*>(trigger + kTriggerEventIdOffset);
                         ++triggerLines;
-                        RDX_LOG_INFO(Weapon,
-                            "STAGE-MARKER [trigger] clip='{}' t={:.3f}/{:.3f}s eventId={}",
-                            clipName,
-                            localTime,
-                            duration,
-                            eventId);
+                        if (s_stageMarkerLogBudget > 1) {
+                            --s_stageMarkerLogBudget;
+                            RDX_LOG_INFO(Weapon,
+                                "STAGE-MARKER [trigger] clip='{}' t={:.3f}/{:.3f}s eventId={}",
+                                clipName,
+                                localTime,
+                                duration,
+                                eventId);
+                        }
                     }
                 }
             }
-            if (annotationLines == 0 && triggerLines == 0) {
-                RDX_LOG_DEBUG(Weapon,
-                    "STAGE-MARKER: clip '{}' carries no annotations and no triggers", clipName);
-            }
+            /*
+             * Always exactly one summary per dumped clip, raw structure
+             * counts included, so "VR clips carry no markers" and "a
+             * plausibility gate rejected everything" are distinguishable
+             * from the log alone (2026-07-05: a full session produced zero
+             * marker lines and the old silent bails/DEBUG-only empty case
+             * could not say which).
+             */
+            --s_stageMarkerLogBudget;
+            RDX_LOG_INFO(Weapon,
+                "STAGE-MARKER summary clip='{}' duration={:.2f}s annotationTracksRaw={} annotationsLogged={} triggersObject={} triggersRaw={} triggersLogged={}",
+                clipName,
+                duration,
+                trackCount,
+                annotationLines,
+                plausiblePointer(triggersObject) ? "set" : "null",
+                triggerCountRaw,
+                triggerLines);
         }
 
         // Returns true when the binding reached a terminal outcome (harvested
@@ -1365,6 +1408,7 @@ namespace redux::weapon_clip_motion_harvest
             s_walkPassStartHarvested = s_bindingsHarvested.load(std::memory_order_relaxed);
             std::scoped_lock lock(s_hookMutex);
             s_processedBindingCount = 0;
+            s_stageMarkerLogBudget = kStageMarkerLogBudgetPerGeneration;
         }
         if (s_walkDone) {
             return StepResult::Completed;
@@ -1478,6 +1522,7 @@ namespace redux::weapon_clip_motion_harvest
         s_walkPassStartHarvested = s_bindingsHarvested.load(std::memory_order_relaxed);
         std::scoped_lock lock(s_hookMutex);
         s_processedBindingCount = 0;
+        s_stageMarkerLogBudget = kStageMarkerLogBudgetPerGeneration;
     }
 
     void restartWalkPass()
