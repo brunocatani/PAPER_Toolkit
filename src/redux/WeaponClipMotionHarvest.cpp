@@ -165,6 +165,46 @@ namespace redux::weapon_clip_motion_harvest
         // session and what made every clip look non-resident.
         constexpr std::size_t kSampleTracksSlot = 5;
 
+        /*
+         * Stage-marker offsets (phase 4, verified 2026-07-05 via the
+         * destructor chain + trigger walker, two raw-disassembly sources):
+         *  - ~hkaAnimation (0x141A31580) walks m_annotationTracks at
+         *    +0x28 (data) / +0x30 (count) with stride 0x18 and frees
+         *    count*0x18 bytes; +0x20 is the refcount-released
+         *    extractedMotion, consistent with the +0x14/+0x18 members
+         *    verified earlier.
+         *  - ~hkaAnnotationTrack (0x141A31650) releases the hkStringPtr
+         *    trackName at +0x0, walks annotations at +0x8/+0x10 with
+         *    stride 0x10, and releases each annotation's hkStringPtr text
+         *    at element+0x8 (element+0x0 is the float time — never
+         *    destructed).
+         *  - The hkbClipGenerator trigger walker (0x14192F160, called from
+         *    update/vfunction9) reads m_triggers at clip+0x98 (refcounted
+         *    object with hkArray at +0x10 data / +0x18 count) and fires
+         *    triggers of stride 0x20: +0x0 float localTime, +0x8 int32
+         *    eventId (graph-local), +0x10 payload.
+         * The reflection name pool independently confirms the member names
+         * ("annotationTracks", "triggers", "hkaAnnotationTrackAnnotation").
+         */
+        constexpr std::uintptr_t kAnimationAnnotationTracksDataOffset = 0x28;
+        constexpr std::uintptr_t kAnimationAnnotationTracksCountOffset = 0x30;
+        constexpr std::uintptr_t kAnnotationTrackStride = 0x18;
+        constexpr std::uintptr_t kAnnotationTrackNameOffset = 0x0;
+        constexpr std::uintptr_t kAnnotationTrackAnnotationsDataOffset = 0x8;
+        constexpr std::uintptr_t kAnnotationTrackAnnotationsCountOffset = 0x10;
+        constexpr std::uintptr_t kAnnotationStride = 0x10;
+        constexpr std::uintptr_t kAnnotationTimeOffset = 0x0;
+        constexpr std::uintptr_t kAnnotationTextOffset = 0x8;
+        constexpr std::uintptr_t kClipGeneratorTriggersOffset = 0x98;
+        constexpr std::uintptr_t kTriggerArrayDataOffset = 0x10;
+        constexpr std::uintptr_t kTriggerArrayCountOffset = 0x18;
+        constexpr std::uintptr_t kTriggerStride = 0x20;
+        constexpr std::uintptr_t kTriggerLocalTimeOffset = 0x0;
+        constexpr std::uintptr_t kTriggerEventIdOffset = 0x8;
+        constexpr std::int32_t kMaxPlausibleAnnotationTracks = 64;
+        constexpr std::int32_t kMaxPlausibleAnnotations = 256;
+        constexpr std::int32_t kMaxPlausibleTriggers = 128;
+
         constexpr float kMinClipDurationSeconds = 0.01f;
         constexpr float kMaxClipDurationSeconds = 300.0f;
         constexpr std::int32_t kMaxPlausibleTrackCount = 512;
@@ -427,6 +467,139 @@ namespace redux::weapon_clip_motion_harvest
                 }
             }
             return false;
+        }
+
+        // Copies a printable hkStringPtr (low-bit owned-flag convention)
+        // into out; returns the length, 0 on any implausible byte.
+        std::size_t copyHkStringPtr(std::uintptr_t stringField, char* out, std::size_t capacity)
+        {
+            out[0] = '\0';
+            const auto pointer = stringField & ~static_cast<std::uintptr_t>(1);
+            if (!plausiblePointer(pointer)) {
+                return 0;
+            }
+            const char* chars = reinterpret_cast<const char*>(pointer);
+            std::size_t length = 0;
+            while (length < capacity - 1 && chars[length] != '\0') {
+                const unsigned char c = static_cast<unsigned char>(chars[length]);
+                if (c < 0x20 || c > 0x7E) {
+                    out[0] = '\0';
+                    return 0;
+                }
+                out[length] = chars[length];
+                ++length;
+            }
+            out[length] = '\0';
+            return length;
+        }
+
+        /*
+         * STAGE-MARKER DUMP (phase 4, Bruno 2026-07-05): the engine's own
+         * named animation stage data, log-only for now — the data source
+         * for future named-stage segmentation. Two kinds:
+         *  - hkaAnimation annotation tracks: authored {time, text} markers
+         *    baked into the clip (real names at exact times);
+         *  - hkbClipGenerator triggers: {localTime, eventId} pairs the game
+         *    itself fires as anim events (mag-out sounds, EjectShellCasing,
+         *    reload-complete). Event ids are graph-local; the id->name
+         *    table (hkbBehaviorGraphStringData::eventNames) is not yet
+         *    verified, so triggers log numeric ids.
+         * Offsets are destructor/walker-verified (see the constants above);
+         * every hop is plausibility-gated and degrades into a logged skip.
+         * Runs once per binding per weapon generation on the activation
+         * path, so the log volume is a handful of lines per equip.
+         */
+        void dumpClipStageMarkers(std::uintptr_t clipGenerator, std::uintptr_t binding, const char* clipName)
+        {
+            const auto animation = *reinterpret_cast<std::uintptr_t*>(binding + kBindingAnimationOffset);
+            if (!plausiblePointer(animation)) {
+                return;
+            }
+            const float duration = *reinterpret_cast<float*>(animation + kAnimationDurationOffset);
+            if (!std::isfinite(duration) || duration <= 0.0f || duration > kMaxClipDurationSeconds) {
+                return;
+            }
+
+            const auto trackCount =
+                *reinterpret_cast<std::int32_t*>(animation + kAnimationAnnotationTracksCountOffset);
+            const auto trackData =
+                *reinterpret_cast<std::uintptr_t*>(animation + kAnimationAnnotationTracksDataOffset);
+            std::uint32_t annotationLines = 0;
+            if (trackCount > 0 && trackCount <= kMaxPlausibleAnnotationTracks && plausiblePointer(trackData)) {
+                for (std::int32_t t = 0; t < trackCount; ++t) {
+                    const auto track = trackData + static_cast<std::uintptr_t>(t) * kAnnotationTrackStride;
+                    char trackName[64];
+                    copyHkStringPtr(
+                        *reinterpret_cast<std::uintptr_t*>(track + kAnnotationTrackNameOffset),
+                        trackName,
+                        sizeof(trackName));
+                    const auto annotationCount =
+                        *reinterpret_cast<std::int32_t*>(track + kAnnotationTrackAnnotationsCountOffset);
+                    const auto annotationData =
+                        *reinterpret_cast<std::uintptr_t*>(track + kAnnotationTrackAnnotationsDataOffset);
+                    if (annotationCount <= 0 || annotationCount > kMaxPlausibleAnnotations ||
+                        !plausiblePointer(annotationData)) {
+                        continue;
+                    }
+                    for (std::int32_t a = 0; a < annotationCount; ++a) {
+                        const auto annotation =
+                            annotationData + static_cast<std::uintptr_t>(a) * kAnnotationStride;
+                        const float time = *reinterpret_cast<float*>(annotation + kAnnotationTimeOffset);
+                        if (!std::isfinite(time) || time < -1.0f || time > duration + 1.0f) {
+                            continue;
+                        }
+                        char text[96];
+                        if (copyHkStringPtr(
+                                *reinterpret_cast<std::uintptr_t*>(annotation + kAnnotationTextOffset),
+                                text,
+                                sizeof(text)) == 0) {
+                            continue;
+                        }
+                        ++annotationLines;
+                        RDX_LOG_INFO(Weapon,
+                            "STAGE-MARKER [annotation] clip='{}' track='{}' t={:.3f}/{:.3f}s text='{}'",
+                            clipName,
+                            trackName,
+                            time,
+                            duration,
+                            text);
+                    }
+                }
+            }
+
+            std::uint32_t triggerLines = 0;
+            const auto triggersObject =
+                *reinterpret_cast<std::uintptr_t*>(clipGenerator + kClipGeneratorTriggersOffset);
+            if (plausiblePointer(triggersObject)) {
+                const auto triggerCount =
+                    *reinterpret_cast<std::int32_t*>(triggersObject + kTriggerArrayCountOffset);
+                const auto triggerData =
+                    *reinterpret_cast<std::uintptr_t*>(triggersObject + kTriggerArrayDataOffset);
+                if (triggerCount > 0 && triggerCount <= kMaxPlausibleTriggers && plausiblePointer(triggerData)) {
+                    for (std::int32_t i = 0; i < triggerCount; ++i) {
+                        const auto trigger = triggerData + static_cast<std::uintptr_t>(i) * kTriggerStride;
+                        const float localTime = *reinterpret_cast<float*>(trigger + kTriggerLocalTimeOffset);
+                        // relativeToEndOfClip triggers carry negative times.
+                        if (!std::isfinite(localTime) || localTime < -(duration + 1.0f) ||
+                            localTime > duration + 1.0f) {
+                            continue;
+                        }
+                        const auto eventId =
+                            *reinterpret_cast<std::int32_t*>(trigger + kTriggerEventIdOffset);
+                        ++triggerLines;
+                        RDX_LOG_INFO(Weapon,
+                            "STAGE-MARKER [trigger] clip='{}' t={:.3f}/{:.3f}s eventId={}",
+                            clipName,
+                            localTime,
+                            duration,
+                            eventId);
+                    }
+                }
+            }
+            if (annotationLines == 0 && triggerLines == 0) {
+                RDX_LOG_DEBUG(Weapon,
+                    "STAGE-MARKER: clip '{}' carries no annotations and no triggers", clipName);
+            }
         }
 
         // Returns true when the binding reached a terminal outcome (harvested
@@ -956,6 +1129,9 @@ namespace redux::weapon_clip_motion_harvest
                 }
                 animationName[length] = '\0';
             }
+            // Stage markers dump BEFORE the harvest so the names/times land
+            // in the log even when the stroke harvest itself bails.
+            dumpClipStageMarkers(clipGenerator, binding, animationName.data());
             if (harvestBinding(
                     binding,
                     skeleton,
