@@ -76,6 +76,14 @@ namespace redux
         float stageEndEpsilonArcUnits = 0.35f;
         float stageChainToleranceGameUnits = 2.0f;
         /*
+         * Shell-eject test (2026-07-05): reaching max travel on a scrubbed
+         * bolt/slide-class part fires the engine's own shell-casing ejection
+         * for the equipped weapon (the P-Casing spawn a fired shot uses).
+         * One eject per full stroke; weapons without a casing model no-op
+         * inside the engine.
+         */
+        bool shellEjectOnMaxTravel = true;
+        /*
          * Bumped whenever a value that changes the eligible-part set changed
          * (mode or allowlist); the runtime recomputes per-part targets when
          * this moves. Starts at 1 so a zero-initialized consumer always

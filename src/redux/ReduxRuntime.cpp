@@ -2,6 +2,7 @@
 
 #include "ReduxConfig.h"
 #include "ReduxLog.h"
+#include "redux/EngineShellEject.h"
 #include "redux/TransformMath.h"
 #include "redux/WeaponClipMotionHarvest.h"
 #include "redux/WeaponPartEligibility.h"
@@ -27,6 +28,48 @@ namespace redux
         // (axis-button base 32 + axis 1 — see ROCK's InputRemapPolicy
         // kOpenVrSteamVrTriggerButtonId). Level state only by API design.
         constexpr std::uint32_t kOpenVrTriggerButtonId = 33;
+
+        // Shell-eject test: the "racking" classifications whose full
+        // rearward travel should eject a casing — bolt/slide-class by part
+        // kind or by action role (parts like an 'Other'-kind bolt handle
+        // still classify through the role).
+        [[nodiscard]] bool isShellEjectActionPart(std::uint32_t partKind, std::uint32_t actionRole)
+        {
+            using Kind = ::rock::provider::RockProviderWeaponPartKindV1;
+            using Role = ::rock::provider::RockProviderWeaponActionRoleV1;
+            switch (static_cast<Kind>(partKind)) {
+                case Kind::Pump:
+                case Kind::Bolt:
+                case Kind::Slide:
+                case Kind::ChargingHandle:
+                    return true;
+                default:
+                    break;
+            }
+            switch (static_cast<Role>(actionRole)) {
+                case Role::Bolt:
+                case Role::Slide:
+                case Role::ChargingHandle:
+                case Role::Pump:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        [[nodiscard]] const char* shellEjectResultName(ShellEjectResult result)
+        {
+            switch (result) {
+                case ShellEjectResult::Ejected:
+                    return "ejected";
+                case ShellEjectResult::NoWeapon:
+                    return "no-weapon";
+                case ShellEjectResult::WeaponMismatch:
+                    return "weapon-mismatch";
+                default:
+                    return "unknown";
+            }
+        }
 
         [[nodiscard]] std::string_view providerFixedStringView(const char* value, std::size_t capacity)
         {
@@ -1349,7 +1392,9 @@ namespace redux
         }
 
         std::array<WeaponPartDriveSandbox::SentDrive, WeaponPartDriveSandbox::kMaxSentDrives> sentDrives{};
-        const auto sentCount = _sandbox.update(input, _learner, sentDrives.data());
+        std::array<WeaponPartDriveSandbox::MaxTravelEvent, WeaponPartDriveSandbox::kMaxMaxTravelEvents> maxTravelEvents{};
+        std::uint32_t maxTravelEventCount = 0;
+        const auto sentCount = _sandbox.update(input, _learner, sentDrives.data(), maxTravelEvents.data(), &maxTravelEventCount);
         // Refresh the untrusted-observation leases for everything we drove
         // this frame; the lease outlives the drive by the restore frame.
         for (std::uint32_t i = 0; i < sentCount; ++i) {
@@ -1376,6 +1421,52 @@ namespace redux
             slot->bodyId = sentDrives[i].bodyId;
             slot->sourceName = sentDrives[i].sourceName;
             slot->framesRemaining = kDrivenPartUntrustedFrames;
+        }
+
+        /*
+         * Shell-eject test (Bruno, 2026-07-05): a scrubbed bolt/slide-class
+         * part reaching max travel fires the engine's own shell-casing
+         * ejection for the equipped weapon — the exact P-Casing debris spawn
+         * a fired shot's "EjectShellCasing" anim event runs (see
+         * EngineShellEject.cpp for the verified call chain). The sandbox
+         * latches emission (one per full stroke), the part classification
+         * gates which parts count, and the eject itself fails closed on
+         * weapon mismatch or a weapon without a casing model. Groundwork for
+         * a larger manual-action feature later.
+         */
+        if (maxTravelEventCount > 0 && g_reduxConfig.shellEjectOnMaxTravel && input.weaponFormId != 0) {
+            for (std::uint32_t i = 0; i < maxTravelEventCount; ++i) {
+                const auto& event = maxTravelEvents[i];
+                const DrivePartCacheEntry* entry = nullptr;
+                if (_drivePartCache.generationKey == generationKey) {
+                    for (std::uint32_t j = 0; j < _drivePartCache.count; ++j) {
+                        if (_drivePartCache.entries[j].bodyId == event.bodyId) {
+                            entry = &_drivePartCache.entries[j];
+                            break;
+                        }
+                    }
+                }
+                const auto eventName = providerFixedStringView(event.sourceName.data(), event.sourceName.size());
+                if (!entry || !isShellEjectActionPart(entry->partKind, entry->actionRole)) {
+                    RDX_LOG_DEBUG(Weapon,
+                        "SHELL-EJECT skip: part '{}' at max travel is not a bolt/slide-class action (kind={} role={})",
+                        eventName,
+                        entry ? entry->partKind : 0xFFFFFFFFu,
+                        entry ? entry->actionRole : 0xFFFFFFFFu);
+                    continue;
+                }
+                auto* player = RE::PlayerCharacter::GetSingleton();
+                if (!player) {
+                    continue;
+                }
+                const auto result = ejectShellCasingForEquippedWeapon(*player, input.weaponFormId);
+                RDX_LOG_INFO(Weapon,
+                    "SHELL-EJECT: part '{}' (kind={} role={}) hit max travel -> {}",
+                    eventName,
+                    entry->partKind,
+                    entry->actionRole,
+                    shellEjectResultName(result));
+            }
         }
     }
 }

@@ -195,8 +195,13 @@ namespace redux
     std::uint32_t WeaponPartDriveSandbox::update(
         const FrameInput& input,
         const WeaponPartMotionLearner& learner,
-        SentDrive* outSentDrives)
+        SentDrive* outSentDrives,
+        MaxTravelEvent* outMaxTravelEvents,
+        std::uint32_t* outMaxTravelEventCount)
     {
+        if (outMaxTravelEventCount) {
+            *outMaxTravelEventCount = 0;
+        }
         if (!ensureRegistered()) {
             _sessions = {};
             _sentDrivesLastUpdate = false;
@@ -277,6 +282,10 @@ namespace redux
                 session.sourceName = {};
                 std::memcpy(session.sourceName.data(), hand.sourceName.data(), (std::min)(hand.sourceName.size(), session.sourceName.size() - 1));
                 session.arcPosition = seeded.arcPosition;
+                // Seeding inside the end zone latches WITHOUT emitting — a
+                // grab of an already-out part is not a completed stroke.
+                session.maxTravelLatched =
+                    seeded.arcPosition >= group.leaderPath->totalArcLength - input.stageEndEpsilonArcUnits;
                 session.handStartTranslate = hand.handTranslate;
                 session.pathAnchorTranslate = seeded.target.translate;
                 session.partScale = hand.partScale;
@@ -326,6 +335,29 @@ namespace redux
             session.arcPosition = scrubbed.arcPosition;
 
             /*
+             * Max-travel event (Bruno, 2026-07-05 shell-eject test), checked
+             * BEFORE the stage handoff so the emission belongs to the primary
+             * end just reached, not to the next stage's seed. Latched: one
+             * event on entering the end zone, re-armed only after the scrub
+             * retreats below half the path.
+             */
+            if (!session.onReturnStage) {
+                const bool atMaxTravel =
+                    scrubbed.arcPosition >= path->totalArcLength - input.stageEndEpsilonArcUnits;
+                if (atMaxTravel && !session.maxTravelLatched) {
+                    session.maxTravelLatched = true;
+                    if (outMaxTravelEvents && outMaxTravelEventCount &&
+                        *outMaxTravelEventCount < kMaxMaxTravelEvents) {
+                        auto& event = outMaxTravelEvents[(*outMaxTravelEventCount)++];
+                        event.bodyId = session.bodyId;
+                        event.sourceName = session.sourceName;
+                    }
+                } else if (!atMaxTravel && scrubbed.arcPosition < 0.5f * path->totalArcLength) {
+                    session.maxTravelLatched = false;
+                }
+            }
+
+            /*
              * Stage handoff at the extremes (Bruno, 2026-07-05): reaching
              * the end of the active stage hands the session to the OTHER
              * learned stage — mag pulled fully out continues onto the
@@ -352,6 +384,9 @@ namespace redux
                     if (seeded.valid &&
                         seeded.arcPosition <= (std::max)(input.stageEndEpsilonArcUnits, kStageHandoffMaxSeedArcFraction * nextPath->totalArcLength)) {
                         session.onReturnStage = !session.onReturnStage;
+                        // The handoff seed lands at a stage START, so the
+                        // max-travel latch re-arms with the new stage.
+                        session.maxTravelLatched = false;
                         session.arcPosition = seeded.arcPosition;
                         session.pathAnchorTranslate = seeded.target.translate;
                         session.handStartTranslate = hand.handTranslate;

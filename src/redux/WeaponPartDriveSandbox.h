@@ -73,6 +73,24 @@ namespace redux
             weapon_part_motion_path::Vec3 handTranslate{};
         };
 
+        /*
+         * Emitted when a scrub session first reaches the far end of its
+         * PRIMARY stage ("max travel" — slide fully back, bolt fully open);
+         * re-armed once the scrub retreats below half the path, so racking
+         * repeatedly emits once per full stroke while end-zone jitter cannot
+         * spam. Sessions that START inside the end zone latch silently
+         * (grabbing an already-out part is not a stroke), and the return
+         * stage never emits — its far end is the rest pose. The runtime
+         * turns these into engine shell-eject calls (test feature).
+         */
+        struct MaxTravelEvent
+        {
+            std::uint32_t bodyId{ 0x7FFF'FFFFu };
+            std::array<char, kMaxSourceName> sourceName{};
+        };
+        // One per hand at most per update.
+        static constexpr std::size_t kMaxMaxTravelEvents = 2;
+
         // One whitelist-eligible part of the current weapon: allowlisted
         // class AND a motion path exists under the active mode ("must
         // move"). The runtime computes these; this class encodes them as
@@ -111,11 +129,14 @@ namespace redux
         };
 
         // Returns the number of drives sent this update, written to
-        // outSentDrives (capacity kMaxSentDrives).
+        // outSentDrives (capacity kMaxSentDrives). Max-travel events land in
+        // outMaxTravelEvents (capacity kMaxMaxTravelEvents) when provided.
         std::uint32_t update(
             const FrameInput& input,
             const WeaponPartMotionLearner& learner,
-            SentDrive* outSentDrives);
+            SentDrive* outSentDrives,
+            MaxTravelEvent* outMaxTravelEvents = nullptr,
+            std::uint32_t* outMaxTravelEventCount = nullptr);
         void shutdown();
 
         [[nodiscard]] std::uint64_t ownerToken() const { return _ownerToken; }
@@ -133,6 +154,9 @@ namespace redux
             // Which learned stage the session is scrubbing; flips at the
             // stage ends when a chained return stage exists.
             bool onReturnStage{ false };
+            // Max-travel event latch (see MaxTravelEvent): true while inside
+            // the primary stage's end zone or until the re-arm point.
+            bool maxTravelLatched{ false };
             std::array<char, kMaxSourceName> sourceName{};
             float arcPosition{ 0.0f };
             weapon_part_motion_path::Vec3 handStartTranslate{};

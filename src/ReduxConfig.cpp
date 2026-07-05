@@ -70,6 +70,13 @@ namespace redux
             "fStageEndEpsilonArcUnits = 0.35\n"
             "fStageChainToleranceGameUnits = 2.0\n"
             "\n"
+            "; Shell-eject test: reaching max travel on a scrubbed bolt/slide-class part\n"
+            "; (bolt, slide, charging handle, pump) fires the engine's own shell-casing\n"
+            "; ejection for the equipped weapon — the same P-Casing debris spawn used\n"
+            "; when firing. One eject per full stroke (re-arms once the part retreats\n"
+            "; past half travel); weapons without a casing model simply do nothing.\n"
+            "bShellEjectOnMaxTravel = true\n"
+            "\n"
             "; AttachOnly allowlist — which part classes MAY become attach-only grips.\n"
             "; Hot-reloadable. The class switch is only half the gate: a part must ALSO\n"
             "; have a motion path (clip-harvested or learned, under the active mode) to\n"
@@ -186,6 +193,7 @@ namespace redux
         const bool previousStageTransitions = stageTransitions;
         const float previousStageEpsilon = stageEndEpsilonArcUnits;
         const float previousChainTolerance = stageChainToleranceGameUnits;
+        const bool previousShellEject = shellEjectOnMaxTravel;
 
         const bool previousRequireTriggerUnlock = requireTriggerUnlock;
         enabled = ini.GetBoolValue(kSection, "bEnabled", enabled);
@@ -225,6 +233,7 @@ namespace redux
         stageTransitions = ini.GetBoolValue(kSection, "bStageTransitions", stageTransitions);
         stageEndEpsilonArcUnits = readClampedFloat("fStageEndEpsilonArcUnits", stageEndEpsilonArcUnits, 0.05f, 5.0f);
         stageChainToleranceGameUnits = readClampedFloat("fStageChainToleranceGameUnits", stageChainToleranceGameUnits, 0.25f, 10.0f);
+        shellEjectOnMaxTravel = ini.GetBoolValue(kSection, "bShellEjectOnMaxTravel", shellEjectOnMaxTravel);
 
         // AttachOnly allowlist booleans, composed into the class masks.
         for (std::size_t i = 0; i < std::size(kAttachOnlyPartKeys); ++i) {
@@ -262,6 +271,12 @@ namespace redux
                     previousRequireTriggerUnlock,
                     requireTriggerUnlock);
             }
+            if (shellEjectOnMaxTravel != previousShellEject) {
+                RDX_LOG_INFO(Config,
+                    "bShellEjectOnMaxTravel: {} -> {}",
+                    previousShellEject,
+                    shellEjectOnMaxTravel);
+            }
             const bool groupingChanged = coTimedFollowers != previousCoTimed || coTimedMinOverlap != previousCoTimedOverlap ||
                 coTimedMaxArcRatio != previousCoTimedRatio || stageTransitions != previousStageTransitions ||
                 stageEndEpsilonArcUnits != previousStageEpsilon || stageChainToleranceGameUnits != previousChainTolerance;
@@ -288,7 +303,8 @@ namespace redux
                 }
             }
             if (enabled == previousEnabled && motionPathMode == previousMode && logLevel == previousLogLevel &&
-                requireTriggerUnlock == previousRequireTriggerUnlock && !allowListChangedKeys && !groupingChanged) {
+                requireTriggerUnlock == previousRequireTriggerUnlock && !allowListChangedKeys && !groupingChanged &&
+                shellEjectOnMaxTravel == previousShellEject) {
                 RDX_LOG_INFO(Config, "Reload applied, no value changes (enabled={} mode={} logLevel={})",
                     enabled,
                     motionPathModeName(motionPathMode),
