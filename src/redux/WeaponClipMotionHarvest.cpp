@@ -134,20 +134,25 @@ namespace redux::weapon_clip_motion_harvest
         constexpr std::uint32_t kSampleBufferTracks = 160;
 
         /*
-         * hkbClipGenerator (0x160 bytes; clone at 0x14192d950 allocates it):
-         * clips can also stream in late, in which case the loaded binding
-         * appears on the clip generator —
-         * +0xD0 is Bethesda's loaded-binding wrapper (the engine's clip
-         * validator, vtable slot 14 / 0x14192d7a0, reports "The animation
-         * has not been loaded." when it is null) and wrapper+0x38 is the
-         * loaded hkaAnimationBinding. Vtable slot 10 (0x14192d510, vtable
-         * 0x2E0FB38 + 0x50) is the install override that swaps a prepared
-         * binding in and notifies Bethesda's loading manager — the one
-         * moment the payload is guaranteed resident, so the harvest hooks
-         * that slot with an atomic pointer swap.
+         * hkbClipGenerator (0x160 bytes; clone at 0x14192d950 allocates it).
+         * Lifecycle slots, raw-disassembly verified 2026-07-05 (vtable read
+         * from the unpacked exe + body disasm of each target):
+         *  - +0x38 activate   (0x14192CA40): backs up m_triggers +0x98 into
+         *    +0xD8, constructs the hkaDefaultAnimationControl and stores it
+         *    at +0xD0, caches the binding at +0xE8 — after it returns the
+         *    payload is resident (control+0x38 = hkaAnimationBinding);
+         *  - +0x40 update     (0x14192D0D0): per-frame time/trigger step;
+         *  - +0x50 deactivate (0x14192D510): decrefs and NULLS +0xD0,
+         *    restores +0x98 from the +0xD8 backup.
+         * The harvest hooks ACTIVATE with an atomic pointer swap and runs
+         * after the original. A 2026-07-04..05 regression had this hook on
+         * +0x50 (then believed to be Bethesda's binding-install override):
+         * the shim read [clip+0xD0] right after deactivate nulled it, so
+         * the activation path silently never harvested or dumped markers —
+         * the equip-time walk masked it.
          */
         constexpr std::uintptr_t kClipGeneratorVtableModuleOffset = 0x2E0FB38;
-        constexpr std::uintptr_t kClipGeneratorInstallSlotOffset = 0x50;
+        constexpr std::uintptr_t kClipGeneratorActivateSlotOffset = 0x38;
         constexpr std::uintptr_t kClipGeneratorLoadedBindingOffset = 0xD0;
         // hkbClipGenerator::m_animationName (hkStringPtr — mask low bit).
         // Raw disassembly 0x141939911: [clip+0x90] & ~1 formatted into
@@ -1067,16 +1072,17 @@ namespace redux::weapon_clip_motion_harvest
             return true;
         }
 
-        using ClipGeneratorInstallFn = void (*)(void*, void*);
-        ClipGeneratorInstallFn s_originalClipInstall = nullptr;
+        using ClipGeneratorActivateFn = void (*)(void*, void*);
+        ClipGeneratorActivateFn s_originalClipActivate = nullptr;
 
         /*
          * Runs on the engine's graph-update thread right after the original
-         * install override completed, i.e. while the loaded binding at
-         * clipGenerator+0xD0 is guaranteed resident. Every read is
-         * plausibility-gated and the sampler's spline gates still apply, so
-         * an unexpected state degrades into a counted skip. The character
-         * filter keeps NPC clip activations out.
+         * hkbClipGenerator::activate completed, i.e. while the animation
+         * control at clipGenerator+0xD0 (and its binding at control+0x38)
+         * is guaranteed resident. Every read is plausibility-gated and the
+         * sampler's spline gates still apply, so an unexpected state
+         * degrades into a counted skip. The character filter keeps NPC clip
+         * activations out.
          */
         void harvestFromClipGenerator(void* clipGeneratorRaw, void* contextRaw)
         {
@@ -1186,10 +1192,10 @@ namespace redux::weapon_clip_motion_harvest
             }
         }
 
-        void clipGeneratorInstallShim(void* clipGenerator, void* context)
+        void clipGeneratorActivateShim(void* clipGenerator, void* context)
         {
-            if (s_originalClipInstall) {
-                s_originalClipInstall(clipGenerator, context);
+            if (s_originalClipActivate) {
+                s_originalClipActivate(clipGenerator, context);
             }
             harvestFromClipGenerator(clipGenerator, context);
         }
@@ -1218,15 +1224,15 @@ namespace redux::weapon_clip_motion_harvest
         }
         s_installed = true;
         const auto slotAddress =
-            REL::Module::get().base() + kClipGeneratorVtableModuleOffset + kClipGeneratorInstallSlotOffset;
-        s_originalClipInstall = reinterpret_cast<ClipGeneratorInstallFn>(*reinterpret_cast<std::uintptr_t*>(slotAddress));
+            REL::Module::get().base() + kClipGeneratorVtableModuleOffset + kClipGeneratorActivateSlotOffset;
+        s_originalClipActivate = reinterpret_cast<ClipGeneratorActivateFn>(*reinterpret_cast<std::uintptr_t*>(slotAddress));
         // 8-byte aligned pointer store is atomic on x64, so concurrent graph
         // updates dispatching through the slot stay safe during the swap.
-        REL::safe_write(slotAddress, reinterpret_cast<std::uintptr_t>(&clipGeneratorInstallShim));
+        REL::safe_write(slotAddress, reinterpret_cast<std::uintptr_t>(&clipGeneratorActivateShim));
         RDX_LOG_INFO(Weapon,
             "WeaponClipMotionHarvest: clip-activation hook installed (vtable slot +{:#x}, original +{:#x})",
-            kClipGeneratorVtableModuleOffset + kClipGeneratorInstallSlotOffset,
-            moduleRelative(reinterpret_cast<std::uintptr_t>(s_originalClipInstall)));
+            kClipGeneratorVtableModuleOffset + kClipGeneratorActivateSlotOffset,
+            moduleRelative(reinterpret_cast<std::uintptr_t>(s_originalClipActivate)));
     }
 
     void setClipActivationTargets(
