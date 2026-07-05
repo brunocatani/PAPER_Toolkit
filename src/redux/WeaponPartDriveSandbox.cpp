@@ -45,6 +45,90 @@ namespace redux
             }
             return std::string_view(name.data(), length);
         }
+
+        [[nodiscard]] std::int32_t findChainLink(
+            const WeaponPartDriveSandbox::FrameInput& input,
+            std::string_view name)
+        {
+            for (std::uint32_t i = 0; i < input.chainLinkCount; ++i) {
+                if (sessionName(input.chainLinks[i].name) == name) {
+                    return static_cast<std::int32_t>(i);
+                }
+            }
+            return -1;
+        }
+
+        // True when ancestorName is a scene-graph ancestor of nodeName per
+        // the chain table (walks nearest-cached-ancestor links; bounded by
+        // the table size, so a malformed cycle terminates).
+        [[nodiscard]] bool chainIsAncestor(
+            const WeaponPartDriveSandbox::FrameInput& input,
+            std::string_view ancestorName,
+            std::string_view nodeName)
+        {
+            if (ancestorName.empty() || nodeName.empty() || ancestorName == nodeName) {
+                return false;
+            }
+            auto index = findChainLink(input, nodeName);
+            for (std::uint32_t hops = 0; index >= 0 && hops < input.chainLinkCount; ++hops) {
+                const auto parent = sessionName(input.chainLinks[index].parentName);
+                if (parent.empty()) {
+                    return false;
+                }
+                if (parent == ancestorName) {
+                    return true;
+                }
+                index = findChainLink(input, parent);
+            }
+            return false;
+        }
+
+        /*
+         * Drive-time chain filter (Bruno's 2x bug, 2026-07-05): decide which
+         * of the session's followers may be DRIVEN alongside the leader.
+         * Children ride their parents natively, so driving two nodes of one
+         * parent chain stacks displacement on the descendant — the gripped
+         * part traveled 2x once full-subtree observation adopted hierarchy
+         * nodes as rigid followers. Rules: any follower that is an ancestor
+         * OR descendant of the leader is suppressed (the leader always
+         * wins), and among the rest only chain-topmost nodes are kept.
+         * Filtering here (not at learn/import time) covers every source —
+         * fresh learning, authored strokes, and already-saved library data.
+         * Unknown names (no chain entry) pass through untouched.
+         */
+        std::uint32_t chainFilterFollowers(
+            const WeaponPartDriveSandbox::FrameInput& input,
+            std::string_view leaderName,
+            const weapon_clip_stroke::AuthoredFollower* followers,
+            std::uint32_t followerCount,
+            std::array<bool, weapon_clip_stroke::kMaxFollowers>& outKeep)
+        {
+            std::uint32_t kept = 0;
+            std::array<std::string_view, weapon_clip_stroke::kMaxFollowers> names{};
+            for (std::uint32_t i = 0; i < followerCount && i < outKeep.size(); ++i) {
+                names[i] = sessionName(followers[i].boneName);
+                outKeep[i] = !names[i].empty() &&
+                    !chainIsAncestor(input, names[i], leaderName) &&
+                    !chainIsAncestor(input, leaderName, names[i]);
+            }
+            for (std::uint32_t i = 0; i < followerCount && i < outKeep.size(); ++i) {
+                if (!outKeep[i]) {
+                    continue;
+                }
+                for (std::uint32_t j = 0; j < followerCount && j < outKeep.size(); ++j) {
+                    // An in-set ancestor carries this follower already; the
+                    // ancestor stays (topmost wins), the descendant drops.
+                    if (i != j && outKeep[j] && chainIsAncestor(input, names[j], names[i])) {
+                        outKeep[i] = false;
+                        break;
+                    }
+                }
+                if (outKeep[i]) {
+                    ++kept;
+                }
+            }
+            return kept;
+        }
     }
 
     bool WeaponPartDriveSandbox::ensureRegistered()
@@ -310,8 +394,11 @@ namespace redux
                         session.followers[i] = group.followers[i];
                     }
                 }
+                std::array<bool, weapon_clip_stroke::kMaxFollowers> keptAtStart{};
+                const auto keptCount = chainFilterFollowers(
+                    input, hand.sourceName, session.followers.data(), session.followerCount, keptAtStart);
                 RDX_LOG_INFO(Weapon,
-                    "WeaponPartDriveSandbox: scrub session started hand={} part='{}' arc={:.2f}/{:.2f} mode={} source={} followers={} returnStage={} maxTravelArc={:.2f} restArc={:.2f} peakDelta={:.2f} restRef={}",
+                    "WeaponPartDriveSandbox: scrub session started hand={} part='{}' arc={:.2f}/{:.2f} mode={} source={} followers={} ({} chain-suppressed) returnStage={} maxTravelArc={:.2f} restArc={:.2f} peakDelta={:.2f} restRef={}",
                     handIndex == 1 ? "left" : "right",
                     hand.sourceName,
                     seeded.arcPosition,
@@ -319,6 +406,7 @@ namespace redux
                     motionPathModeName(session.mode),
                     !group.authored ? "runtime-learned" : (group.fallbackSource ? "authored-fallback" : "authored-clip"),
                     session.followerCount,
+                    session.followerCount - keptCount,
                     group.returnPath != nullptr,
                     seedExtreme.valid ? seedExtreme.arcPosition : -1.0f,
                     seedExtreme.valid ? seedExtreme.restArcPosition : -1.0f,
@@ -495,11 +583,16 @@ namespace redux
             drive.targetTransform.scale = session.partScale;
 
             // Authored assembly followers move at the same stroke progress —
-            // driven by source name so they need no collider evidence.
+            // driven by source name so they need no collider evidence. The
+            // chain filter drives at most one node per parent chain (see
+            // chainFilterFollowers).
+            std::array<bool, weapon_clip_stroke::kMaxFollowers> followerKept{};
+            (void)chainFilterFollowers(
+                input, sessionName(session.sourceName), session.followers.data(), session.followerCount, followerKept);
             const float keyPosition = weapon_clip_stroke::keyPositionForArc(*path, session.arcPosition);
             for (std::uint32_t i = 0; i < session.followerCount && driveCount < drives.size(); ++i) {
                 const auto& follower = session.followers[i];
-                if (follower.boneName[0] == '\0') {
+                if (follower.boneName[0] == '\0' || !followerKept[i]) {
                     continue;
                 }
                 const auto followerPose = weapon_clip_stroke::followerPoseAtKeyPosition(follower, keyPosition);

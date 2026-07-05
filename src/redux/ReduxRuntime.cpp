@@ -717,6 +717,32 @@ namespace redux
             }
         }
 
+        // Chain relations for the drive-time filter: nearest cached
+        // ancestor per entry, computed once per generation over the final
+        // entry set (evidence + observation-only).
+        if (sawCurrentGeneration && weaponNode) {
+            for (std::uint32_t i = 0; i < _drivePartCache.count; ++i) {
+                auto& entry = _drivePartCache.entries[i];
+                entry.chainParentIndex = -1;
+                if (!entry.node) {
+                    continue;
+                }
+                auto* parent = entry.node->parent;
+                for (int depth = 0; parent && depth < 16; ++depth) {
+                    for (std::uint32_t j = 0; j < _drivePartCache.count; ++j) {
+                        if (j != i && _drivePartCache.entries[j].node == parent) {
+                            entry.chainParentIndex = static_cast<std::int32_t>(j);
+                            break;
+                        }
+                    }
+                    if (entry.chainParentIndex >= 0 || parent == weaponNode) {
+                        break;
+                    }
+                    parent = parent->parent;
+                }
+            }
+        }
+
         if (sawCurrentGeneration) {
             _drivePartCache.generationKey = generationKey;
         }
@@ -1662,6 +1688,23 @@ namespace redux
         if (attachModeArmed) {
             input.eligiblePartCount = _eligiblePartCount;
             input.eligibleParts = _eligibleParts;
+        }
+
+        // Scene-graph chain table for the drive-time chain filter.
+        if (_drivePartCache.generationKey == generationKey) {
+            const auto linkCount = (std::min)(
+                _drivePartCache.count, static_cast<std::uint32_t>(WeaponPartDriveSandbox::kMaxChainLinks));
+            input.chainLinkCount = linkCount;
+            for (std::uint32_t i = 0; i < linkCount; ++i) {
+                const auto& entry = _drivePartCache.entries[i];
+                input.chainLinks[i].name = entry.sourceName;
+                input.chainLinks[i].parentName = {};
+                if (entry.chainParentIndex >= 0 &&
+                    entry.chainParentIndex < static_cast<std::int32_t>(_drivePartCache.count)) {
+                    input.chainLinks[i].parentName =
+                        _drivePartCache.entries[entry.chainParentIndex].sourceName;
+                }
+            }
         }
 
         RE::NiTransform weaponWorldInverse{};

@@ -120,6 +120,23 @@ namespace redux
         // Matches the runtime's drive-part cache capacity.
         static constexpr std::size_t kMaxEligibleParts = 48;
 
+        /*
+         * Scene-graph chain table (Bruno's 2x bug, 2026-07-05): one entry
+         * per cached weapon part, naming its nearest OTHER cached part that
+         * is a scene-graph ANCESTOR (empty = chain-top). Full-subtree
+         * observation records hierarchy nodes ('parent', attach points) as
+         * rigid followers of the parts they carry; DRIVING a node and its
+         * ancestor with absolute targets stacks the displacement on the
+         * descendant (the gripped part traveled 2x). The drive loop uses
+         * this table to drive at most one node per parent chain.
+         */
+        struct PartChainLink
+        {
+            std::array<char, kMaxSourceName> name{};
+            std::array<char, kMaxSourceName> parentName{};
+        };
+        static constexpr std::size_t kMaxChainLinks = 48;
+
         struct FrameInput
         {
             std::uint32_t weaponFormId{ 0 };
@@ -148,6 +165,9 @@ namespace redux
             // generation; targets reinstall only when this set changes.
             std::uint32_t eligiblePartCount{ 0 };
             std::array<EligiblePart, kMaxEligibleParts> eligibleParts{};
+            // Scene-graph chain relations for the drive-time chain filter.
+            std::uint32_t chainLinkCount{ 0 };
+            std::array<PartChainLink, kMaxChainLinks> chainLinks{};
             // Indexed [0]=right, [1]=left to match hand-state conventions.
             std::array<HandInput, 2> hands{};
         };

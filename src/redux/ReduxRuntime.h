@@ -82,6 +82,13 @@ namespace redux
              * and never install provider targets.
              */
             bool observationOnly{ false };
+            /*
+             * Nearest OTHER cache entry that is a scene-graph ANCESTOR of
+             * this entry's node (-1 = chain-top). Feeds the sandbox's
+             * drive-time chain filter: driving a node and its ancestor with
+             * absolute targets stacks displacement on the descendant.
+             */
+            std::int32_t chainParentIndex{ -1 };
             std::array<char, WeaponPartMotionLearner::kMaxSourceName> sourceName{};
             /*
              * Rest-pose capture (weapon-local): the pose the part settles at
