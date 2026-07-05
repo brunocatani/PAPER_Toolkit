@@ -1203,46 +1203,57 @@ namespace redux
         }
 
         /*
-         * Trigger selects the grip type (Bruno, 2026-07-04): grab alone is a
-         * normal ROCK authority grab; grab with the OFFHAND trigger held
-         * makes the part attach-only. Arming installs the per-part targets,
-         * so ROCK resolves the grab as AttachOnly only while armed. Once an
+         * Trigger selects the grip type (Bruno, 2026-07-04), PER HAND: grab
+         * alone is a normal ROCK authority/carry grab; that hand's trigger
+         * makes/keeps the part attach-only — including the free firing hand
+         * holding a part in part-carry mode. Arming installs the per-part
+         * targets, so ROCK resolves grabs (and mid-hold re-resolves) as
+         * AttachOnly only while armed. A hand's trigger only ARMS while
+         * that hand does not own the firing grip — otherwise every fired
+         * shot would arm and flip the other hand's grabs. Once an
          * attach-only grip of ours is live, arming is STICKY until the part
          * is released — required mechanically too: removing the target
-         * mid-grip would make ROCK drop the glue. The offhand trigger is the
-         * selector because the firing hand's trigger fires the weapon; the
-         * pipboy-suppression state is logged for diagnosis but not gated on
-         * (ROCK decides press consumption; refusing to arm here cannot
-         * un-open a Pip-Boy and only creates re-grab races).
+         * mid-grip would make ROCK drop the glue. The pipboy-suppression
+         * state is logged for diagnosis but not gated on (ROCK decides
+         * press consumption; refusing to arm here cannot un-open a Pip-Boy
+         * and only creates re-grab races).
          */
         const bool triggerSelectionActive = g_reduxConfig.requireTriggerUnlock && _rawWandButtonsAvailable;
-        bool offhandTriggerHeld = false;
-        auto offhandEnum = ::rock::provider::RockProviderHand::None;
-        if (triggerSelectionActive && api && api->getRawWandButtonStateV1 && api->getOffhandHandV1) {
-            offhandEnum = api->getOffhandHandV1();
-            ::rock::provider::RockProviderRawWandButtonStateV1 buttonState{};
-            if (offhandEnum != ::rock::provider::RockProviderHand::None &&
-                api->getRawWandButtonStateV1(offhandEnum, kOpenVrTriggerButtonId, &buttonState) &&
-                buttonState.available != 0 && buttonState.held != 0) {
-                offhandTriggerHeld = true;
+        std::array<bool, 2> triggerHeld{};
+        if (triggerSelectionActive && api && api->getRawWandButtonStateV1) {
+            for (const bool isLeft : { false, true }) {
+                const auto handEnum = isLeft ? ::rock::provider::RockProviderHand::Left : ::rock::provider::RockProviderHand::Right;
+                ::rock::provider::RockProviderRawWandButtonStateV1 buttonState{};
+                if (api->getRawWandButtonStateV1(handEnum, kOpenVrTriggerButtonId, &buttonState) &&
+                    buttonState.available != 0 && buttonState.held != 0) {
+                    triggerHeld[isLeft ? 1u : 0u] = true;
+                }
             }
         }
+        bool anyArmingTrigger = false;
         bool attachGripActive = false;
         for (std::size_t handIndex = 0; handIndex < 2; ++handIndex) {
             const auto& report = gripReports[handIndex];
-            if (gripReportValid[handIndex] && report.active != 0 && report.attachOnly != 0 &&
+            const bool reportActive = gripReportValid[handIndex] && report.active != 0;
+            const bool ownsFiringGrip = reportActive &&
+                report.gripKind == ::rock::provider::RockProviderWeaponPartGripKindV1::FiringGrip;
+            if (triggerHeld[handIndex] && !ownsFiringGrip) {
+                anyArmingTrigger = true;
+            }
+            if (reportActive && report.attachOnly != 0 &&
                 report.providerOwnerToken == _sandbox.ownerToken() &&
                 report.weaponGenerationKey == generationKey) {
                 attachGripActive = true;
             }
         }
-        const bool attachModeArmed = !triggerSelectionActive || offhandTriggerHeld || attachGripActive;
+        const bool attachModeArmed = !triggerSelectionActive || anyArmingTrigger || attachGripActive;
         if (attachModeArmed != _lastAttachModeArmed) {
             _lastAttachModeArmed = attachModeArmed;
             RDX_LOG_INFO(Weapon,
-                "AttachOnly arming {} (offhandTrigger={} stickyAttachGrip={} pipboySuppressed={})",
+                "AttachOnly arming {} (triggerRight={} triggerLeft={} stickyAttachGrip={} pipboySuppressed={})",
                 attachModeArmed ? "ON" : "off",
-                offhandTriggerHeld,
+                triggerHeld[0],
+                triggerHeld[1],
                 attachGripActive,
                 _pipboySuppressionAvailable && api && api->isNativePipboyInputSuppressedV1 ? api->isNativePipboyInputSuppressedV1() : false);
         }
@@ -1265,7 +1276,6 @@ namespace redux
 
         for (const bool isLeft : { false, true }) {
             auto& handInput = input.hands[isLeft ? 1u : 0u];
-            const auto handEnum = isLeft ? ::rock::provider::RockProviderHand::Left : ::rock::provider::RockProviderHand::Right;
             if (!gripReportValid[isLeft ? 1u : 0u]) {
                 continue;
             }
@@ -1284,11 +1294,9 @@ namespace redux
             handInput.gripSequence = report.gripSequence;
             handInput.bodyId = report.bodyId;
 
-            // Session unlock (level state — press or already-held both
-            // count): the offhand tracks its trigger, the selector button.
-            // A firing-hand attach grip only exists while armed, and its
-            // trigger fires the weapon, so it unlocks immediately.
-            handInput.triggerHeld = !triggerSelectionActive || handEnum != offhandEnum || offhandTriggerHeld;
+            // Session unlock, PER HAND (level state — press or already-held
+            // both count): each hand's scrub is enabled by its own trigger.
+            handInput.triggerHeld = !triggerSelectionActive || triggerHeld[isLeft ? 1u : 0u];
 
             // Names and nodes come from the member cache (stable storage) so
             // the string_views handed to the sandbox outlive this scope.

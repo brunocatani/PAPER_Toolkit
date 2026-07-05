@@ -36,12 +36,15 @@ namespace redux
         bool enabled = true;
         MotionPathMode motionPathMode = MotionPathMode::Hybrid;
         /*
-         * Trigger selects the grip type on eligible parts: grab alone is a
-         * normal ROCK authority grab; grab with the OFFHAND trigger held is
-         * attach-only manipulation, sticky until the part is released. The
-         * per-part provider targets only exist while armed, so ROCK itself
-         * resolves the grab into the right mode. Off = eligible parts are
-         * always attach-only (scrub on grab, the pre-selection behavior).
+         * Trigger selects the grip type on eligible parts, PER HAND: grab
+         * alone is a normal ROCK authority/carry grab; that hand's trigger
+         * (before or during the hold — including the free firing hand in
+         * part-carry) makes the part attach-only, sticky until released.
+         * A hand's trigger does not arm while it owns the firing grip, so
+         * firing never flips the other hand's grabs. The per-part provider
+         * targets only exist while armed, so ROCK itself resolves grips
+         * into the right mode. Off = eligible parts are always attach-only
+         * (scrub on grab, the pre-selection behavior).
          */
         bool requireTriggerUnlock = true;
         // spdlog level: 0=trace 1=debug 2=info 3=warn 4=error 5=critical 6=off.
