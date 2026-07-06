@@ -100,24 +100,6 @@ namespace redux
             "fClipScrubSweepSeconds = 6.0\n"
             "sClipScrubSweepClipFilter = Reload\n"
             "\n"
-            "; Delta-gated magazine freedom: a gripped magazine rides its animation\n"
-            "; path for the first fraction of its travel (the seat/unseat click) —\n"
-            "; past it the mag moves freely with your hand, position and wrist\n"
-            "; rotation, ignoring the weapon completely. Bring it back within the\n"
-            "; capture distance of its path (game units, ~1.4cm each) and the path\n"
-            "; takes it back — the mag gets authority and the glued hand follows,\n"
-            "; same ride in and out. Letting go anywhere parks the mag back at rest.\n"
-            "bMagazineFreeMovement = true\n"
-            "fMagazineFreeDetachTravelFraction = 0.02\n"
-            "fMagazineFreeCaptureDistanceUnits = 5.0\n"
-            "\n"
-            "; Learner evidence window: parts teach the learner ONLY while an\n"
-            "; animation clip whose path matches this filter is playing, so firing\n"
-            "; recoil never records as a reload path. '|' separates alternatives\n"
-            "; (bolt/lever-action exceptions later, e.g. Reload|BoltCharge). Empty =\n"
-            "; learn from every animation (old behavior).\n"
-            "sLearnerClipFilter = Reload\n"
-            "\n"
             "; Re-record mode: while true, EVERY save of this INI (and every game\n"
             "; start) wipes all learned motion data so reloads re-record from scratch\n"
             "; under the current grouping settings (drained authored strokes are wiped\n"
@@ -264,10 +246,6 @@ namespace redux
         const bool previousSweepTest = clipScrubSweepTest;
         const float previousSweepSeconds = clipScrubSweepSeconds;
         const std::string previousSweepFilter = clipScrubSweepClipFilter;
-        const bool previousMagFree = magazineFreeMovement;
-        const float previousMagFreeDetach = magazineFreeDetachTravelFraction;
-        const float previousMagFreeCapture = magazineFreeCaptureDistanceUnits;
-        const std::string previousLearnerFilter = learnerClipFilter;
         const bool previousResetLearned = resetLearnedPaths;
         const bool previousMotionLibrary = motionLibrary;
         const bool previousLibraryReadOnly = motionLibraryReadOnly;
@@ -317,14 +295,6 @@ namespace redux
         clipScrubSweepSeconds = readClampedFloat("fClipScrubSweepSeconds", clipScrubSweepSeconds, 1.0f, 60.0f);
         if (const char* sweepFilter = ini.GetValue(kSection, "sClipScrubSweepClipFilter", clipScrubSweepClipFilter.c_str())) {
             clipScrubSweepClipFilter = sweepFilter;
-        }
-        magazineFreeMovement = ini.GetBoolValue(kSection, "bMagazineFreeMovement", magazineFreeMovement);
-        magazineFreeDetachTravelFraction =
-            readClampedFloat("fMagazineFreeDetachTravelFraction", magazineFreeDetachTravelFraction, 0.01f, 0.99f);
-        magazineFreeCaptureDistanceUnits =
-            readClampedFloat("fMagazineFreeCaptureDistanceUnits", magazineFreeCaptureDistanceUnits, 0.5f, 50.0f);
-        if (const char* learnerFilter = ini.GetValue(kSection, "sLearnerClipFilter", learnerClipFilter.c_str())) {
-            learnerClipFilter = learnerFilter;
         }
         resetLearnedPaths = ini.GetBoolValue(kSection, "bResetLearnedPaths", resetLearnedPaths);
         motionLibrary = ini.GetBoolValue(kSection, "bMotionLibrary", motionLibrary);
@@ -382,23 +352,6 @@ namespace redux
                     clipScrubSweepSeconds,
                     clipScrubSweepClipFilter);
             }
-            const bool magFreeChanged = magazineFreeMovement != previousMagFree ||
-                magazineFreeDetachTravelFraction != previousMagFreeDetach ||
-                magazineFreeCaptureDistanceUnits != previousMagFreeCapture;
-            if (magFreeChanged) {
-                RDX_LOG_INFO(Config,
-                    "Magazine free movement: enabled={} detachFraction={:.2f} captureDist={:.1f}u (applies to the next magazine grip)",
-                    magazineFreeMovement,
-                    magazineFreeDetachTravelFraction,
-                    magazineFreeCaptureDistanceUnits);
-            }
-            const bool learnerFilterChanged = learnerClipFilter != previousLearnerFilter;
-            if (learnerFilterChanged) {
-                RDX_LOG_INFO(Config,
-                    "sLearnerClipFilter: '{}' -> '{}' (learner evidence window)",
-                    previousLearnerFilter,
-                    learnerClipFilter);
-            }
             if (resetLearnedPaths != previousResetLearned) {
                 RDX_LOG_INFO(Config,
                     "bResetLearnedPaths: {} -> {} (while true, every reload wipes learned motion data)",
@@ -444,8 +397,7 @@ namespace redux
             }
             if (enabled == previousEnabled && motionPathMode == previousMode && logLevel == previousLogLevel &&
                 requireTriggerUnlock == previousRequireTriggerUnlock && !allowListChangedKeys && !groupingChanged &&
-                shellEjectOnMaxTravel == previousShellEject && !sweepChanged && !magFreeChanged &&
-                !learnerFilterChanged && resetLearnedPaths == previousResetLearned &&
+                shellEjectOnMaxTravel == previousShellEject && !sweepChanged && resetLearnedPaths == previousResetLearned &&
                 motionLibrary == previousMotionLibrary && motionLibraryReadOnly == previousLibraryReadOnly &&
                 fullSubtreeObservation == previousFullSubtree) {
                 RDX_LOG_INFO(Config, "Reload applied, no value changes (enabled={} mode={} logLevel={})",

@@ -324,8 +324,6 @@ namespace redux
         weapon_clip_motion_harvest::setClipScrubCaptureConfig(
             g_reduxConfig.motionPathMode == MotionPathMode::ClipScrub,
             g_reduxConfig.clipScrubSweepClipFilter.c_str());
-        // Learner evidence window: only clips matching this filter open it.
-        weapon_clip_motion_harvest::setReloadWindowFilter(g_reduxConfig.learnerClipFilter.c_str());
 
         auto* weaponNode = reinterpret_cast<RE::NiNode*>(snapshot.weaponNode);
         const auto generationKey = snapshot.weaponGenerationKey;
@@ -906,16 +904,6 @@ namespace redux
         // Frame-align every recorder before this frame's observations so
         // concurrent recordings can be compared for co-movement grouping.
         _learner.beginObservationFrame();
-        /*
-         * Learner evidence window (Bruno 2026-07-06: fire/recoil part
-         * motion was being learned as reload paths): observations count as
-         * animation evidence only while a reload-filter clip is live on
-         * the graph. Outside the window everything arrives untrusted —
-         * rest-pose capture below is unaffected (it is runtime-side).
-         * Empty filter = gate off (old always-on behavior).
-         */
-        const bool reloadEvidenceWindow = g_reduxConfig.learnerClipFilter.empty() ||
-            weapon_clip_motion_harvest::reloadClipWindowActive();
         for (std::uint32_t i = 0; i < _drivePartCache.count; ++i) {
             auto& entry = _drivePartCache.entries[i];
             if (!entry.node || !nodeContainsNode(weaponNode, entry.node, 64)) {
@@ -944,7 +932,7 @@ namespace redux
                 .sourceName = providerFixedStringView(entry.sourceName.data(), entry.sourceName.size()),
                 .pose = pose,
                 .scale = partWeaponLocal.scale,
-                .trusted = !driven && reloadEvidenceWindow,
+                .trusted = !driven,
             });
 
             // Rest-pose capture for the delta-curve anchors (see the cache
@@ -1637,9 +1625,6 @@ namespace redux
         input.motionPathMode = g_reduxConfig.motionPathMode;
         input.stageTransitionsEnabled = g_reduxConfig.stageTransitions;
         input.travelExtremeToleranceFraction = g_reduxConfig.travelExtremeTolerance;
-        input.magazineFreeMovement = g_reduxConfig.magazineFreeMovement;
-        input.magazineFreeDetachTravelFraction = g_reduxConfig.magazineFreeDetachTravelFraction;
-        input.magazineFreeCaptureDistanceUnits = g_reduxConfig.magazineFreeCaptureDistanceUnits;
 
         /*
          * Clip-scrub session lifecycle (mode == scrub). The captured clip
@@ -1834,11 +1819,6 @@ namespace redux
                             handInput.restPoseValid = true;
                             handInput.restPose = _drivePartCache.entries[i].restPose;
                         }
-                        // Magazine group = radius-gated free movement.
-                        handInput.freeMovementEligible =
-                            static_cast<::rock::provider::RockProviderWeaponPartKindV1>(
-                                _drivePartCache.entries[i].partKind) ==
-                            ::rock::provider::RockProviderWeaponPartKindV1::Magazine;
                         break;
                     }
                 }
@@ -1864,30 +1844,6 @@ namespace redux
                     handInput.partScale = partWeaponLocal.scale;
                     handInput.handTranslate = weapon_part_motion_path::Vec3{ handWeaponLocal.x, handWeaponLocal.y, handWeaponLocal.z };
                     handInput.transformsValid = true;
-                    // Hand orientation (weapon-local) for free-moving parts:
-                    // the provider hand frame's row-major rotation composed
-                    // into weapon space, as a Havok-order quaternion.
-                    RE::NiTransform handWorldTransform{};
-                    for (std::size_t row = 0; row < 3; ++row) {
-                        for (std::size_t column = 0; column < 3; ++column) {
-                            handWorldTransform.rotate.entry[row][column] = handTransform.rotate[row * 3 + column];
-                        }
-                    }
-                    handWorldTransform.translate = handWorld;
-                    handWorldTransform.scale = 1.0f;
-                    const RE::NiTransform handWeaponLocalFull =
-                        transform_math::composeTransforms(weaponWorldInverse, handWorldTransform);
-                    if (finiteNiTransform(handWeaponLocalFull)) {
-                        float handQuaternion[4]{};
-                        transform_math::niRowsToHavokQuaternion(handWeaponLocalFull.rotate, handQuaternion);
-                        handInput.handRotate = weapon_part_motion_path::Quat{
-                            handQuaternion[3],
-                            handQuaternion[0],
-                            handQuaternion[1],
-                            handQuaternion[2],
-                        };
-                        handInput.handRotateValid = true;
-                    }
                 }
             }
         }

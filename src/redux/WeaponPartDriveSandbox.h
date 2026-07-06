@@ -74,10 +74,6 @@ namespace redux
             weapon_part_motion_path::Vec3 partTranslate{};
             float partScale{ 1.0f };
             weapon_part_motion_path::Vec3 handTranslate{};
-            // Hand ORIENTATION (weapon-root-local): free-moving parts ride
-            // the full hand pose, so waving/twisting carries the part.
-            bool handRotateValid{ false };
-            weapon_part_motion_path::Quat handRotate{};
             /*
              * Weapon-local pose the part settles at when idle (runtime
              * rest-pose capture): the reference for the delta curve that
@@ -87,9 +83,6 @@ namespace redux
              */
             bool restPoseValid{ false };
             weapon_part_motion_path::PoseSample restPose{};
-            // Radius-gated free movement applies to this part's class
-            // (magazine group); the runtime resolves it from the part cache.
-            bool freeMovementEligible{ false };
         };
 
         /*
@@ -178,24 +171,6 @@ namespace redux
             bool clipScrubSessionActive{ false };
             std::uint64_t clipScrubSessionId{ 0 };
             float clipScrubFraction{ 0.0f };
-            /*
-             * Delta-gated magazine freedom (reload-template step 0, Bruno
-             * 2026-07-06 final form): a gripped magazine-class part is
-             * GUIDED (normal path scrub) until its DELTA DISTANCE from its
-             * rest pose reaches this fraction of the part's full travel —
-             * i.e. the mag rides the animation path until it is out. From
-             * there it is a free carried part: driven in the gripping
-             * hand's OWN frame (ROCK HandLocal space, composed against the
-             * live hand transform at apply time), so weapon/other-hand
-             * motion is fully ignored while free. Re-capture: once the
-             * free part has first LEFT the capture distance (arming), it
-             * re-captures onto the nearest path point when it comes back
-             * within it — the part regains authority and the glued hand
-             * follows. Release in any state parks the part at rest.
-             */
-            bool magazineFreeMovement{ false };
-            float magazineFreeDetachTravelFraction{ 0.85f };
-            float magazineFreeCaptureDistanceUnits{ 5.0f };
             // Per-part attach-only whitelist for the current weapon
             // generation; targets reinstall only when this set changes.
             std::uint32_t eligiblePartCount{ 0 };
@@ -271,39 +246,6 @@ namespace redux
              * real hand pull, which carries the session across windows
              * where the gripped part is authored to rest.
              */
-            /*
-             * Radius-gated magazine freedom: while true the part left its
-             * path and rides the hand as a rigid attachment — the grab
-             * offset is stored HAND-LOCAL (translate + rotation), so the
-             * part follows position AND wrist rotation like a held loose
-             * object (no dynamic conversion; it is still a driven weapon
-             * part). Guided state resumes on re-capture near the rest pose.
-             */
-            bool freeMoving{ false };
-            bool freeHandRotateValid{ false };
-            // Re-capture arms only after the free part first LEAVES the
-            // capture distance — a just-detached part sits ON the path and
-            // would instantly re-capture otherwise.
-            bool freeCaptureArmed{ false };
-            std::uint32_t freeFrames{ 0 };
-            /*
-             * Two-phase detach: hand authority releases the visual glue,
-             * but the hand BONE only realigns to the controller on the
-             * next provider frame — an offset captured against the still-
-             * glued hand teleports the part by the glued->controller
-             * displacement the moment the hand snaps back (in-game round
-             * 4). So the part HOLDS its detach pose for these frames and
-             * the hand-local offset is captured only after the hand
-             * realigned.
-             */
-            std::uint32_t freeOffsetPendingFrames{ 0 };
-            weapon_part_motion_path::PoseSample freeHoldPose{};
-            weapon_part_motion_path::Vec3 freeOffsetTranslate{};
-            weapon_part_motion_path::Quat freeOffsetRotate{};
-            // Rest pose pinned at grip start: anchors the hand-distance
-            // radius AND the park-at-rest drive emitted on release.
-            bool restPoseValid{ false };
-            weapon_part_motion_path::PoseSample restPose{};
             bool clipScrub{ false };
             std::uint64_t clipScrubSessionId{ 0 };
             weapon_part_motion_path::Vec3 scrubPartStartTranslate{};

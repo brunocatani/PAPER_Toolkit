@@ -440,22 +440,6 @@ namespace redux::weapon_clip_motion_harvest
         bool s_scrubCaptureArmed = false;
         std::array<char, 48> s_scrubCaptureFilter{};
 
-        /*
-         * Reload-window tracking (learner gate, Bruno 2026-07-06: the
-         * learner was recording fire/recoil part motion as reload paths):
-         * clips matching the reload-window filter are tracked from their
-         * activation to their deactivation; the runtime treats part
-         * observations as animation evidence ONLY while at least one such
-         * clip is live. Lock-free slots — the activate path claims one
-         * under s_hookMutex, the deactivate shim clears by pointer without
-         * locking, readers just scan. A clip destroyed without deactivating
-         * would leak a slot (window stuck open = learner reverts to the old
-         * always-on behavior); slots are wiped with the activation targets.
-         */
-        constexpr std::size_t kMaxReloadWindowClips = 8;
-        std::array<std::atomic<std::uintptr_t>, kMaxReloadWindowClips> s_reloadWindowClips{};
-        std::array<char, 64> s_reloadWindowFilter{};
-
         std::atomic<std::uintptr_t> s_scrubClip{ 0 };
         std::atomic<std::uint64_t> s_scrubSessionId{ 0 };
         std::atomic<float> s_scrubDesiredFraction{ 0.0f };
@@ -590,34 +574,6 @@ namespace redux::weapon_clip_motion_harvest
                 }
             }
             return true;
-        }
-
-        // '|'-separated variant: true when ANY segment of `filters` is a
-        // case-insensitive substring of `haystack` (future exceptions like
-        // "Reload|BoltCharge" for bolt/lever actions plug in here).
-        [[nodiscard]] bool nameMatchesAnyFilterNoCase(const char* haystack, const char* filters)
-        {
-            if (!haystack || !filters || filters[0] == '\0') {
-                return false;
-            }
-            const auto haystackLength = std::strlen(haystack);
-            const char* segment = filters;
-            while (*segment != '\0') {
-                const char* end = segment;
-                while (*end != '\0' && *end != '|') {
-                    ++end;
-                }
-                const auto segmentLength = static_cast<std::size_t>(end - segment);
-                if (segmentLength > 0 && segmentLength <= haystackLength) {
-                    for (std::size_t start = 0; start + segmentLength <= haystackLength; ++start) {
-                        if (namesEqualNoCase(haystack + start, segment, segmentLength)) {
-                            return true;
-                        }
-                    }
-                }
-                segment = *end == '|' ? end + 1 : end;
-            }
-            return false;
         }
 
         // ASCII case-insensitive substring test (clip paths are ASCII).
@@ -1622,18 +1578,6 @@ namespace redux::weapon_clip_motion_harvest
                 }
                 animationName[length] = '\0';
             }
-            // Reload-window claim: this clip keeps the learner's evidence
-            // window open until its deactivation clears the slot.
-            if (s_reloadWindowFilter[0] != '\0' &&
-                nameMatchesAnyFilterNoCase(animationName.data(), s_reloadWindowFilter.data())) {
-                for (auto& slot : s_reloadWindowClips) {
-                    std::uintptr_t expected = 0;
-                    if (slot.load(std::memory_order_relaxed) == clipGenerator ||
-                        slot.compare_exchange_strong(expected, clipGenerator, std::memory_order_relaxed)) {
-                        break;
-                    }
-                }
-            }
             maybeBeginScrubSweepLocked(clipGenerator, binding, animationName.data());
             maybeBeginClipScrubSessionLocked(clipGenerator, binding, animationName.data());
             if (bindingProcessedLocked(binding, /*fromActivation=*/true)) {
@@ -1769,14 +1713,6 @@ namespace redux::weapon_clip_motion_harvest
         void clipGeneratorDeactivateShim(void* clipGeneratorRaw, void* context)
         {
             const auto clipGenerator = reinterpret_cast<std::uintptr_t>(clipGeneratorRaw);
-            // Reload-window release: lock-free by-pointer clear (fires for
-            // every clip deactivation in the game — the scan of 8 atomics
-            // is the entire cost for non-tracked clips).
-            for (auto& slot : s_reloadWindowClips) {
-                if (slot.load(std::memory_order_relaxed) == clipGenerator) {
-                    slot.store(0, std::memory_order_relaxed);
-                }
-            }
             if (s_scrubClip.load(std::memory_order_acquire) == clipGenerator) {
                 *reinterpret_cast<std::uint8_t*>(clipGenerator + kClipGeneratorModeOffset) = s_scrubSavedMode;
                 s_scrubClip.store(0, std::memory_order_release);
@@ -1958,34 +1894,6 @@ namespace redux::weapon_clip_motion_harvest
         std::scoped_lock lock(s_hookMutex);
         s_hookCharacterCount = 0;
         s_hookNodeNameCount = 0;
-        // Leak safety for the learner gate: a clip destroyed without
-        // deactivating would hold its window open forever otherwise.
-        for (auto& slot : s_reloadWindowClips) {
-            slot.store(0, std::memory_order_relaxed);
-        }
-    }
-
-    void setReloadWindowFilter(const char* filter)
-    {
-        std::scoped_lock lock(s_hookMutex);
-        s_reloadWindowFilter = {};
-        if (filter) {
-            std::size_t length = 0;
-            while (length < s_reloadWindowFilter.size() - 1 && filter[length] != '\0') {
-                s_reloadWindowFilter[length] = filter[length];
-                ++length;
-            }
-        }
-    }
-
-    bool reloadClipWindowActive()
-    {
-        for (const auto& slot : s_reloadWindowClips) {
-            if (slot.load(std::memory_order_relaxed) != 0) {
-                return true;
-            }
-        }
-        return false;
     }
 
     bool probeBindings(const void* graphManager)

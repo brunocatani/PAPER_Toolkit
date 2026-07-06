@@ -177,19 +177,6 @@ namespace redux::weapon_clip_motion_harvest
     void endClipScrubSession();
 
     /*
-     * Learner evidence window: clips whose animation name matches the
-     * '|'-separated filter are tracked from activation to deactivation,
-     * and reloadClipWindowActive() is true while at least one is live.
-     * The runtime records part motion as animation evidence ONLY inside
-     * this window, so fire/recoil part motion never teaches the learner
-     * (Bruno 2026-07-06). An empty filter disables the gate (always-on
-     * learning, the old behavior). Slots are wiped with the activation
-     * targets as leak safety.
-     */
-    void setReloadWindowFilter(const char* filter);
-    [[nodiscard]] bool reloadClipWindowActive();
-
-    /*
      * One-shot dump of the manager→bindings chain: raw pointer of every hop,
      * each object's vtable rebased to a module offset (identifies the actual
      * runtime type in Ghidra), skeleton bone count/names, and the binding
