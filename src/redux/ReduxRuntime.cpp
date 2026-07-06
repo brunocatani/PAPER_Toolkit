@@ -1638,7 +1638,8 @@ namespace redux
         input.stageTransitionsEnabled = g_reduxConfig.stageTransitions;
         input.travelExtremeToleranceFraction = g_reduxConfig.travelExtremeTolerance;
         input.magazineFreeMovement = g_reduxConfig.magazineFreeMovement;
-        input.magazineFreeRadiusUnits = g_reduxConfig.magazineFreeRadiusUnits;
+        input.magazineFreeDetachTravelFraction = g_reduxConfig.magazineFreeDetachTravelFraction;
+        input.magazineFreeCaptureDistanceUnits = g_reduxConfig.magazineFreeCaptureDistanceUnits;
 
         /*
          * Clip-scrub session lifecycle (mode == scrub). The captured clip

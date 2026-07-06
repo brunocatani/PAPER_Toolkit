@@ -106,15 +106,18 @@ namespace redux
         float clipScrubSweepSeconds = 6.0f;
         std::string clipScrubSweepClipFilter = "Reload";
         /*
-         * Radius-gated magazine freedom (reload-template step 0): a gripped
-         * magazine-class part is guided by its motion path while the hand
-         * stays within the radius; beyond it the mag detaches and follows
-         * the hand freely, and re-entering the radius re-captures it onto
-         * the path (part authority, hand follows) — both directions.
-         * Release always snaps back via ROCK's baseline restore.
+         * Delta-gated magazine freedom (reload-template step 0): a gripped
+         * magazine-class part rides its animation path until its delta
+         * distance from rest reaches the detach fraction of its full
+         * travel (mag is out) — from there it is a free carried part in
+         * the gripping hand's own frame (weapon motion ignored). It
+         * re-captures onto the path when brought back within the capture
+         * distance of it (after first leaving it). Release in any state
+         * parks the part at rest.
          */
         bool magazineFreeMovement = true;
-        float magazineFreeRadiusUnits = 8.0f;
+        float magazineFreeDetachTravelFraction = 0.85f;
+        float magazineFreeCaptureDistanceUnits = 5.0f;
         /*
          * Learner evidence window: part motion counts as animation evidence
          * only while a clip whose path matches this '|'-separated filter is

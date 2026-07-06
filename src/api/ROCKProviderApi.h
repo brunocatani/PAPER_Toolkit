@@ -361,6 +361,16 @@ namespace rock::provider
     {
         WeaponRootLocal = 0,
         SourceParentLocal = 1,
+        /*
+         * Target expressed in the gripping HAND's frame, composed against
+         * the LIVE hand bone transform at apply time (driveHand selects the
+         * hand). This is the "free carried part" drive: a part rides the
+         * hand fully untethered from weapon motion — a weapon-root-local
+         * target is only as fresh as the consumer's last update, so the
+         * part visibly drags with the weapon between consumer frames.
+         * Added without an API version bump (pre-consumer phase).
+         */
+        HandLocal = 2,
     };
 
     /*
@@ -701,7 +711,10 @@ namespace rock::provider
         std::uint32_t leaseFrames{ 1 };
         RockProviderTransform targetTransform{};
         char sourceName[ROCK_PROVIDER_MAX_EVIDENCE_NAME]{};
-        std::uint32_t reserved[7]{};
+        // HandLocal drive space only: which hand frame the target composes
+        // against (0 = right, 1 = left). Ignored by the other spaces.
+        std::uint32_t driveHand{ 0 };
+        std::uint32_t reserved[6]{};
     };
 
     enum class RockProviderWeaponPartGripLocalSpaceV1 : std::uint32_t

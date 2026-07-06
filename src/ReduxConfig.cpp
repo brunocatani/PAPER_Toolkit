@@ -100,14 +100,16 @@ namespace redux
             "fClipScrubSweepSeconds = 6.0\n"
             "sClipScrubSweepClipFilter = Reload\n"
             "\n"
-            "; Radius-gated magazine freedom: a gripped magazine follows its animation\n"
-            "; path (guided) while your hand stays within this radius of the path;\n"
-            "; pull further and the mag detaches and moves freely with the hand. Bring\n"
-            "; it back near the path and it re-captures — the mag takes authority and\n"
-            "; the glued hand follows it, out and in. Letting go anywhere snaps the\n"
-            "; mag back as before. Radius in game units (~1.4cm each).\n"
+            "; Delta-gated magazine freedom: a gripped magazine rides its animation\n"
+            "; path until its travel from rest passes the detach fraction (the mag is\n"
+            "; out) — from there it moves freely with your hand, position and wrist\n"
+            "; rotation, ignoring the weapon completely. Bring it back within the\n"
+            "; capture distance of its path (game units, ~1.4cm each) and the path\n"
+            "; takes it back — the mag gets authority and the glued hand follows.\n"
+            "; Letting go anywhere parks the mag back at rest.\n"
             "bMagazineFreeMovement = true\n"
-            "fMagazineFreeRadiusUnits = 8.0\n"
+            "fMagazineFreeDetachTravelFraction = 0.85\n"
+            "fMagazineFreeCaptureDistanceUnits = 5.0\n"
             "\n"
             "; Learner evidence window: parts teach the learner ONLY while an\n"
             "; animation clip whose path matches this filter is playing, so firing\n"
@@ -263,7 +265,8 @@ namespace redux
         const float previousSweepSeconds = clipScrubSweepSeconds;
         const std::string previousSweepFilter = clipScrubSweepClipFilter;
         const bool previousMagFree = magazineFreeMovement;
-        const float previousMagFreeRadius = magazineFreeRadiusUnits;
+        const float previousMagFreeDetach = magazineFreeDetachTravelFraction;
+        const float previousMagFreeCapture = magazineFreeCaptureDistanceUnits;
         const std::string previousLearnerFilter = learnerClipFilter;
         const bool previousResetLearned = resetLearnedPaths;
         const bool previousMotionLibrary = motionLibrary;
@@ -316,7 +319,10 @@ namespace redux
             clipScrubSweepClipFilter = sweepFilter;
         }
         magazineFreeMovement = ini.GetBoolValue(kSection, "bMagazineFreeMovement", magazineFreeMovement);
-        magazineFreeRadiusUnits = readClampedFloat("fMagazineFreeRadiusUnits", magazineFreeRadiusUnits, 1.0f, 100.0f);
+        magazineFreeDetachTravelFraction =
+            readClampedFloat("fMagazineFreeDetachTravelFraction", magazineFreeDetachTravelFraction, 0.30f, 0.99f);
+        magazineFreeCaptureDistanceUnits =
+            readClampedFloat("fMagazineFreeCaptureDistanceUnits", magazineFreeCaptureDistanceUnits, 0.5f, 50.0f);
         if (const char* learnerFilter = ini.GetValue(kSection, "sLearnerClipFilter", learnerClipFilter.c_str())) {
             learnerClipFilter = learnerFilter;
         }
@@ -377,12 +383,14 @@ namespace redux
                     clipScrubSweepClipFilter);
             }
             const bool magFreeChanged = magazineFreeMovement != previousMagFree ||
-                magazineFreeRadiusUnits != previousMagFreeRadius;
+                magazineFreeDetachTravelFraction != previousMagFreeDetach ||
+                magazineFreeCaptureDistanceUnits != previousMagFreeCapture;
             if (magFreeChanged) {
                 RDX_LOG_INFO(Config,
-                    "Magazine free movement: enabled={} radius={:.1f}u (applies to the next magazine grip)",
+                    "Magazine free movement: enabled={} detachFraction={:.2f} captureDist={:.1f}u (applies to the next magazine grip)",
                     magazineFreeMovement,
-                    magazineFreeRadiusUnits);
+                    magazineFreeDetachTravelFraction,
+                    magazineFreeCaptureDistanceUnits);
             }
             const bool learnerFilterChanged = learnerClipFilter != previousLearnerFilter;
             if (learnerFilterChanged) {

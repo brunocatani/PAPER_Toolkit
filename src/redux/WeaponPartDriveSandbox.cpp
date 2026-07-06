@@ -43,10 +43,10 @@ namespace redux
         constexpr float kScrubMinFractionDelta = 1.0e-4f;
         constexpr float kScrubMinTravelDelta = 1.0e-3f;
 
-        // Magazine free-movement re-capture hysteresis: the part re-enters
-        // guided state at this fraction of the detach radius, so hovering
-        // right at the boundary cannot flap between states.
-        constexpr float kMagFreeRecaptureRadiusFraction = 0.75f;
+        // Magazine free-movement: periodic free-state diagnostic cadence
+        // (frames) — logs part delta / path distance / arming so a failing
+        // detach or capture geometry is readable from one session log.
+        constexpr std::uint32_t kMagFreeDiagnosticFrames = 90;
 
         [[nodiscard]] weapon_part_motion_path::Vec3 vecSub(
             const weapon_part_motion_path::Vec3& a, const weapon_part_motion_path::Vec3& b)
@@ -701,24 +701,24 @@ namespace redux
             };
 
             /*
-             * Radius-gated magazine freedom (reload-template step 0 test,
-             * Bruno 2026-07-06, reworked same day on his feedback): the
-             * gate is the CONTROLLER HAND's distance from the part's REST
-             * pose — inside it the part is GUIDED (the normal path scrub
-             * below); beyond it the part detaches and rides the full hand
-             * pose as a rigid hand-local attachment (position AND wrist
-             * rotation — untethered manipulation like a held loose object,
-             * still a driven weapon part, not a dynamic body). Coming back
-             * inside the hysteresis radius re-captures onto the nearest
-             * path point: the PART regains authority and the glued hand
-             * follows it, in both the out and in directions. Followers are
-             * not driven while free (they restore to the engine pose) —
-             * acceptable for this test.
+             * Delta-gated magazine freedom (reload-template step 0, Bruno
+             * 2026-07-06 final form): the part rides its animation path
+             * until its DELTA DISTANCE from rest reaches the detach
+             * fraction of its full travel (the same delta-curve measure
+             * the max-travel events trust) — i.e. the mag is guided until
+             * it is OUT. From there it is a free carried part: the stored
+             * HAND-LOCAL offset is sent in ROCK's HandLocal drive space,
+             * composed against the LIVE hand transform at apply time, so
+             * weapon/other-hand motion is fully ignored while free (a
+             * weapon-root-local free drive visibly dragged the part with
+             * the right hand — first in-game round). Re-capture arms once
+             * the part first leaves the capture distance, then fires when
+             * it comes back within it of the nearest path point: the part
+             * regains authority and the glued hand follows. Followers are
+             * not driven while free — acceptable for this test.
              */
-            if (input.magazineFreeMovement && hand.freeMovementEligible &&
-                input.magazineFreeRadiusUnits > 0.0f) {
-                const auto& restReference = session.restPoseValid ? session.restPose.translate : path->keys[0].translate;
-                const float handDistanceFromRest = vecLength(vecSub(hand.handTranslate, restReference));
+            if (input.magazineFreeMovement && hand.freeMovementEligible) {
+                const auto& restPoseReference = session.restPoseValid ? session.restPose : path->keys[0];
                 const auto handRotation = hand.handRotateValid
                     ? weapon_part_motion_path::quatNormalizeOrIdentity(hand.handRotate)
                     : weapon_part_motion_path::Quat{ 1.0f, 0.0f, 0.0f, 0.0f };
@@ -729,31 +729,45 @@ namespace redux
                         hand.handTranslate.y + offsetWorld.y,
                         hand.handTranslate.z + offsetWorld.z,
                     };
-                    if (handDistanceFromRest <=
-                        input.magazineFreeRadiusUnits * kMagFreeRecaptureRadiusFraction) {
+                    const auto seeded = weapon_part_motion_scrub::initialScrubPosition(*path, freeTarget);
+                    const float pathDistance = seeded.valid
+                        ? vecLength(vecSub(freeTarget, seeded.target.translate))
+                        : input.magazineFreeCaptureDistanceUnits * 10.0f;
+                    if (!session.freeCaptureArmed &&
+                        pathDistance > input.magazineFreeCaptureDistanceUnits) {
+                        session.freeCaptureArmed = true;
+                    }
+                    if (++session.freeFrames % kMagFreeDiagnosticFrames == 0) {
+                        RDX_LOG_INFO(Weapon,
+                            "MAG-FREE state part='{}' pathDist={:.1f}u capture={:.1f}u armed={}",
+                            sessionName(session.sourceName),
+                            pathDistance,
+                            input.magazineFreeCaptureDistanceUnits,
+                            session.freeCaptureArmed);
+                    }
+                    if (session.freeCaptureArmed && seeded.valid &&
+                        pathDistance <= input.magazineFreeCaptureDistanceUnits) {
                         // Re-capture at the path point nearest the part's
                         // free pose; re-anchor exactly like a fresh grip
                         // (this frame's desired IS that point).
-                        const auto seeded = weapon_part_motion_scrub::initialScrubPosition(*path, freeTarget);
-                        if (seeded.valid) {
-                            session.freeMoving = false;
-                            session.arcPosition = seeded.arcPosition;
-                            session.pathAnchorTranslate = seeded.target.translate;
-                            session.handStartTranslate = hand.handTranslate;
-                            session.maxTravelLatched = false;
-                            desired = session.pathAnchorTranslate;
-                            RDX_LOG_INFO(Weapon,
-                                "MAG-FREE recapture hand={} part='{}' arc={:.2f}/{:.2f} handDist={:.1f}u",
-                                handIndex == 1 ? "left" : "right",
-                                sessionName(session.sourceName),
-                                seeded.arcPosition,
-                                path->totalArcLength,
-                                handDistanceFromRest);
-                        }
-                    }
-                    if (session.freeMoving) {
-                        // Free drive: the part rides the full hand pose.
-                        // One drive per node still holds.
+                        session.freeMoving = false;
+                        session.freeCaptureArmed = false;
+                        session.arcPosition = seeded.arcPosition;
+                        session.pathAnchorTranslate = seeded.target.translate;
+                        session.handStartTranslate = hand.handTranslate;
+                        session.maxTravelLatched = false;
+                        desired = session.pathAnchorTranslate;
+                        RDX_LOG_INFO(Weapon,
+                            "MAG-FREE recapture hand={} part='{}' arc={:.2f}/{:.2f} pathDist={:.1f}u",
+                            handIndex == 1 ? "left" : "right",
+                            sessionName(session.sourceName),
+                            seeded.arcPosition,
+                            path->totalArcLength,
+                            pathDistance);
+                    } else {
+                        // Free carried-part drive: constant hand-local
+                        // offset, composed by ROCK against the live hand
+                        // frame. One drive per node still holds.
                         bool freeDuplicate = false;
                         for (std::uint32_t i = 0; i < driveCount; ++i) {
                             if (drives[i].bodyId == session.bodyId) {
@@ -762,48 +776,61 @@ namespace redux
                             }
                         }
                         if (!freeDuplicate && driveCount < drives.size()) {
-                            const auto freeRotate = weapon_part_motion_path::quatNormalizeOrIdentity(
-                                quatMul(handRotation, session.freeOffsetRotate));
                             auto& drive = drives[driveCount++];
                             drive.flags = static_cast<std::uint32_t>(
                                 ::rock::provider::RockProviderWeaponPartTargetFlagV1::MatchBodyId);
-                            drive.driveSpace = ::rock::provider::RockProviderWeaponPartDriveSpaceV1::WeaponRootLocal;
+                            drive.driveSpace = ::rock::provider::RockProviderWeaponPartDriveSpaceV1::HandLocal;
+                            drive.driveHand = handIndex == 1 ? 1u : 0u;
                             drive.weaponGenerationKey = session.weaponGenerationKey;
                             drive.bodyId = session.bodyId;
                             drive.groupId = static_cast<std::uint32_t>(handIndex + 1);
                             drive.priority = kDrivePriority;
                             drive.leaseFrames = kDriveLeaseFrames;
-                            quatToRotateRowMajor(freeRotate, drive.targetTransform.rotate);
-                            drive.targetTransform.translate[0] = freeTarget.x;
-                            drive.targetTransform.translate[1] = freeTarget.y;
-                            drive.targetTransform.translate[2] = freeTarget.z;
+                            quatToRotateRowMajor(session.freeOffsetRotate, drive.targetTransform.rotate);
+                            drive.targetTransform.translate[0] = session.freeOffsetTranslate.x;
+                            drive.targetTransform.translate[1] = session.freeOffsetTranslate.y;
+                            drive.targetTransform.translate[2] = session.freeOffsetTranslate.z;
                             drive.targetTransform.scale = session.partScale;
                         }
                         continue;
                     }
-                } else if (handDistanceFromRest > input.magazineFreeRadiusUnits) {
-                    // Detach from the part's LAST GUIDED pose so the frame
-                    // is continuous; the offset is stored hand-local so the
-                    // part follows wrist rotation from here on.
+                } else {
+                    // Detach test on the GUIDED pose: part delta distance
+                    // from rest vs the delta-curve travel range.
                     const auto probe = weapon_part_motion_scrub::scrub(*path, session.arcPosition, desired);
-                    if (probe.valid) {
-                        const auto handInverse = quatConjugate(handRotation);
-                        session.freeMoving = true;
-                        session.freeHandRotateValid = hand.handRotateValid;
-                        session.freeOffsetTranslate =
-                            quatRotateVec(handInverse, vecSub(probe.target.translate, hand.handTranslate));
-                        session.freeOffsetRotate = weapon_part_motion_path::quatNormalizeOrIdentity(
-                            quatMul(handInverse, probe.target.rotate));
-                        RDX_LOG_INFO(Weapon,
-                            "MAG-FREE detach hand={} part='{}' handDist={:.1f}u radius={:.1f}u arc={:.2f}/{:.2f} handRotate={}",
-                            handIndex == 1 ? "left" : "right",
-                            sessionName(session.sourceName),
-                            handDistanceFromRest,
-                            input.magazineFreeRadiusUnits,
-                            probe.arcPosition,
-                            path->totalArcLength,
-                            hand.handRotateValid);
-                        continue;
+                    const auto extreme = weapon_part_motion_path::travelExtremeFromRest(*path, restPoseReference);
+                    if (probe.valid && extreme.valid) {
+                        const float partDelta = weapon_part_motion_path::poseDistance(probe.target, restPoseReference);
+                        const float travelRange = extreme.peakDelta - extreme.restDelta;
+                        if (travelRange > 0.0f &&
+                            partDelta >= extreme.restDelta + input.magazineFreeDetachTravelFraction * travelRange) {
+                            /*
+                             * Detach from the part's LAST GUIDED pose so the
+                             * frame is continuous; the offset is captured in
+                             * the HAND's frame so the part rides position
+                             * and wrist rotation from here on.
+                             */
+                            const auto handInverse = quatConjugate(handRotation);
+                            session.freeMoving = true;
+                            session.freeCaptureArmed = false;
+                            session.freeFrames = 0;
+                            session.freeHandRotateValid = hand.handRotateValid;
+                            session.freeOffsetTranslate =
+                                quatRotateVec(handInverse, vecSub(probe.target.translate, hand.handTranslate));
+                            session.freeOffsetRotate = weapon_part_motion_path::quatNormalizeOrIdentity(
+                                quatMul(handInverse, probe.target.rotate));
+                            RDX_LOG_INFO(Weapon,
+                                "MAG-FREE detach hand={} part='{}' delta={:.1f}u range={:.1f}u fraction={:.2f} arc={:.2f}/{:.2f} handRotate={}",
+                                handIndex == 1 ? "left" : "right",
+                                sessionName(session.sourceName),
+                                partDelta,
+                                travelRange,
+                                input.magazineFreeDetachTravelFraction,
+                                probe.arcPosition,
+                                path->totalArcLength,
+                                hand.handRotateValid);
+                            continue;
+                        }
                     }
                 }
             }

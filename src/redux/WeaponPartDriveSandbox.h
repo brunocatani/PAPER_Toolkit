@@ -179,20 +179,23 @@ namespace redux
             std::uint64_t clipScrubSessionId{ 0 };
             float clipScrubFraction{ 0.0f };
             /*
-             * Radius-gated magazine freedom (reload-template step 0): a
-             * gripped magazine-class part is GUIDED (normal path scrub)
-             * while the CONTROLLER HAND stays within this radius of the
-             * part's REST pose (Bruno 2026-07-06: the radius is the hand's
-             * distance from the mag's home, not distance-to-path); beyond
-             * it the part detaches and rides the full hand pose freely —
-             * untethered manipulation, wave/twist included. Re-entering
-             * the (hysteresis-scaled) radius re-captures onto the path —
-             * the part regains authority and the glued hand follows it,
-             * both directions. Release in any state parks the part back
-             * at its rest pose.
+             * Delta-gated magazine freedom (reload-template step 0, Bruno
+             * 2026-07-06 final form): a gripped magazine-class part is
+             * GUIDED (normal path scrub) until its DELTA DISTANCE from its
+             * rest pose reaches this fraction of the part's full travel —
+             * i.e. the mag rides the animation path until it is out. From
+             * there it is a free carried part: driven in the gripping
+             * hand's OWN frame (ROCK HandLocal space, composed against the
+             * live hand transform at apply time), so weapon/other-hand
+             * motion is fully ignored while free. Re-capture: once the
+             * free part has first LEFT the capture distance (arming), it
+             * re-captures onto the nearest path point when it comes back
+             * within it — the part regains authority and the glued hand
+             * follows. Release in any state parks the part at rest.
              */
             bool magazineFreeMovement{ false };
-            float magazineFreeRadiusUnits{ 8.0f };
+            float magazineFreeDetachTravelFraction{ 0.85f };
+            float magazineFreeCaptureDistanceUnits{ 5.0f };
             // Per-part attach-only whitelist for the current weapon
             // generation; targets reinstall only when this set changes.
             std::uint32_t eligiblePartCount{ 0 };
@@ -278,6 +281,11 @@ namespace redux
              */
             bool freeMoving{ false };
             bool freeHandRotateValid{ false };
+            // Re-capture arms only after the free part first LEAVES the
+            // capture distance — a just-detached part sits ON the path and
+            // would instantly re-capture otherwise.
+            bool freeCaptureArmed{ false };
+            std::uint32_t freeFrames{ 0 };
             weapon_part_motion_path::Vec3 freeOffsetTranslate{};
             weapon_part_motion_path::Quat freeOffsetRotate{};
             // Rest pose pinned at grip start: anchors the hand-distance
