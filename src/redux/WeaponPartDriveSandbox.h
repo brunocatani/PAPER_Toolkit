@@ -286,6 +286,18 @@ namespace redux
             // would instantly re-capture otherwise.
             bool freeCaptureArmed{ false };
             std::uint32_t freeFrames{ 0 };
+            /*
+             * Two-phase detach: hand authority releases the visual glue,
+             * but the hand BONE only realigns to the controller on the
+             * next provider frame — an offset captured against the still-
+             * glued hand teleports the part by the glued->controller
+             * displacement the moment the hand snaps back (in-game round
+             * 4). So the part HOLDS its detach pose for these frames and
+             * the hand-local offset is captured only after the hand
+             * realigned.
+             */
+            std::uint32_t freeOffsetPendingFrames{ 0 };
+            weapon_part_motion_path::PoseSample freeHoldPose{};
             weapon_part_motion_path::Vec3 freeOffsetTranslate{};
             weapon_part_motion_path::Quat freeOffsetRotate{};
             // Rest pose pinned at grip start: anchors the hand-distance

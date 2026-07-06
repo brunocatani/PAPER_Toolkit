@@ -747,6 +747,62 @@ namespace redux
                     ? weapon_part_motion_path::quatNormalizeOrIdentity(hand.handRotate)
                     : weapon_part_motion_path::Quat{ 1.0f, 0.0f, 0.0f, 0.0f };
                 if (session.freeMoving) {
+                    /*
+                     * Two-phase detach: hold the exact detach pose (weapon-
+                     * local) while the hand bone realigns to the controller,
+                     * then capture the hand-local offset against the
+                     * REALIGNED hand — capturing against the still-glued
+                     * hand teleported the part by the glued->controller
+                     * displacement (in-game round 4).
+                     */
+                    if (session.freeOffsetPendingFrames > 0) {
+                        --session.freeOffsetPendingFrames;
+                        if (session.freeOffsetPendingFrames == 0) {
+                            const auto handInverse = quatConjugate(handRotation);
+                            session.freeHandRotateValid = hand.handRotateValid;
+                            session.freeOffsetTranslate = quatRotateVec(
+                                handInverse, vecSub(session.freeHoldPose.translate, hand.handTranslate));
+                            session.freeOffsetRotate = weapon_part_motion_path::quatNormalizeOrIdentity(
+                                quatMul(handInverse, session.freeHoldPose.rotate));
+                            RDX_LOG_INFO(Weapon,
+                                "MAG-FREE offset captured after hand realign part='{}' offset={:.1f}u hand=({:.1f},{:.1f},{:.1f}) part=({:.1f},{:.1f},{:.1f})",
+                                sessionName(session.sourceName),
+                                vecLength(session.freeOffsetTranslate),
+                                hand.handTranslate.x,
+                                hand.handTranslate.y,
+                                hand.handTranslate.z,
+                                session.freeHoldPose.translate.x,
+                                session.freeHoldPose.translate.y,
+                                session.freeHoldPose.translate.z);
+                        } else {
+                            // Hold drive: keep the part exactly where it
+                            // detached (weapon-local) for this frame.
+                            bool holdDuplicate = false;
+                            for (std::uint32_t i = 0; i < driveCount; ++i) {
+                                if (drives[i].bodyId == session.bodyId) {
+                                    holdDuplicate = true;
+                                    break;
+                                }
+                            }
+                            if (!holdDuplicate && driveCount < drives.size()) {
+                                auto& drive = drives[driveCount++];
+                                drive.flags = static_cast<std::uint32_t>(
+                                    ::rock::provider::RockProviderWeaponPartTargetFlagV1::MatchBodyId);
+                                drive.driveSpace = ::rock::provider::RockProviderWeaponPartDriveSpaceV1::WeaponRootLocal;
+                                drive.weaponGenerationKey = session.weaponGenerationKey;
+                                drive.bodyId = session.bodyId;
+                                drive.groupId = static_cast<std::uint32_t>(handIndex + 1);
+                                drive.priority = kDrivePriority;
+                                drive.leaseFrames = kDriveLeaseFrames;
+                                quatToRotateRowMajor(session.freeHoldPose.rotate, drive.targetTransform.rotate);
+                                drive.targetTransform.translate[0] = session.freeHoldPose.translate.x;
+                                drive.targetTransform.translate[1] = session.freeHoldPose.translate.y;
+                                drive.targetTransform.translate[2] = session.freeHoldPose.translate.z;
+                                drive.targetTransform.scale = session.partScale;
+                            }
+                            continue;
+                        }
+                    }
                     const weapon_part_motion_path::Vec3 offsetWorld = quatRotateVec(handRotation, session.freeOffsetTranslate);
                     const weapon_part_motion_path::Vec3 freeTarget{
                         hand.handTranslate.x + offsetWorld.x,
@@ -782,15 +838,23 @@ namespace redux
                     bool recaptured = false;
                     if (session.freeCaptureArmed &&
                         restDistance <= input.magazineFreeCaptureDistanceUnits) {
-                        // Re-capture at the path point nearest the part's
-                        // free pose (the seat end, since we are near rest);
-                        // re-anchor exactly like a fresh grip and hand the
-                        // visual glue back to the part.
-                        const auto seeded = weapon_part_motion_scrub::initialScrubPosition(*path, freeTarget);
+                        /*
+                         * Re-capture at the REST-nearest path point (the
+                         * seat) — NOT the part-nearest one: winding paths
+                         * put "nearest" mid-arc where the delta already
+                         * exceeds the detach threshold, causing an instant
+                         * re-detach flap (AX50, in-game round 4). Seeding
+                         * at the seat makes the click snap (<= capture
+                         * distance) and leaves the guided delta at ~rest,
+                         * so the part stays captured until pulled out.
+                         */
+                        const auto seeded =
+                            weapon_part_motion_scrub::initialScrubPosition(*path, restPoseReference.translate);
                         if (seeded.valid) {
                             recaptured = true;
                             session.freeMoving = false;
                             session.freeCaptureArmed = false;
+                            session.freeOffsetPendingFrames = 0;
                             session.arcPosition = seeded.arcPosition;
                             session.pathAnchorTranslate = seeded.target.translate;
                             session.handStartTranslate = hand.handTranslate;
@@ -847,25 +911,21 @@ namespace redux
                         if (travelRange > 0.0f &&
                             partDelta >= extreme.restDelta + input.magazineFreeDetachTravelFraction * travelRange) {
                             /*
-                             * Detach from the part's LAST GUIDED pose so the
-                             * frame is continuous; the offset is captured in
-                             * the HAND's frame so the part rides position
-                             * and wrist rotation from here on.
+                             * Detach, phase 1: freeze the part at its LAST
+                             * GUIDED pose and release the hand's visual
+                             * glue. The hand-local offset is captured two
+                             * frames later, once the hand bone realigned
+                             * to the controller (see the pending block).
                              */
-                            const auto handInverse = quatConjugate(handRotation);
                             session.freeMoving = true;
                             session.freeCaptureArmed = false;
                             session.freeFrames = 0;
+                            session.freeOffsetPendingFrames = 2;
+                            session.freeHoldPose = probe.target;
                             session.freeHandRotateValid = hand.handRotateValid;
-                            session.freeOffsetTranslate =
-                                quatRotateVec(handInverse, vecSub(probe.target.translate, hand.handTranslate));
-                            session.freeOffsetRotate = weapon_part_motion_path::quatNormalizeOrIdentity(
-                                quatMul(handInverse, probe.target.rotate));
-                            // Hand syncs back to the controller; the part
-                            // rides the hand from here (HandLocal drive).
                             setGripHandAuthority(handIndex, true);
                             RDX_LOG_INFO(Weapon,
-                                "MAG-FREE detach hand={} part='{}' delta={:.1f}u range={:.1f}u fraction={:.2f} arc={:.2f}/{:.2f} handRotate={} part=({:.1f},{:.1f},{:.1f}) hand=({:.1f},{:.1f},{:.1f}) rest=({:.1f},{:.1f},{:.1f}) offset={:.1f}u",
+                                "MAG-FREE detach hand={} part='{}' delta={:.1f}u range={:.1f}u fraction={:.2f} arc={:.2f}/{:.2f} part=({:.1f},{:.1f},{:.1f}) gluedHand=({:.1f},{:.1f},{:.1f}) rest=({:.1f},{:.1f},{:.1f}) (holding pose while hand realigns)",
                                 handIndex == 1 ? "left" : "right",
                                 sessionName(session.sourceName),
                                 partDelta,
@@ -873,7 +933,6 @@ namespace redux
                                 input.magazineFreeDetachTravelFraction,
                                 probe.arcPosition,
                                 path->totalArcLength,
-                                hand.handRotateValid,
                                 probe.target.translate.x,
                                 probe.target.translate.y,
                                 probe.target.translate.z,
@@ -882,8 +941,7 @@ namespace redux
                                 hand.handTranslate.z,
                                 restPoseReference.translate.x,
                                 restPoseReference.translate.y,
-                                restPoseReference.translate.z,
-                                vecLength(session.freeOffsetTranslate));
+                                restPoseReference.translate.z);
                             continue;
                         }
                     }
