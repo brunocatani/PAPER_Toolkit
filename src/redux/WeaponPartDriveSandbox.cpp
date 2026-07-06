@@ -65,6 +65,25 @@ namespace redux
             return std::sqrt(vecDot(v, v));
         }
 
+        /*
+         * "Free carried part" hand authority (Bruno 2026-07-06): while a
+         * magazine is free, ROCK stops gluing the visual hand to the part —
+         * the hand syncs back to the controller's normal IK and the part
+         * rides IT (HandLocal drive). Old ROCKs without the API entry
+         * no-op via the table-size gate.
+         */
+        void setGripHandAuthority(std::size_t handIndex, bool handAuthority)
+        {
+            const auto* api = ::rock::provider::RockProviderApi::inst;
+            if (!api || !::rock::provider::supportsWeaponPartGripHandAuthorityV1() ||
+                !api->setWeaponPartGripHandAuthorityV1) {
+                return;
+            }
+            (void)api->setWeaponPartGripHandAuthorityV1(
+                handIndex == 1 ? ::rock::provider::RockProviderHand::Left : ::rock::provider::RockProviderHand::Right,
+                handAuthority);
+        }
+
         // Quat is {w, x, y, z}; helpers for the hand-local free attachment.
         [[nodiscard]] weapon_part_motion_path::Quat quatMul(
             const weapon_part_motion_path::Quat& a, const weapon_part_motion_path::Quat& b)
@@ -388,6 +407,11 @@ namespace redux
             auto& session = _sessions[handIndex];
 
             if (!hand.gripActive || input.weaponFormId == 0 || input.weaponGenerationKey == 0) {
+                if (session.active && session.freeMoving) {
+                    // ROCK clears this with the grip too; explicit for the
+                    // paths where the grip object outlives our session.
+                    setGripHandAuthority(handIndex, false);
+                }
                 /*
                  * Park-at-rest on release (Bruno 2026-07-06: parts were
                  * staying at their extreme positions): one explicit final
@@ -729,42 +753,60 @@ namespace redux
                         hand.handTranslate.y + offsetWorld.y,
                         hand.handTranslate.z + offsetWorld.z,
                     };
-                    const auto seeded = weapon_part_motion_scrub::initialScrubPosition(*path, freeTarget);
-                    const float pathDistance = seeded.valid
-                        ? vecLength(vecSub(freeTarget, seeded.target.translate))
-                        : input.magazineFreeCaptureDistanceUnits * 10.0f;
+                    /*
+                     * Return trip (Bruno): keep tracking the part's delta
+                     * distance to the STORED rest point (captured before
+                     * the animation started); when it comes back within
+                     * the capture distance, the guide takes it at the
+                     * detach boundary and rides it down to the seat.
+                     */
+                    const float restDistance = vecLength(vecSub(freeTarget, restPoseReference.translate));
                     if (!session.freeCaptureArmed &&
-                        pathDistance > input.magazineFreeCaptureDistanceUnits) {
+                        restDistance > input.magazineFreeCaptureDistanceUnits) {
                         session.freeCaptureArmed = true;
                     }
                     if (++session.freeFrames % kMagFreeDiagnosticFrames == 0) {
                         RDX_LOG_INFO(Weapon,
-                            "MAG-FREE state part='{}' pathDist={:.1f}u capture={:.1f}u armed={}",
+                            "MAG-FREE state part='{}' restDist={:.1f}u capture={:.1f}u armed={} part=({:.1f},{:.1f},{:.1f}) rest=({:.1f},{:.1f},{:.1f})",
                             sessionName(session.sourceName),
-                            pathDistance,
+                            restDistance,
                             input.magazineFreeCaptureDistanceUnits,
-                            session.freeCaptureArmed);
+                            session.freeCaptureArmed,
+                            freeTarget.x,
+                            freeTarget.y,
+                            freeTarget.z,
+                            restPoseReference.translate.x,
+                            restPoseReference.translate.y,
+                            restPoseReference.translate.z);
                     }
-                    if (session.freeCaptureArmed && seeded.valid &&
-                        pathDistance <= input.magazineFreeCaptureDistanceUnits) {
+                    bool recaptured = false;
+                    if (session.freeCaptureArmed &&
+                        restDistance <= input.magazineFreeCaptureDistanceUnits) {
                         // Re-capture at the path point nearest the part's
-                        // free pose; re-anchor exactly like a fresh grip
-                        // (this frame's desired IS that point).
-                        session.freeMoving = false;
-                        session.freeCaptureArmed = false;
-                        session.arcPosition = seeded.arcPosition;
-                        session.pathAnchorTranslate = seeded.target.translate;
-                        session.handStartTranslate = hand.handTranslate;
-                        session.maxTravelLatched = false;
-                        desired = session.pathAnchorTranslate;
-                        RDX_LOG_INFO(Weapon,
-                            "MAG-FREE recapture hand={} part='{}' arc={:.2f}/{:.2f} pathDist={:.1f}u",
-                            handIndex == 1 ? "left" : "right",
-                            sessionName(session.sourceName),
-                            seeded.arcPosition,
-                            path->totalArcLength,
-                            pathDistance);
-                    } else {
+                        // free pose (the seat end, since we are near rest);
+                        // re-anchor exactly like a fresh grip and hand the
+                        // visual glue back to the part.
+                        const auto seeded = weapon_part_motion_scrub::initialScrubPosition(*path, freeTarget);
+                        if (seeded.valid) {
+                            recaptured = true;
+                            session.freeMoving = false;
+                            session.freeCaptureArmed = false;
+                            session.arcPosition = seeded.arcPosition;
+                            session.pathAnchorTranslate = seeded.target.translate;
+                            session.handStartTranslate = hand.handTranslate;
+                            session.maxTravelLatched = false;
+                            desired = session.pathAnchorTranslate;
+                            setGripHandAuthority(handIndex, false);
+                            RDX_LOG_INFO(Weapon,
+                                "MAG-FREE recapture hand={} part='{}' arc={:.2f}/{:.2f} restDist={:.1f}u",
+                                handIndex == 1 ? "left" : "right",
+                                sessionName(session.sourceName),
+                                seeded.arcPosition,
+                                path->totalArcLength,
+                                restDistance);
+                        }
+                    }
+                    if (!recaptured) {
                         // Free carried-part drive: constant hand-local
                         // offset, composed by ROCK against the live hand
                         // frame. One drive per node still holds.
@@ -819,8 +861,11 @@ namespace redux
                                 quatRotateVec(handInverse, vecSub(probe.target.translate, hand.handTranslate));
                             session.freeOffsetRotate = weapon_part_motion_path::quatNormalizeOrIdentity(
                                 quatMul(handInverse, probe.target.rotate));
+                            // Hand syncs back to the controller; the part
+                            // rides the hand from here (HandLocal drive).
+                            setGripHandAuthority(handIndex, true);
                             RDX_LOG_INFO(Weapon,
-                                "MAG-FREE detach hand={} part='{}' delta={:.1f}u range={:.1f}u fraction={:.2f} arc={:.2f}/{:.2f} handRotate={}",
+                                "MAG-FREE detach hand={} part='{}' delta={:.1f}u range={:.1f}u fraction={:.2f} arc={:.2f}/{:.2f} handRotate={} part=({:.1f},{:.1f},{:.1f}) hand=({:.1f},{:.1f},{:.1f}) rest=({:.1f},{:.1f},{:.1f}) offset={:.1f}u",
                                 handIndex == 1 ? "left" : "right",
                                 sessionName(session.sourceName),
                                 partDelta,
@@ -828,7 +873,17 @@ namespace redux
                                 input.magazineFreeDetachTravelFraction,
                                 probe.arcPosition,
                                 path->totalArcLength,
-                                hand.handRotateValid);
+                                hand.handRotateValid,
+                                probe.target.translate.x,
+                                probe.target.translate.y,
+                                probe.target.translate.z,
+                                hand.handTranslate.x,
+                                hand.handTranslate.y,
+                                hand.handTranslate.z,
+                                restPoseReference.translate.x,
+                                restPoseReference.translate.y,
+                                restPoseReference.translate.z,
+                                vecLength(session.freeOffsetTranslate));
                             continue;
                         }
                     }
@@ -1051,6 +1106,8 @@ namespace redux
 
     void WeaponPartDriveSandbox::shutdown()
     {
+        setGripHandAuthority(0, false);
+        setGripHandAuthority(1, false);
         if (_ownerToken != 0) {
             const auto* api = ::rock::provider::RockProviderApi::inst;
             if (api && api->unregisterConsumerV1) {

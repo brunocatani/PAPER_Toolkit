@@ -1123,6 +1123,19 @@ namespace rock::provider
          */
         bool(ROCK_PROVIDER_CALL* isNativePipboyInputSuppressedV1)();
 
+        /*
+         * Hand authority for an attach-only part grip ("free carried part",
+         * PAPER_Redux magazine freedom): while true, ROCK stops gluing the
+         * visual hand to the gripped part — the hand syncs back to the
+         * controller's normal IK (finger pose kept) — and the consumer
+         * drives the part against the live hand frame instead (HandLocal
+         * drive space). Cleared automatically when the grip releases.
+         * Gate on ROCK_PROVIDER_API_V1_PART_GRIP_HAND_AUTHORITY_TABLE_BYTES
+         * before reading this member. Added without an API version bump
+         * (pre-consumer phase).
+         */
+        bool(ROCK_PROVIDER_CALL* setWeaponPartGripHandAuthorityV1)(RockProviderHand hand, bool handAuthority);
+
         [[nodiscard]] static int initialize(
             const std::uint32_t minVersion = ROCK_PROVIDER_API_VERSION,
             const std::uint32_t minProviderApiByteSize = 0)
@@ -1194,6 +1207,8 @@ namespace rock::provider
         offsetof(RockProviderApi, getRawWandButtonStateV1) + sizeof(std::declval<RockProviderApi>().getRawWandButtonStateV1));
     inline constexpr std::uint32_t ROCK_PROVIDER_API_V1_PIPBOY_INPUT_SUPPRESSION_TABLE_BYTES = static_cast<std::uint32_t>(
         offsetof(RockProviderApi, isNativePipboyInputSuppressedV1) + sizeof(std::declval<RockProviderApi>().isNativePipboyInputSuppressedV1));
+    inline constexpr std::uint32_t ROCK_PROVIDER_API_V1_PART_GRIP_HAND_AUTHORITY_TABLE_BYTES = static_cast<std::uint32_t>(
+        offsetof(RockProviderApi, setWeaponPartGripHandAuthorityV1) + sizeof(std::declval<RockProviderApi>().setWeaponPartGripHandAuthorityV1));
 
     [[nodiscard]] inline bool queryProviderLimitsV1(RockProviderLimitsV1& outLimits)
     {
@@ -1313,6 +1328,15 @@ namespace rock::provider
     {
         RockProviderLimitsV1 limits{};
         return queryProviderLimitsV1(limits) && supportsPipboyInputSuppressionV1(limits);
+    }
+
+    // Table-size gate only (no feature bit): a table this large always
+    // carries the implementation.
+    [[nodiscard]] inline bool supportsWeaponPartGripHandAuthorityV1()
+    {
+        RockProviderLimitsV1 limits{};
+        return queryProviderLimitsV1(limits) &&
+               providerApiTableSupportsV1(limits, ROCK_PROVIDER_API_V1_PART_GRIP_HAND_AUTHORITY_TABLE_BYTES);
     }
 
     [[nodiscard]] inline bool supportsWeaponPartRecordIdentityV1(const RockProviderLimitsV1& limits)
