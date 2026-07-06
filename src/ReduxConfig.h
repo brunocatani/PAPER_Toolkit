@@ -116,7 +116,9 @@ namespace redux
          * parks the part at rest.
          */
         bool magazineFreeMovement = true;
-        float magazineFreeDetachTravelFraction = 0.85f;
+        // 0.02 (Bruno): the guide owns only the seat/unseat click — the
+        // first sliver of travel is animated, everything past it is free.
+        float magazineFreeDetachTravelFraction = 0.02f;
         float magazineFreeCaptureDistanceUnits = 5.0f;
         /*
          * Learner evidence window: part motion counts as animation evidence

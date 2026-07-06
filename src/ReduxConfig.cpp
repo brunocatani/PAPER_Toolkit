@@ -101,14 +101,14 @@ namespace redux
             "sClipScrubSweepClipFilter = Reload\n"
             "\n"
             "; Delta-gated magazine freedom: a gripped magazine rides its animation\n"
-            "; path until its travel from rest passes the detach fraction (the mag is\n"
-            "; out) — from there it moves freely with your hand, position and wrist\n"
+            "; path for the first fraction of its travel (the seat/unseat click) —\n"
+            "; past it the mag moves freely with your hand, position and wrist\n"
             "; rotation, ignoring the weapon completely. Bring it back within the\n"
             "; capture distance of its path (game units, ~1.4cm each) and the path\n"
-            "; takes it back — the mag gets authority and the glued hand follows.\n"
-            "; Letting go anywhere parks the mag back at rest.\n"
+            "; takes it back — the mag gets authority and the glued hand follows,\n"
+            "; same ride in and out. Letting go anywhere parks the mag back at rest.\n"
             "bMagazineFreeMovement = true\n"
-            "fMagazineFreeDetachTravelFraction = 0.85\n"
+            "fMagazineFreeDetachTravelFraction = 0.02\n"
             "fMagazineFreeCaptureDistanceUnits = 5.0\n"
             "\n"
             "; Learner evidence window: parts teach the learner ONLY while an\n"
@@ -320,7 +320,7 @@ namespace redux
         }
         magazineFreeMovement = ini.GetBoolValue(kSection, "bMagazineFreeMovement", magazineFreeMovement);
         magazineFreeDetachTravelFraction =
-            readClampedFloat("fMagazineFreeDetachTravelFraction", magazineFreeDetachTravelFraction, 0.30f, 0.99f);
+            readClampedFloat("fMagazineFreeDetachTravelFraction", magazineFreeDetachTravelFraction, 0.01f, 0.99f);
         magazineFreeCaptureDistanceUnits =
             readClampedFloat("fMagazineFreeCaptureDistanceUnits", magazineFreeCaptureDistanceUnits, 0.5f, 50.0f);
         if (const char* learnerFilter = ini.GetValue(kSection, "sLearnerClipFilter", learnerClipFilter.c_str())) {
