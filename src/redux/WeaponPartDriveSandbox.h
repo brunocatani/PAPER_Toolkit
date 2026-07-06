@@ -83,6 +83,9 @@ namespace redux
              */
             bool restPoseValid{ false };
             weapon_part_motion_path::PoseSample restPose{};
+            // Radius-gated free movement applies to this part's class
+            // (magazine group); the runtime resolves it from the part cache.
+            bool freeMovementEligible{ false };
         };
 
         /*
@@ -171,6 +174,18 @@ namespace redux
             bool clipScrubSessionActive{ false };
             std::uint64_t clipScrubSessionId{ 0 };
             float clipScrubFraction{ 0.0f };
+            /*
+             * Radius-gated magazine freedom (reload-template step 0): a
+             * gripped magazine-class part is GUIDED (normal path scrub)
+             * while the hand's target stays within this radius of the
+             * part's motion path; beyond it the part detaches and follows
+             * the hand freely. Re-entering the (hysteresis-scaled) radius
+             * re-captures onto the path — the part regains authority and
+             * the glued hand follows it, both directions. Release in any
+             * state ends the session (ROCK baseline restore = snap back).
+             */
+            bool magazineFreeMovement{ false };
+            float magazineFreeRadiusUnits{ 8.0f };
             // Per-part attach-only whitelist for the current weapon
             // generation; targets reinstall only when this set changes.
             std::uint32_t eligiblePartCount{ 0 };
@@ -246,6 +261,15 @@ namespace redux
              * real hand pull, which carries the session across windows
              * where the gripped part is authored to rest.
              */
+            /*
+             * Radius-gated magazine freedom: while true the part left its
+             * path and follows the hand directly (grab offset preserved,
+             * rotation frozen at the detach pose). Guided state resumes on
+             * re-capture near the path.
+             */
+            bool freeMoving{ false };
+            weapon_part_motion_path::Vec3 freeGrabOffset{};
+            weapon_part_motion_path::Quat freeRotation{};
             bool clipScrub{ false };
             std::uint64_t clipScrubSessionId{ 0 };
             weapon_part_motion_path::Vec3 scrubPartStartTranslate{};

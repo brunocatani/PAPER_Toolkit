@@ -1625,6 +1625,8 @@ namespace redux
         input.motionPathMode = g_reduxConfig.motionPathMode;
         input.stageTransitionsEnabled = g_reduxConfig.stageTransitions;
         input.travelExtremeToleranceFraction = g_reduxConfig.travelExtremeTolerance;
+        input.magazineFreeMovement = g_reduxConfig.magazineFreeMovement;
+        input.magazineFreeRadiusUnits = g_reduxConfig.magazineFreeRadiusUnits;
 
         /*
          * Clip-scrub session lifecycle (mode == scrub). The captured clip
@@ -1819,6 +1821,11 @@ namespace redux
                             handInput.restPoseValid = true;
                             handInput.restPose = _drivePartCache.entries[i].restPose;
                         }
+                        // Magazine group = radius-gated free movement.
+                        handInput.freeMovementEligible =
+                            static_cast<::rock::provider::RockProviderWeaponPartKindV1>(
+                                _drivePartCache.entries[i].partKind) ==
+                            ::rock::provider::RockProviderWeaponPartKindV1::Magazine;
                         break;
                     }
                 }

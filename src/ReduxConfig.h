@@ -106,6 +106,16 @@ namespace redux
         float clipScrubSweepSeconds = 6.0f;
         std::string clipScrubSweepClipFilter = "Reload";
         /*
+         * Radius-gated magazine freedom (reload-template step 0): a gripped
+         * magazine-class part is guided by its motion path while the hand
+         * stays within the radius; beyond it the mag detaches and follows
+         * the hand freely, and re-entering the radius re-captures it onto
+         * the path (part authority, hand follows) — both directions.
+         * Release always snaps back via ROCK's baseline restore.
+         */
+        bool magazineFreeMovement = true;
+        float magazineFreeRadiusUnits = 8.0f;
+        /*
          * Re-record mode: while true, EVERY config (re)load wipes all
          * learner-held motion data (learned strokes AND drained authored
          * strokes; authored re-harvests on the next equip / clip playback),
