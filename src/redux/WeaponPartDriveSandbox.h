@@ -74,6 +74,10 @@ namespace redux
             weapon_part_motion_path::Vec3 partTranslate{};
             float partScale{ 1.0f };
             weapon_part_motion_path::Vec3 handTranslate{};
+            // Hand ORIENTATION (weapon-root-local): free-moving parts ride
+            // the full hand pose, so waving/twisting carries the part.
+            bool handRotateValid{ false };
+            weapon_part_motion_path::Quat handRotate{};
             /*
              * Weapon-local pose the part settles at when idle (runtime
              * rest-pose capture): the reference for the delta curve that
@@ -177,12 +181,15 @@ namespace redux
             /*
              * Radius-gated magazine freedom (reload-template step 0): a
              * gripped magazine-class part is GUIDED (normal path scrub)
-             * while the hand's target stays within this radius of the
-             * part's motion path; beyond it the part detaches and follows
-             * the hand freely. Re-entering the (hysteresis-scaled) radius
-             * re-captures onto the path — the part regains authority and
-             * the glued hand follows it, both directions. Release in any
-             * state ends the session (ROCK baseline restore = snap back).
+             * while the CONTROLLER HAND stays within this radius of the
+             * part's REST pose (Bruno 2026-07-06: the radius is the hand's
+             * distance from the mag's home, not distance-to-path); beyond
+             * it the part detaches and rides the full hand pose freely —
+             * untethered manipulation, wave/twist included. Re-entering
+             * the (hysteresis-scaled) radius re-captures onto the path —
+             * the part regains authority and the glued hand follows it,
+             * both directions. Release in any state parks the part back
+             * at its rest pose.
              */
             bool magazineFreeMovement{ false };
             float magazineFreeRadiusUnits{ 8.0f };
@@ -263,13 +270,20 @@ namespace redux
              */
             /*
              * Radius-gated magazine freedom: while true the part left its
-             * path and follows the hand directly (grab offset preserved,
-             * rotation frozen at the detach pose). Guided state resumes on
-             * re-capture near the path.
+             * path and rides the hand as a rigid attachment — the grab
+             * offset is stored HAND-LOCAL (translate + rotation), so the
+             * part follows position AND wrist rotation like a held loose
+             * object (no dynamic conversion; it is still a driven weapon
+             * part). Guided state resumes on re-capture near the rest pose.
              */
             bool freeMoving{ false };
-            weapon_part_motion_path::Vec3 freeGrabOffset{};
-            weapon_part_motion_path::Quat freeRotation{};
+            bool freeHandRotateValid{ false };
+            weapon_part_motion_path::Vec3 freeOffsetTranslate{};
+            weapon_part_motion_path::Quat freeOffsetRotate{};
+            // Rest pose pinned at grip start: anchors the hand-distance
+            // radius AND the park-at-rest drive emitted on release.
+            bool restPoseValid{ false };
+            weapon_part_motion_path::PoseSample restPose{};
             bool clipScrub{ false };
             std::uint64_t clipScrubSessionId{ 0 };
             weapon_part_motion_path::Vec3 scrubPartStartTranslate{};

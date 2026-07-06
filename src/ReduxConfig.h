@@ -116,6 +116,14 @@ namespace redux
         bool magazineFreeMovement = true;
         float magazineFreeRadiusUnits = 8.0f;
         /*
+         * Learner evidence window: part motion counts as animation evidence
+         * only while a clip whose path matches this '|'-separated filter is
+         * live — fire/recoil motion never teaches the learner. Empty = gate
+         * off (learn from everything, the old behavior). Bolt/lever-action
+         * exceptions later, e.g. "Reload|BoltCharge".
+         */
+        std::string learnerClipFilter = "Reload";
+        /*
          * Re-record mode: while true, EVERY config (re)load wipes all
          * learner-held motion data (learned strokes AND drained authored
          * strokes; authored re-harvests on the next equip / clip playback),
