@@ -43,6 +43,16 @@ namespace redux
         constexpr float kScrubMinFractionDelta = 1.0e-4f;
         constexpr float kScrubMinTravelDelta = 1.0e-3f;
 
+        /*
+         * Mag-free transition blend: the on-path point and the hand's raw
+         * free-space point are generally different the instant the clamp
+         * lifts (or re-engages) — a geometric fact, not a staleness bug — so
+         * both transitions lerp over this many frames instead of popping.
+         * ~90ms at 90fps; short enough to feel immediate, long enough to
+         * hide the seam.
+         */
+        constexpr std::uint32_t kFreeTransitionBlendFrames = 8;
+
         [[nodiscard]] weapon_part_motion_path::Vec3 vecSub(
             const weapon_part_motion_path::Vec3& a, const weapon_part_motion_path::Vec3& b)
         {
@@ -612,124 +622,280 @@ namespace redux
                 session.pathAnchorTranslate.y + (hand.handTranslate.y - session.handStartTranslate.y),
                 session.pathAnchorTranslate.z + (hand.handTranslate.z - session.handStartTranslate.z),
             };
-            auto scrubbed = weapon_part_motion_scrub::scrub(*path, session.arcPosition, desired);
-            if (!scrubbed.valid) {
-                continue;
-            }
-            session.arcPosition = scrubbed.arcPosition;
-
             /*
-             * DELTA CURVE anchor (Bruno, 2026-07-05): max-travel events and
-             * stage-transition triggers both anchor on the path's physical
-             * travel extremes — displacement from the part's REST pose
-             * graphed along the path — never on key order. Learned strokes
-             * record in whichever direction the animation happened to run
-             * (a recorder armed while a bolt idled open stores the closing
-             * stroke), so "last key" can be the rest pose; the delta curve
-             * is direction-agnostic. Falls back to the first key as the
-             * rest reference when no live rest pose is captured yet.
+             * Rest reference for BOTH the guided delta curve and mag-free's
+             * detach/recapture distance checks (Bruno, 2026-07-05 / 2026-07-06):
+             * displacement from the part's authored rest pose, direction-
+             * agnostic. Falls back to the path's first key when no live rest
+             * pose is captured yet.
              */
             const auto& restReference = hand.restPoseValid ? hand.restPose : path->keys[0];
-            const auto extreme = weapon_part_motion_path::travelExtremeFromRest(*path, restReference);
-            /*
-             * Percentage zones on the delta curve (Bruno, 2026-07-05): the
-             * scrub is "at max" / "at rest" when its displacement from rest
-             * is within a travel FRACTION of the respective extreme, so the
-             * zones scale with each part's own stroke — a 4-unit pistol
-             * slide and a 10-unit bolt pull behave identically.
-             */
-            const float scrubDelta = weapon_part_motion_path::poseDistance(scrubbed.target, restReference);
-            const float travelRange = extreme.valid ? extreme.peakDelta - extreme.restDelta : 0.0f;
-            const bool atMaxTravel = extreme.valid &&
-                scrubDelta >= extreme.restDelta + (1.0f - input.travelExtremeToleranceFraction) * travelRange;
-            const bool atRestPoint = extreme.valid &&
-                scrubDelta <= extreme.restDelta + input.travelExtremeToleranceFraction * travelRange;
 
-            /*
-             * Max-travel event (shell-eject test), checked BEFORE the stage
-             * handoff so the emission belongs to the extreme just reached,
-             * not to the next stage's seed. Latched: one event on entering
-             * the max-travel zone, re-armed only after the part comes at
-             * least halfway back down the delta curve toward rest.
-             */
-            if (!session.onReturnStage && extreme.valid) {
-                if (atMaxTravel && !session.maxTravelLatched) {
-                    session.maxTravelLatched = true;
-                    if (outMaxTravelEvents && outMaxTravelEventCount &&
-                        *outMaxTravelEventCount < kMaxMaxTravelEvents) {
-                        auto& event = outMaxTravelEvents[(*outMaxTravelEventCount)++];
-                        event.bodyId = session.bodyId;
-                        event.sourceName = session.sourceName;
-                        event.arcPosition = scrubbed.arcPosition;
-                        event.extremeArcPosition = extreme.arcPosition;
-                        event.peakDelta = extreme.peakDelta;
-                    }
-                } else if (!atMaxTravel && session.maxTravelLatched &&
-                           scrubDelta <= extreme.restDelta + 0.5f * travelRange) {
-                    session.maxTravelLatched = false;
+            // Populated by the guided branch below; the mag-free detach
+            // check afterward reads them (left at defaults in free mode,
+            // where a path-relative delta curve doesn't apply).
+            weapon_part_motion_path::TravelExtreme extreme{};
+            float scrubDelta = 0.0f;
+            float travelRange = 0.0f;
+            bool stageHandoffOccurred = false;
+
+            // Whichever branch below computes it is what actually drives
+            // this frame (and, in free mode, what followers ride relative
+            // to). Captured before either branch runs so the follower loop
+            // later knows which computation produced it, independent of any
+            // detach/recapture flip that happens further down.
+            weapon_part_motion_path::PoseSample leaderTarget{};
+            const bool computingFreeThisFrame = session.freeMode;
+
+            if (session.freeMode) {
+                /*
+                 * MAG-FREE — limits released (Bruno, 2026-07-06): the leader
+                 * rides `desired` (the hand's raw, unprojected displacement)
+                 * directly instead of scrub()'s path projection. No arc
+                 * position, no delta curve, no stage/max-travel concepts —
+                 * those are guided-path ideas that don't apply to a freely
+                 * carried part. The attach-only grip session itself never
+                 * changes: this is purely a drive-target computation choice,
+                 * not a grip-authority change.
+                 *
+                 * Rotation is hand-DELTA tracked, not absolute and not
+                 * frozen: the hand's rotation change since the exact detach
+                 * frame is applied on top of the path's rotation at that same
+                 * frame, so there is zero pop at the instant of detach and
+                 * the part keeps turning with the wrist afterward (freezing
+                 * it would look broken the moment the hand twists; using the
+                 * hand's raw absolute rotation would pop immediately).
+                 */
+                weapon_part_motion_path::Quat freeRotate = session.freePathRotateAnchor;
+                if (hand.handRotateValid && session.freeHandRotateValid) {
+                    const auto handDelta = weapon_part_motion_path::quatMul(
+                        hand.handRotate, weapon_part_motion_path::quatConjugate(session.freeHandRotateAnchor));
+                    freeRotate = weapon_part_motion_path::quatNormalizeOrIdentity(
+                        weapon_part_motion_path::quatMul(handDelta, session.freePathRotateAnchor));
                 }
+                leaderTarget = weapon_part_motion_path::PoseSample{ desired, freeRotate };
+            } else {
+                auto scrubbed = weapon_part_motion_scrub::scrub(*path, session.arcPosition, desired);
+                if (!scrubbed.valid) {
+                    continue;
+                }
+                session.arcPosition = scrubbed.arcPosition;
+
+                /*
+                 * DELTA CURVE anchor (Bruno, 2026-07-05): max-travel events and
+                 * stage-transition triggers both anchor on the path's physical
+                 * travel extremes — displacement from the part's REST pose
+                 * graphed along the path — never on key order. Learned strokes
+                 * record in whichever direction the animation happened to run
+                 * (a recorder armed while a bolt idled open stores the closing
+                 * stroke), so "last key" can be the rest pose; the delta curve
+                 * is direction-agnostic.
+                 */
+                extreme = weapon_part_motion_path::travelExtremeFromRest(*path, restReference);
+                /*
+                 * Percentage zones on the delta curve (Bruno, 2026-07-05): the
+                 * scrub is "at max" / "at rest" when its displacement from rest
+                 * is within a travel FRACTION of the respective extreme, so the
+                 * zones scale with each part's own stroke — a 4-unit pistol
+                 * slide and a 10-unit bolt pull behave identically.
+                 */
+                scrubDelta = weapon_part_motion_path::poseDistance(scrubbed.target, restReference);
+                travelRange = extreme.valid ? extreme.peakDelta - extreme.restDelta : 0.0f;
+                const bool atMaxTravel = extreme.valid &&
+                    scrubDelta >= extreme.restDelta + (1.0f - input.travelExtremeToleranceFraction) * travelRange;
+                const bool atRestPoint = extreme.valid &&
+                    scrubDelta <= extreme.restDelta + input.travelExtremeToleranceFraction * travelRange;
+
+                /*
+                 * Max-travel event (shell-eject test), checked BEFORE the stage
+                 * handoff so the emission belongs to the extreme just reached,
+                 * not to the next stage's seed. Latched: one event on entering
+                 * the max-travel zone, re-armed only after the part comes at
+                 * least halfway back down the delta curve toward rest.
+                 */
+                if (!session.onReturnStage && extreme.valid) {
+                    if (atMaxTravel && !session.maxTravelLatched) {
+                        session.maxTravelLatched = true;
+                        if (outMaxTravelEvents && outMaxTravelEventCount &&
+                            *outMaxTravelEventCount < kMaxMaxTravelEvents) {
+                            auto& event = outMaxTravelEvents[(*outMaxTravelEventCount)++];
+                            event.bodyId = session.bodyId;
+                            event.sourceName = session.sourceName;
+                            event.arcPosition = scrubbed.arcPosition;
+                            event.extremeArcPosition = extreme.arcPosition;
+                            event.peakDelta = extreme.peakDelta;
+                        }
+                    } else if (!atMaxTravel && session.maxTravelLatched &&
+                               scrubDelta <= extreme.restDelta + 0.5f * travelRange) {
+                        session.maxTravelLatched = false;
+                    }
+                }
+
+                /*
+                 * Stage handoff at the extremes (Bruno, 2026-07-05): reaching
+                 * the end of the active stage hands the session to the OTHER
+                 * learned stage — mag pulled fully out continues onto the
+                 * insertion path with its own min/max, and completing the
+                 * insertion re-arms the extraction. The handoff re-seeds the
+                 * path anchor and the hand baseline, so displacement measures
+                 * from the handoff pose; the seed must land near the next
+                 * stage's BEGINNING or the handoff is refused (a stage whose
+                 * geometry doesn't start here would be skipped end-to-end in
+                 * one frame otherwise). Grabbing a part already resting at the
+                 * primary's end hands off on the first update, so an out-mag
+                 * grab starts directly on the insertion stage.
+                 */
+                // Transition trigger on the SAME delta-curve zones: a stage
+                // hands over at either physical travel extreme — the far point
+                // (mag fully out -> insertion path) or the rest point (seated ->
+                // extraction re-arms) — not at the recorded key order's end. The
+                // seed-near-next-start check below still decides whether a
+                // chained stage actually begins at the reached extreme. Old
+                // arc-end trigger remains only as the no-delta-curve fallback.
+                const bool atTransitionPoint = extreme.valid
+                    ? (atMaxTravel || atRestPoint)
+                    : scrubbed.arcPosition >= path->totalArcLength * (1.0f - input.travelExtremeToleranceFraction);
+                if (input.stageTransitionsEnabled && atTransitionPoint) {
+                    const auto* nextPath = session.onReturnStage ? liveGroup.leaderPath : liveGroup.returnPath;
+                    const auto* nextFollowers = session.onReturnStage ? liveGroup.followers : liveGroup.returnFollowers;
+                    const auto nextFollowerCount = session.onReturnStage ? liveGroup.followerCount : liveGroup.returnFollowerCount;
+                    if (nextPath && nextPath->valid) {
+                        const auto seeded = weapon_part_motion_scrub::initialScrubPosition(*nextPath, scrubbed.target.translate);
+                        // Accept only near-start seeds (chained stages start at
+                        // the previous stage's end by construction).
+                        constexpr float kStageHandoffMaxSeedArcFraction = 0.25f;
+                        if (seeded.valid &&
+                            seeded.arcPosition <= kStageHandoffMaxSeedArcFraction * nextPath->totalArcLength) {
+                            session.onReturnStage = !session.onReturnStage;
+                            stageHandoffOccurred = true;
+                            // The handoff seed lands at a stage START, so the
+                            // max-travel latch re-arms with the new stage.
+                            session.maxTravelLatched = false;
+                            session.arcPosition = seeded.arcPosition;
+                            session.pathAnchorTranslate = seeded.target.translate;
+                            session.handStartTranslate = hand.handTranslate;
+                            session.followerCount = 0;
+                            if (nextFollowers) {
+                                session.followerCount = (std::min)(nextFollowerCount, static_cast<std::uint32_t>(session.followers.size()));
+                                for (std::uint32_t i = 0; i < session.followerCount; ++i) {
+                                    session.followers[i] = nextFollowers[i];
+                                }
+                            }
+                            path = nextPath;
+                            scrubbed = seeded;
+                            RDX_LOG_INFO(Weapon,
+                                "WeaponPartDriveSandbox: stage handoff hand={} part='{}' -> {} stage (arc {:.2f}/{:.2f}, {} followers)",
+                                handIndex == 1 ? "left" : "right",
+                                sessionName(session.sourceName),
+                                session.onReturnStage ? "return" : "primary",
+                                seeded.arcPosition,
+                                nextPath->totalArcLength,
+                                session.followerCount);
+                        }
+                    }
+                }
+
+                leaderTarget = scrubbed.target;
             }
 
             /*
-             * Stage handoff at the extremes (Bruno, 2026-07-05): reaching
-             * the end of the active stage hands the session to the OTHER
-             * learned stage — mag pulled fully out continues onto the
-             * insertion path with its own min/max, and completing the
-             * insertion re-arms the extraction. The handoff re-seeds the
-             * path anchor and the hand baseline, so displacement measures
-             * from the handoff pose; the seed must land near the next
-             * stage's BEGINNING or the handoff is refused (a stage whose
-             * geometry doesn't start here would be skipped end-to-end in
-             * one frame otherwise). Grabbing a part already resting at the
-             * primary's end hands off on the first update, so an out-mag
-             * grab starts directly on the insertion stage.
+             * Uniform transition blend (Bruno, 2026-07-06), whichever branch
+             * just ran above: the on-path point and the hand's raw free-
+             * space point are generally different the instant the clamp
+             * lifts or re-engages — a geometric fact, not a staleness bug —
+             * so both directions lerp from the pose captured at the
+             * transition instant (`freeBlendFromPose`) toward whatever this
+             * frame's branch computed, over a fixed frame window, instead of
+             * popping.
              */
-            // Transition trigger on the SAME delta-curve zones: a stage
-            // hands over at either physical travel extreme — the far point
-            // (mag fully out -> insertion path) or the rest point (seated ->
-            // extraction re-arms) — not at the recorded key order's end. The
-            // seed-near-next-start check below still decides whether a
-            // chained stage actually begins at the reached extreme. Old
-            // arc-end trigger remains only as the no-delta-curve fallback.
-            const bool atTransitionPoint = extreme.valid
-                ? (atMaxTravel || atRestPoint)
-                : scrubbed.arcPosition >= path->totalArcLength * (1.0f - input.travelExtremeToleranceFraction);
-            if (input.stageTransitionsEnabled && atTransitionPoint) {
-                const auto* nextPath = session.onReturnStage ? liveGroup.leaderPath : liveGroup.returnPath;
-                const auto* nextFollowers = session.onReturnStage ? liveGroup.followers : liveGroup.returnFollowers;
-                const auto nextFollowerCount = session.onReturnStage ? liveGroup.followerCount : liveGroup.returnFollowerCount;
-                if (nextPath && nextPath->valid) {
-                    const auto seeded = weapon_part_motion_scrub::initialScrubPosition(*nextPath, scrubbed.target.translate);
-                    // Accept only near-start seeds (chained stages start at
-                    // the previous stage's end by construction).
-                    constexpr float kStageHandoffMaxSeedArcFraction = 0.25f;
-                    if (seeded.valid &&
-                        seeded.arcPosition <= kStageHandoffMaxSeedArcFraction * nextPath->totalArcLength) {
-                        session.onReturnStage = !session.onReturnStage;
-                        // The handoff seed lands at a stage START, so the
-                        // max-travel latch re-arms with the new stage.
-                        session.maxTravelLatched = false;
-                        session.arcPosition = seeded.arcPosition;
-                        session.pathAnchorTranslate = seeded.target.translate;
-                        session.handStartTranslate = hand.handTranslate;
-                        session.followerCount = 0;
-                        if (nextFollowers) {
-                            session.followerCount = (std::min)(nextFollowerCount, static_cast<std::uint32_t>(session.followers.size()));
-                            for (std::uint32_t i = 0; i < session.followerCount; ++i) {
-                                session.followers[i] = nextFollowers[i];
-                            }
-                        }
-                        path = nextPath;
-                        scrubbed = seeded;
-                        RDX_LOG_INFO(Weapon,
-                            "WeaponPartDriveSandbox: stage handoff hand={} part='{}' -> {} stage (arc {:.2f}/{:.2f}, {} followers)",
-                            handIndex == 1 ? "left" : "right",
-                            sessionName(session.sourceName),
-                            session.onReturnStage ? "return" : "primary",
-                            seeded.arcPosition,
-                            nextPath->totalArcLength,
-                            session.followerCount);
+            if (session.freeBlendFramesRemaining > 0) {
+                const float t = 1.0f -
+                    static_cast<float>(session.freeBlendFramesRemaining) / static_cast<float>(kFreeTransitionBlendFrames);
+                leaderTarget = weapon_part_motion_path::lerpPose(
+                    session.freeBlendFromPose, leaderTarget, std::clamp(t, 0.0f, 1.0f));
+                --session.freeBlendFramesRemaining;
+            }
+
+            if (input.magazineFreeMovement) {
+                if (session.freeMode) {
+                    /*
+                     * Recapture (Bruno, 2026-07-06): armed only after the
+                     * free part has left the capture radius at least once —
+                     * a small detach fraction can leave the part still
+                     * inside the radius the instant it detaches, and without
+                     * arming that would re-clamp on the very next frame.
+                     * Re-seeds at the point on the path NEAREST REST, not
+                     * nearest the part's current position — seeding by
+                     * current position flapped on winding paths where the
+                     * nearest point lands mid-arc, already past the detach
+                     * threshold again.
+                     */
+                    const float distanceToRest = weapon_part_motion_path::length(
+                        weapon_part_motion_path::sub(leaderTarget.translate, restReference.translate));
+                    if (distanceToRest > input.magazineFreeCaptureDistanceUnits) {
+                        session.freeRecaptureArmed = true;
                     }
+                    if (session.freeRecaptureArmed && distanceToRest <= input.magazineFreeCaptureDistanceUnits) {
+                        const auto seeded = weapon_part_motion_scrub::initialScrubPosition(*path, restReference.translate);
+                        if (seeded.valid) {
+                            session.freeMode = false;
+                            session.freeRecaptureArmed = false;
+                            session.maxTravelLatched = false;
+                            session.arcPosition = seeded.arcPosition;
+                            session.pathAnchorTranslate = seeded.target.translate;
+                            session.handStartTranslate = hand.handTranslate;
+                            session.freeBlendFromPose = leaderTarget;
+                            session.freeBlendFramesRemaining = kFreeTransitionBlendFrames;
+                            RDX_LOG_INFO(Weapon,
+                                "WeaponPartDriveSandbox: MAG-FREE recapture hand={} part='{}' restDist={:.2f}",
+                                handIndex == 1 ? "left" : "right",
+                                sessionName(session.sourceName),
+                                distanceToRest);
+                        }
+                    }
+                } else if (!stageHandoffOccurred && extreme.valid &&
+                           scrubDelta >= extreme.restDelta + input.magazineFreeDetachTravelFraction * travelRange) {
+                    /*
+                     * Detach (Bruno, 2026-07-06): past this fraction of the
+                     * path's own travel range, lift the clamp. The hand's
+                     * attach-only grip session is untouched — no authority
+                     * change, no new drive space, only whether scrub()'s
+                     * projection runs. Followers' poses relative to the
+                     * leader are captured now so they ride rigidly with it
+                     * while free (post chain-filter — the scene-graph-
+                     * stacking risk it guards against doesn't go away just
+                     * because the leader is free).
+                     */
+                    session.freeMode = true;
+                    session.freeRecaptureArmed = false;
+                    session.freeBlendFromPose = leaderTarget;
+                    session.freeBlendFramesRemaining = kFreeTransitionBlendFrames;
+                    session.freeHandRotateValid = hand.handRotateValid;
+                    session.freeHandRotateAnchor = hand.handRotate;
+                    session.freePathRotateAnchor = leaderTarget.rotate;
+
+                    std::array<bool, weapon_clip_stroke::kMaxFollowers> keptAtDetach{};
+                    chainFilterFollowers(
+                        input, sessionName(session.sourceName), session.followers.data(), session.followerCount, keptAtDetach);
+                    const float keyPositionAtDetach = weapon_clip_stroke::keyPositionForArc(*path, session.arcPosition);
+                    const auto leaderRotateConj = weapon_part_motion_path::quatConjugate(leaderTarget.rotate);
+                    for (std::uint32_t i = 0; i < session.followerCount; ++i) {
+                        if (!keptAtDetach[i] || session.followers[i].boneName[0] == '\0') {
+                            continue;
+                        }
+                        const auto followerPose = weapon_clip_stroke::followerPoseAtKeyPosition(session.followers[i], keyPositionAtDetach);
+                        session.freeFollowerOffsetTranslate[i] = weapon_part_motion_path::quatRotateVec(
+                            leaderRotateConj, weapon_part_motion_path::sub(followerPose.translate, leaderTarget.translate));
+                        session.freeFollowerOffsetRotate[i] = weapon_part_motion_path::quatNormalizeOrIdentity(
+                            weapon_part_motion_path::quatMul(leaderRotateConj, followerPose.rotate));
+                    }
+                    RDX_LOG_INFO(Weapon,
+                        "WeaponPartDriveSandbox: MAG-FREE detach hand={} part='{}' scrubDelta={:.2f} threshold={:.2f} followers={}",
+                        handIndex == 1 ? "left" : "right",
+                        sessionName(session.sourceName),
+                        scrubDelta,
+                        extreme.restDelta + input.magazineFreeDetachTravelFraction * travelRange,
+                        session.followerCount);
                 }
             }
 
@@ -754,16 +920,17 @@ namespace redux
             drive.groupId = static_cast<std::uint32_t>(handIndex + 1);
             drive.priority = kDrivePriority;
             drive.leaseFrames = kDriveLeaseFrames;
-            quatToRotateRowMajor(scrubbed.target.rotate, drive.targetTransform.rotate);
-            drive.targetTransform.translate[0] = scrubbed.target.translate.x;
-            drive.targetTransform.translate[1] = scrubbed.target.translate.y;
-            drive.targetTransform.translate[2] = scrubbed.target.translate.z;
+            quatToRotateRowMajor(leaderTarget.rotate, drive.targetTransform.rotate);
+            drive.targetTransform.translate[0] = leaderTarget.translate.x;
+            drive.targetTransform.translate[1] = leaderTarget.translate.y;
+            drive.targetTransform.translate[2] = leaderTarget.translate.z;
             drive.targetTransform.scale = session.partScale;
 
             // Authored assembly followers move at the same stroke progress —
             // driven by source name so they need no collider evidence. The
             // chain filter drives at most one node per parent chain (see
-            // chainFilterFollowers).
+            // chainFilterFollowers). In free mode they instead ride the
+            // leader's live pose via the offset captured at detach.
             std::array<bool, weapon_clip_stroke::kMaxFollowers> followerKept{};
             (void)chainFilterFollowers(
                 input, sessionName(session.sourceName), session.followers.data(), session.followerCount, followerKept);
@@ -773,7 +940,15 @@ namespace redux
                 if (follower.boneName[0] == '\0' || !followerKept[i]) {
                     continue;
                 }
-                const auto followerPose = weapon_clip_stroke::followerPoseAtKeyPosition(follower, keyPosition);
+                weapon_part_motion_path::PoseSample followerPose{};
+                if (computingFreeThisFrame) {
+                    followerPose.translate = weapon_part_motion_path::add(leaderTarget.translate,
+                        weapon_part_motion_path::quatRotateVec(leaderTarget.rotate, session.freeFollowerOffsetTranslate[i]));
+                    followerPose.rotate = weapon_part_motion_path::quatNormalizeOrIdentity(
+                        weapon_part_motion_path::quatMul(leaderTarget.rotate, session.freeFollowerOffsetRotate[i]));
+                } else {
+                    followerPose = weapon_clip_stroke::followerPoseAtKeyPosition(follower, keyPosition);
+                }
                 auto& followerDrive = drives[driveCount++];
                 followerDrive.flags = static_cast<std::uint32_t>(::rock::provider::RockProviderWeaponPartTargetFlagV1::MatchSourceName);
                 followerDrive.driveSpace = ::rock::provider::RockProviderWeaponPartDriveSpaceV1::WeaponRootLocal;

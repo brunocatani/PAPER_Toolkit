@@ -113,6 +113,20 @@ namespace redux
                    std::abs(transform.scale) > 0.0001f;
         }
 
+        // Shared by the clip-harvest drain (rig-space stroke keys) and the
+        // drive sandbox's mag-free hand-rotation read (weapon-local hand
+        // pose) — callers check finiteNiTransform first, this does no
+        // validity check of its own.
+        [[nodiscard]] weapon_part_motion_path::PoseSample niTransformToPose(const RE::NiTransform& transform)
+        {
+            weapon_part_motion_path::PoseSample pose{};
+            float quaternion[4]{};
+            transform_math::niRowsToHavokQuaternion(transform.rotate, quaternion);
+            pose.rotate = weapon_part_motion_path::Quat{ quaternion[3], quaternion[0], quaternion[1], quaternion[2] };
+            pose.translate = weapon_part_motion_path::Vec3{ transform.translate.x, transform.translate.y, transform.translate.z };
+            return pose;
+        }
+
         [[nodiscard]] bool nodeContainsNode(RE::NiAVObject* root, RE::NiAVObject* target, int maxDepth)
         {
             if (!root || !target || maxDepth < 0) {
@@ -1230,14 +1244,6 @@ namespace redux
             return false;
         }
 
-        const auto niToPose = [](const RE::NiTransform& transform) {
-            weapon_part_motion_path::PoseSample pose{};
-            float quaternion[4]{};
-            transform_math::niRowsToHavokQuaternion(transform.rotate, quaternion);
-            pose.rotate = weapon_part_motion_path::Quat{ quaternion[3], quaternion[0], quaternion[1], quaternion[2] };
-            pose.translate = weapon_part_motion_path::Vec3{ transform.translate.x, transform.translate.y, transform.translate.z };
-            return pose;
-        };
         /*
          * Clip keys are RIG-bone-local under the rig 'Weapon' bone: their
          * rest value differs from the scene node's (in-game A/B 2026-07-04:
@@ -1367,7 +1373,7 @@ namespace redux
                 } else {
                     keyTransform.translate += sceneDelta;
                 }
-                outPath.keys[key] = niToPose(keyTransform);
+                outPath.keys[key] = niTransformToPose(keyTransform);
                 if (key > 0) {
                     arc += weapon_part_motion_path::poseDistance(outPath.keys[key], outPath.keys[key - 1]);
                 }
@@ -1424,7 +1430,7 @@ namespace redux
             // down-and-back; any other shape means the calibration is off
             // for this rig family.
             {
-                const auto restPose = niToPose(leaderRestWeaponLocal);
+                const auto restPose = niTransformToPose(leaderRestWeaponLocal);
                 const auto& key0 = group.leaderPath.keys[0];
                 const auto& keyLast = group.leaderPath.keys[weapon_part_motion_path::kResampledKeyCount - 1];
                 const auto sceneDelta = rigDeltaToScene(
@@ -1497,7 +1503,7 @@ namespace redux
                         const auto rotationDelta = sceneRotationDelta(followerFirstKey, clipKey);
                         keyTransform.rotate = applyDeltaToRest(followerRestWeaponLocal.rotate, rotationDelta);
                     }
-                    slot.keys[key] = niToPose(keyTransform);
+                    slot.keys[key] = niTransformToPose(keyTransform);
                 }
                 slot.restScale = followerRestWeaponLocal.scale;
                 ++converted.followerCount;
@@ -1578,7 +1584,7 @@ namespace redux
                             } else {
                                 keyTransform.translate += sceneDelta;
                             }
-                            slot.keys[key] = niToPose(keyTransform);
+                            slot.keys[key] = niTransformToPose(keyTransform);
                         }
                         slot.restScale = otherRestWeaponLocal.scale;
                         ++groupForEntry.followerCount;
@@ -1625,6 +1631,9 @@ namespace redux
         input.motionPathMode = g_reduxConfig.motionPathMode;
         input.stageTransitionsEnabled = g_reduxConfig.stageTransitions;
         input.travelExtremeToleranceFraction = g_reduxConfig.travelExtremeTolerance;
+        input.magazineFreeMovement = g_reduxConfig.magazineFreeMovement;
+        input.magazineFreeDetachTravelFraction = g_reduxConfig.magazineFreeDetachTravelFraction;
+        input.magazineFreeCaptureDistanceUnits = g_reduxConfig.magazineFreeCaptureDistanceUnits;
 
         /*
          * Clip-scrub session lifecycle (mode == scrub). The captured clip
@@ -1844,6 +1853,26 @@ namespace redux
                     handInput.partScale = partWeaponLocal.scale;
                     handInput.handTranslate = weapon_part_motion_path::Vec3{ handWeaponLocal.x, handWeaponLocal.y, handWeaponLocal.z };
                     handInput.transformsValid = true;
+                }
+                /*
+                 * Mag-free free-mode rotation (Bruno, 2026-07-06): the only
+                 * consumer of hand ROTATION in this runtime — guided
+                 * scrubbing only ever needed hand translate. Built the same
+                 * way the part's own weapon-local pose is above
+                 * (composeTransforms against weaponWorldInverse), just
+                 * starting from the provider's flat row-major rotate[9]
+                 * instead of an engine NiTransform.
+                 */
+                RE::NiTransform handWorldTransform{};
+                handWorldTransform.rotate =
+                    transform_math::providerRotateToNiRows<decltype(handWorldTransform.rotate)>(handTransform.rotate);
+                handWorldTransform.translate = handWorld;
+                handWorldTransform.scale = handTransform.scale;
+                const RE::NiTransform handWeaponLocalTransform =
+                    transform_math::composeTransforms(weaponWorldInverse, handWorldTransform);
+                if (finiteNiTransform(handWeaponLocalTransform)) {
+                    handInput.handRotate = niTransformToPose(handWeaponLocalTransform).rotate;
+                    handInput.handRotateValid = true;
                 }
             }
         }

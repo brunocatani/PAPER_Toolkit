@@ -75,6 +75,17 @@ namespace redux
         bool stageTransitions = true;
         float stageChainToleranceGameUnits = 2.0f;
         /*
+         * Mag-free limit release (2026-07-06): past this fraction of a
+         * gripped part's own path travel range, the guided clamp lifts and
+         * the part rides the hand's raw displacement directly (still the
+         * same attach-only grip, hand glue unchanged — see
+         * WeaponPartDriveSandbox). Re-clamps once the free part comes back
+         * within magazineFreeCaptureDistanceUnits of its rest pose.
+         */
+        bool magazineFreeMovement = true;
+        float magazineFreeDetachTravelFraction = 0.02f;
+        float magazineFreeCaptureDistanceUnits = 5.0f;
+        /*
          * Max/min trigger zone as a FRACTION of each part's full travel
          * (the delta-curve height). Percentage-based on purpose: an
          * absolute arc-unit epsilon meant a pistol slide's zone and a bolt
