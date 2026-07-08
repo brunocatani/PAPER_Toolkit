@@ -83,14 +83,6 @@ namespace redux
              */
             bool restPoseValid{ false };
             weapon_part_motion_path::PoseSample restPose{};
-            /*
-             * Weapon-local hand ROTATION (mag-free free-mode only — guided
-             * scrubbing never needed it). false when the composed transform
-             * was non-finite; the session then holds its last free-mode
-             * rotation anchor rather than snapping to garbage.
-             */
-            bool handRotateValid{ false };
-            weapon_part_motion_path::Quat handRotate{};
         };
 
         /*
@@ -179,22 +171,6 @@ namespace redux
             bool clipScrubSessionActive{ false };
             std::uint64_t clipScrubSessionId{ 0 };
             float clipScrubFraction{ 0.0f };
-            /*
-             * Mag-free limit release: past this fraction of the path's own
-             * travel range (delta-curve height from rest), the guided clamp
-             * lifts and the part rides the hand's raw displacement directly
-             * instead of being projected onto the recorded path — the SAME
-             * attach-only grip session the whole time, hand glue unchanged;
-             * only the drive-target computation's clamp toggles. Re-clamps
-             * once the free part comes back within
-             * magazineFreeCaptureDistanceUnits of its rest pose (armed only
-             * after first leaving that radius, so a low detach fraction
-             * cannot flap the part between the two states on the same
-             * frame it detaches).
-             */
-            bool magazineFreeMovement{ false };
-            float magazineFreeDetachTravelFraction{ 0.02f };
-            float magazineFreeCaptureDistanceUnits{ 5.0f };
             // Per-part attach-only whitelist for the current weapon
             // generation; targets reinstall only when this set changes.
             std::uint32_t eligiblePartCount{ 0 };
@@ -280,50 +256,6 @@ namespace redux
             // Game units of part travel per unit fraction (local slope).
             float scrubSlope{ 0.0f };
             std::uint32_t scrubLastLogDecile{ 0 };
-
-            /*
-             * Mag-free limit release. `freeMode` false = guided (scrub()
-             * projects the hand's desired point onto the path, exactly as
-             * always); true = the clamp is lifted and the leader drives
-             * straight off `desired`. `freeRecaptureArmed` requires the part
-             * to have left the capture radius at least once since detaching
-             * before a recapture can fire — otherwise a detach fraction
-             * small enough to still be inside the capture radius would
-             * re-clamp on the very next frame. `freeBlendFramesRemaining`
-             * bridges BOTH transition directions: whichever branch computed
-             * this frame's raw target, if a blend is in flight the final
-             * pose lerps from `freeBlendFromPose` (captured once, at the
-             * transition instant) toward that raw target — the two branches
-             * never need their own bespoke smoothing.
-             */
-            bool freeMode{ false };
-            bool freeRecaptureArmed{ false };
-            std::uint32_t freeBlendFramesRemaining{ 0 };
-            weapon_part_motion_path::PoseSample freeBlendFromPose{};
-            /*
-             * Free-mode rotation is hand-DELTA tracked, not absolute and not
-             * frozen: anchor the hand's rotation and the path's rotation at
-             * the exact detach frame, then every free frame apply the
-             * hand's rotation change since that anchor on top of the path
-             * anchor — zero pop at the detach instant by construction, and
-             * the part keeps rotating with the wrist afterward (a frozen
-             * rotation would look broken the moment the hand twists).
-             * `freeHandRotateValid` is false when the hand rotation wasn't
-             * available at the detach instant (composed transform
-             * non-finite) — free rotation then just holds the path anchor.
-             */
-            bool freeHandRotateValid{ false };
-            weapon_part_motion_path::Quat freeHandRotateAnchor{};
-            weapon_part_motion_path::Quat freePathRotateAnchor{};
-            /*
-             * Follower poses relative to the LEADER's own frame, captured at
-             * the detach instant (leaderRotate^-1 * (followerPose - leader),
-             * so free-mode followers ride the leader rigidly — same idea as
-             * an authored follower riding the leader's stroke progress, just
-             * against the leader's live free pose instead of a key position.
-             */
-            std::array<weapon_part_motion_path::Vec3, weapon_clip_stroke::kMaxFollowers> freeFollowerOffsetTranslate{};
-            std::array<weapon_part_motion_path::Quat, weapon_clip_stroke::kMaxFollowers> freeFollowerOffsetRotate{};
         };
 
         bool ensureRegistered();

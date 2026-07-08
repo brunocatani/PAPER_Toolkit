@@ -58,40 +58,9 @@ namespace redux::weapon_part_motion_path
     // A new stroke must beat the stored one by this ratio to replace it.
     inline constexpr float kReplaceExcursionRatio = 1.02f;
 
-    inline Vec3 add(const Vec3& a, const Vec3& b) { return Vec3{ a.x + b.x, a.y + b.y, a.z + b.z }; }
     inline Vec3 sub(const Vec3& a, const Vec3& b) { return Vec3{ a.x - b.x, a.y - b.y, a.z - b.z }; }
     inline float dot(const Vec3& a, const Vec3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
     inline float length(const Vec3& a) { return std::sqrt(dot(a, a)); }
-
-    // Hamilton product a*b: rotating by b THEN a (matches this file's
-    // {w,x,y,z} convention throughout).
-    inline Quat quatMul(const Quat& a, const Quat& b)
-    {
-        return Quat{
-            a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
-            a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
-            a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
-            a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
-        };
-    }
-
-    inline Quat quatConjugate(const Quat& q) { return Quat{ q.w, -q.x, -q.y, -q.z }; }
-
-    // Rotates v by unit quaternion q (v' = q * (0,v) * conj(q), optimized).
-    inline Vec3 quatRotateVec(const Quat& q, const Vec3& v)
-    {
-        const Vec3 qv{ q.x, q.y, q.z };
-        const Vec3 t{
-            2.0f * (qv.y * v.z - qv.z * v.y),
-            2.0f * (qv.z * v.x - qv.x * v.z),
-            2.0f * (qv.x * v.y - qv.y * v.x),
-        };
-        return Vec3{
-            v.x + q.w * t.x + (qv.y * t.z - qv.z * t.y),
-            v.y + q.w * t.y + (qv.z * t.x - qv.x * t.z),
-            v.z + q.w * t.z + (qv.x * t.y - qv.y * t.x),
-        };
-    }
 
     inline float quatDot(const Quat& a, const Quat& b)
     {

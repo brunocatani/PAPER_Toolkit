@@ -257,22 +257,6 @@ namespace redux::transform_math
         return result;
     }
 
-    // A provider-API RockProviderTransform ships rotation as a flat row-major
-    // float[9] (row r, column c at index r*3+c — matches how this codebase's
-    // quatToRotateRowMajor writes it going the other direction). Rebuilds the
-    // stored-rows Matrix form so a provider-received transform (e.g. a hand
-    // pose read from a frame snapshot) can go through composeTransforms like
-    // any engine NiTransform.
-    template <class Matrix>
-    inline Matrix providerRotateToNiRows(const float rotate[9])
-    {
-        Matrix result{};
-        result.entry[0][0] = rotate[0]; result.entry[0][1] = rotate[1]; result.entry[0][2] = rotate[2]; result.entry[0][3] = 0.0f;
-        result.entry[1][0] = rotate[3]; result.entry[1][1] = rotate[4]; result.entry[1][2] = rotate[5]; result.entry[1][3] = 0.0f;
-        result.entry[2][0] = rotate[6]; result.entry[2][1] = rotate[7]; result.entry[2][2] = rotate[8]; result.entry[2][3] = 0.0f;
-        return result;
-    }
-
     // Transpose between ROCK stored rows and native helpers that deliberately
     // use NiMatrix columns as physical axes before building an hkTransformf.
     template <class Matrix>

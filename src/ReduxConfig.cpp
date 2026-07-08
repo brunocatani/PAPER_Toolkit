@@ -75,16 +75,6 @@ namespace redux
             "bStageTransitions = true\n"
             "fStageChainToleranceGameUnits = 2.0\n"
             "\n"
-            "; Mag-free limit release: a gripped part rides its recorded path for the\n"
-            "; first fraction of its travel (the seat/unseat click) — past it the part\n"
-            "; moves freely with your hand, position and wrist rotation, ignoring the\n"
-            "; weapon completely (the attach-only grip and hand glue never change).\n"
-            "; Bring it back within the capture distance of its rest pose and the path\n"
-            "; takes it back over. Letting go anywhere parks the part where it is.\n"
-            "bMagazineFreeMovement = true\n"
-            "fMagazineFreeDetachTravelFraction = 0.02\n"
-            "fMagazineFreeCaptureDistanceUnits = 5.0\n"
-            "\n"
             "; Max/min trigger zone as a FRACTION of each part's full travel: the part\n"
             "; counts as at-max / at-rest when its displacement from rest is within\n"
             "; this percentage of the extreme. Percentage-based so short pistol slides\n"
@@ -252,9 +242,6 @@ namespace redux
         const bool previousStageTransitions = stageTransitions;
         const float previousExtremeTolerance = travelExtremeTolerance;
         const float previousChainTolerance = stageChainToleranceGameUnits;
-        const bool previousMagazineFreeMovement = magazineFreeMovement;
-        const float previousMagazineFreeDetachFraction = magazineFreeDetachTravelFraction;
-        const float previousMagazineFreeCaptureDistance = magazineFreeCaptureDistanceUnits;
         const bool previousShellEject = shellEjectOnMaxTravel;
         const bool previousSweepTest = clipScrubSweepTest;
         const float previousSweepSeconds = clipScrubSweepSeconds;
@@ -301,11 +288,6 @@ namespace redux
         coTimedMaxArcRatio = readClampedFloat("fCoTimedMaxArcRatio", coTimedMaxArcRatio, 0.1f, 10.0f);
         stageTransitions = ini.GetBoolValue(kSection, "bStageTransitions", stageTransitions);
         stageChainToleranceGameUnits = readClampedFloat("fStageChainToleranceGameUnits", stageChainToleranceGameUnits, 0.25f, 10.0f);
-        magazineFreeMovement = ini.GetBoolValue(kSection, "bMagazineFreeMovement", magazineFreeMovement);
-        magazineFreeDetachTravelFraction =
-            readClampedFloat("fMagazineFreeDetachTravelFraction", magazineFreeDetachTravelFraction, 0.005f, 0.95f);
-        magazineFreeCaptureDistanceUnits =
-            readClampedFloat("fMagazineFreeCaptureDistanceUnits", magazineFreeCaptureDistanceUnits, 0.5f, 50.0f);
         // Cap keeps the max/rest zones clear of the 50%-of-travel re-arm point.
         travelExtremeTolerance = readClampedFloat("fTravelExtremeTolerance", travelExtremeTolerance, 0.02f, 0.45f);
         shellEjectOnMaxTravel = ini.GetBoolValue(kSection, "bShellEjectOnMaxTravel", shellEjectOnMaxTravel);
@@ -400,16 +382,6 @@ namespace redux
                     stageTransitions,
                     travelExtremeTolerance,
                     stageChainToleranceGameUnits);
-            }
-            const bool magazineFreeChanged = magazineFreeMovement != previousMagazineFreeMovement ||
-                magazineFreeDetachTravelFraction != previousMagazineFreeDetachFraction ||
-                magazineFreeCaptureDistanceUnits != previousMagazineFreeCaptureDistance;
-            if (magazineFreeChanged) {
-                RDX_LOG_INFO(Config,
-                    "Mag-free limit release: enabled={} detachFraction={:.3f} captureDistance={:.2f} (applies immediately, mid-grip)",
-                    magazineFreeMovement,
-                    magazineFreeDetachTravelFraction,
-                    magazineFreeCaptureDistanceUnits);
             }
             bool allowListChangedKeys = false;
             for (std::size_t i = 0; i < std::size(kAttachOnlyPartKeys); ++i) {
