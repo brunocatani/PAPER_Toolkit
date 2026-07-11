@@ -91238,11 +91238,20 @@
       {
         "id": "magazine_group",
         "role": "detachable_magazine",
-        "notes": "The unique Object01/Object02/ammunition meshes are physical grips across recorded assembly variants. WeaponMagazine is the sole top-level driver. P-Mag and the original 0x6B57 BSX remain connector/motion evidence, never physical identity.",
+        "notes": "Alternative physical grips cover both observed assemblies: the OMOD-qualified 0x6B57 magazine BSX when present, plus unique Object01/Object02/ammunition meshes. WeaponMagazine is the sole top-level driver and P-Mag remains connector-only.",
         "connectorEvidence": [
           "P-Mag"
         ],
         "grips": [
+          {
+            "source": "BSX",
+            "omod": {
+              "plugin": "F4NV-AMR.esp",
+              "id": "0x00006B57"
+            },
+            "omodName": "F4NV-AMR magazine assembly",
+            "role": "physical_magazine_omod_mesh"
+          },
           {
             "source": "Object01",
             "role": "physical_magazine_mesh_primary"

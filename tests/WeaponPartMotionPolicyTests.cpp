@@ -809,14 +809,17 @@ int main()
             f4nv.spatialReload.sourceClip == "Animations\\44Pistol\\WPNReload.hkt");
         ok &= expectTrue("F4NV magazine group uses unique physical mesh grips",
             f4nv.spatialReload.groups.size() == 2 &&
-                f4nv.spatialReload.groups[1].grips.size() == 3 &&
-                f4nv.spatialReload.groups[1].grips[0].sourceName == "Object01" &&
-                f4nv.spatialReload.groups[1].grips[1].sourceName == "Object02" &&
-                f4nv.spatialReload.groups[1].grips[2].sourceName ==
+                f4nv.spatialReload.groups[1].grips.size() == 4 &&
+                f4nv.spatialReload.groups[1].grips[0].sourceName == "BSX" &&
+                f4nv.spatialReload.groups[1].grips[0].omod.plugin == "F4NV-AMR.esp" &&
+                f4nv.spatialReload.groups[1].grips[0].omod.localFormId == 0x6B57u &&
+                f4nv.spatialReload.groups[1].grips[1].sourceName == "Object01" &&
+                f4nv.spatialReload.groups[1].grips[2].sourceName == "Object02" &&
+                f4nv.spatialReload.groups[1].grips[3].sourceName ==
                     "308MagSmalBullets:0" &&
-                f4nv.spatialReload.groups[1].grips[0].omod.empty() &&
                 f4nv.spatialReload.groups[1].grips[1].omod.empty() &&
-                f4nv.spatialReload.groups[1].grips[2].omod.empty());
+                f4nv.spatialReload.groups[1].grips[2].omod.empty() &&
+                f4nv.spatialReload.groups[1].grips[3].omod.empty());
         ok &= expectTrue("P-Mag is connector evidence rather than a grip or driver",
                 f4nv.spatialReload.groups[1].connectorEvidence.size() == 1 &&
                 f4nv.spatialReload.groups[1].connectorEvidence[0] == "P-Mag" &&

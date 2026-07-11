@@ -121,7 +121,7 @@ The generator validates weapon identity and captured annotation inventory, retai
 
 Before any active-file replacement, preserve the original JSON and capture and record SHA-256 hashes. Runtime files are never the only copy of a known-good mapping again.
 
-Physical grip identity must use concrete, uniquely named evidence meshes that survive supported attachment variants. Generic NIF names such as `BSX` are not stable identities: unrelated OMODs may reuse them. OMOD and connector data remain valuable assembly evidence, but a connector is never a part and an optional OMOD child must not make an otherwise valid movement group ambiguous.
+Physical grip declarations are alternatives across supported attachment variants: every unambiguous concrete match is exposed and a group fails closed only when none bind. Generic NIF names such as `BSX` require an exact OMOD qualifier because unrelated OMODs may reuse them. Stable mesh fallbacks may coexist with that qualified identity. A connector is never a part and a missing optional OMOD child must not reject an otherwise valid group.
 
 ## Validation boundary
 

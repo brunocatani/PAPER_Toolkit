@@ -59,9 +59,9 @@ This explicit direction selection avoids treating learner stage labels as semant
 
 ## Magazine group
 
-The source capture contains a magazine `BSX`, classified as `Magazine` with exact OMOD `F4NV-AMR.esp:0x00006B57`, under `WeaponMagazine/P-Mag`. That identity is retained as motion and assembly evidence, but it is not a stable grip identity: `BSX` is a generic name also used by scope OMODs and the magazine instance can be absent in another assembly of the same weapon form.
+The source capture contains a magazine `BSX`, classified as `Magazine` with exact OMOD `F4NV-AMR.esp:0x00006B57`, under `WeaponMagazine/P-Mag`. Bare `BSX` is not stable identity because scope OMODs reuse the name, so it is accepted only when qualified by the exact magazine OMOD and treated as one alternative rather than a mandatory grip.
 
-Physical grips use the unique magazine meshes present in both captured assemblies:
+Alternative physical grips also use the unique magazine meshes present in both captured assemblies:
 
 - `Object01` under `WeaponMagazineChild1`;
 - `Object02` under `WeaponMagazineChild3`;
@@ -71,7 +71,7 @@ Top-level driver:
 
 - `WeaponMagazine`, carrying the full magazine subtree.
 
-`P-Mag` is connector evidence only. PAPER drives `WeaponMagazine`, not `P-Mag` and not every descendant separately. Grabbing any of the three concrete magazine meshes selects the same magazine group.
+`P-Mag` is connector evidence only. PAPER drives `WeaponMagazine`, not `P-Mag` and not every descendant separately. Grabbing the OMOD-qualified magazine `BSX` or any of the three concrete magazine meshes selects the same magazine group.
 
 The removal control is the exact `BSX.learnedPrimary` path. The insertion control is the exact `BSX.learnedReturn` path. `WeaponMagazine` supplies the matching exact driver stages.
 
@@ -110,7 +110,13 @@ The first attempt to apply `CullBone.WeaponMagazineChild1`/`UnCullBone.WeaponMag
 
 The `19:20` session equipped a different assembly of the same weapon form. The scene contained two `BSX` nodes under separate `P-Scope` connectors, both classified as `Sight` with OMOD `0x6B56`, and no magazine `BSX` under `P-Mag`. The exact binder therefore rejected the complete profile with `ambiguous-follower:'BSX', grip:'BSX'`; no AttachOnly targets were installed, so ROCK correctly fell back to authority grabs.
 
-The profile no longer treats bare `BSX` as physical magazine identity or a required follower. It binds the three unique concrete magazine meshes above, while its movement remains the exact preserved `BSX.learnedPrimary`/`learnedReturn` data. This keeps physical identity assembly-stable without changing the known-good motion authority.
+The profile no longer treats bare `BSX` as physical magazine identity or a required follower. Grip declarations are alternatives: the exact `0x6B57` magazine `BSX` binds when present, while the three unique concrete meshes bind both observed assemblies. Its movement remains the exact preserved `BSX.learnedPrimary`/`learnedReturn` data.
+
+### Repeated-audio and magazine-contact correction
+
+The `19:31` live log showed the controller was not latching sounds: all four bolt descriptors were requested successfully across at least five cycles. The audio handle itself was value-initialized with `soundID = 0`, but CommonLibF4VR exposes `BSSoundHandle` as a POD without a constructor and zero is a real engine id. Every fresh direct-audio request now starts with the invalid-id sentinel, `assumeSuccess = false`, and a zero state before descriptor resolution.
+
+The same session showed why the magazine still used authority grabbing. PAPER installed targets for the three child meshes, but the hand contacted the large magazine `BSX` body with OMOD `0x6B57`. That body is restored as an OMOD-qualified alternative grip. Missing alternatives no longer reject a group as long as at least one concrete grip binds.
 
 ## Test checklist
 

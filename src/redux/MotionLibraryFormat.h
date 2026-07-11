@@ -125,6 +125,10 @@ namespace redux::motion_library
         // P-* nodes are connection subnodes only. They may prove the captured
         // hierarchy here, but can never be grips or physical driver identity.
         std::vector<std::string> connectorEvidence;
+        // Alternative physical identities for supported assembly variants.
+        // Every concrete match is exposed; the group fails closed only when
+        // none bind. OMOD-qualified generic names may coexist with stable
+        // mesh fallbacks without making either variant mandatory.
         std::vector<SpatialReloadGripSource> grips;
         std::vector<SpatialReloadDriver> drivers;
     };

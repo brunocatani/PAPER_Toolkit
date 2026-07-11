@@ -1544,7 +1544,9 @@ namespace redux
                     omodRuntimeId =
                         motion_library::MotionLibraryStore::runtimeIdFromFormRef(grip.omod);
                     if (omodRuntimeId == 0) {
-                        recordMissing("omod", grip.omod.plugin);
+                        // Grip declarations are alternatives. An OMOD from an
+                        // assembly variant that is not loaded cannot disable
+                        // another concrete grip that did bind for this group.
                         continue;
                     }
                 }
@@ -1552,8 +1554,8 @@ namespace redux
                 const auto* entry = findEntry(
                     grip.sourceName, true, omodRuntimeId, ambiguous);
                 if (!entry) {
-                    recordMissing(
-                        ambiguous ? "ambiguous-grip" : "grip", grip.sourceName);
+                    // Missing/ambiguous alternatives fail closed individually.
+                    // The group fails below only when no declared grip binds.
                     continue;
                 }
                 bool duplicateBody = false;
@@ -1637,8 +1639,16 @@ namespace redux
                     });
             auto* audio = validCommand ? RE::BSAudioManager::GetSingleton() : nullptr;
             bool played = false;
+            RE::BSSoundHandle handle{};
+            // CommonLibF4VR exposes this engine handle as a POD with no
+            // constructor. Zero is a real sound id; GetSoundHandleByName
+            // requires the invalid-id sentinel for every fresh request.
+            // Reusing zero can report FadeInPlay success while replaying
+            // or suppressing the first engine sound instance.
+            handle.soundID = (std::numeric_limits<std::uint32_t>::max)();
+            handle.assumeSuccess = false;
+            handle.state = 0;
             if (audio) {
-                RE::BSSoundHandle handle{};
                 // The captured annotation is a graph command; the audio
                 // manager resolves only the NUL-terminated descriptor after
                 // "Soundplay.". Direct playback preserves the sound without
@@ -1653,11 +1663,12 @@ namespace redux
             }
             if (played) {
                 RDX_LOG_INFO(Weapon,
-                    "Spatial preview sound id='{}' stage='{}' path={:.3f} descriptor='{}'",
+                    "Spatial preview sound id='{}' stage='{}' path={:.3f} descriptor='{}' soundId={}",
                     event.id,
                     event.stageId,
                     output.pathDistance,
-                    event.sourceEvent.c_str() + kSoundCommandPrefix.size());
+                    event.sourceEvent.c_str() + kSoundCommandPrefix.size(),
+                    handle.soundID);
             } else if (!_spatialPreviewSoundFailureLogged[eventIndex]) {
                 _spatialPreviewSoundFailureLogged[eventIndex] = true;
                 RDX_LOG_WARN(Weapon,
