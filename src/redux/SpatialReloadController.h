@@ -67,20 +67,11 @@ namespace redux::spatial_reload
             float outwardFraction{ 0.0f };
             std::uint32_t driverCount{ 0 };
             std::array<DriverOutput, motion_library::kMaxSpatialReloadDrivers> drivers{};
-            // Edge-latched direct-audio requests.
+            // Sound-only executable surface. Visibility/gameplay mapped
+            // events remain inert profile metadata and never appear here.
             std::uint32_t soundEventCount{ 0 };
             std::array<std::uint32_t, motion_library::kMaxSpatialReloadEvents>
                 soundEventIndices{};
-            /*
-             * Current stage's declarative preview visibility state. These
-             * indices repeat every active frame so the runtime can maintain
-             * and restore a scene-node cull lease deterministically. They
-             * are never sent to the animation graph. Gameplay events remain
-             * inert and have no output surface.
-             */
-            std::uint32_t visibilityEventCount{ 0 };
-            std::array<std::uint32_t, motion_library::kMaxSpatialReloadEvents>
-                visibilityEventIndices{};
         };
 
         [[nodiscard]] FrameOutput update(
@@ -149,10 +140,6 @@ namespace redux::spatial_reload
             std::uint32_t stageIndex,
             float pathDistance);
         void writeDriverOutput(
-            const motion_library::SpatialReloadProfile& profile,
-            std::uint32_t stageIndex,
-            FrameOutput& output) const;
-        void writeVisibilityOutput(
             const motion_library::SpatialReloadProfile& profile,
             std::uint32_t stageIndex,
             FrameOutput& output) const;

@@ -145,24 +145,6 @@ namespace redux
                 eligibleParts{};
         };
 
-        /*
-         * Preview-only scene-node visibility override. Identity is stored by
-         * generation + source name, never as a retained engine pointer. Each
-         * frame resolves through the equip-scoped drive cache; release
-         * restores the exact pre-preview AppCulled state. A generation change
-         * clears without dereferencing the discarded weapon scene graph.
-         */
-        struct SpatialPreviewVisibilityLease
-        {
-            bool used{ false };
-            std::uint64_t generationKey{ 0 };
-            std::uint32_t groupIndex{ 0 };
-            std::array<char, WeaponPartDriveSandbox::kMaxSourceName> sourceName{};
-            bool originalCulled{ false };
-            bool appliedCulled{ false };
-        };
-        static constexpr std::size_t kMaxSpatialPreviewVisibilityLeases = 8;
-
         // Parts driven by our own drive targets within the last lease window;
         // their observations are untrusted (leaders match by bodyId,
         // followers by source name).
@@ -189,14 +171,6 @@ namespace redux
         void playSpatialPreviewSounds(
             const motion_library::SpatialReloadProfile& profile,
             const spatial_reload::Controller::FrameOutput& output);
-        void applySpatialPreviewVisibility(
-            const motion_library::SpatialReloadProfile& profile,
-            const spatial_reload::Controller::FrameOutput& output,
-            std::uint64_t generationKey);
-        void restoreSpatialPreviewVisibility(std::uint64_t generationKey);
-        [[nodiscard]] RE::NiAVObject* findUniqueDrivePartNode(
-            std::uint64_t generationKey,
-            std::string_view sourceName) const;
         void observeWeaponPartMotion(RE::NiNode* weaponNode, std::uint64_t generationKey, std::uint32_t weaponFormId);
         void updateWeaponClipHarvestWalk(RE::NiNode* weaponNode, std::uint64_t generationKey, std::uint32_t weaponFormId);
         void drainWeaponClipHarvest(RE::NiNode* weaponNode, std::uint64_t generationKey, std::uint32_t weaponFormId);
@@ -255,11 +229,6 @@ namespace redux
         // for the equipped profile; successful edge crossings remain visible.
         std::array<bool, motion_library::kMaxSpatialReloadEvents>
             _spatialPreviewSoundFailureLogged{};
-        std::array<bool, motion_library::kMaxSpatialReloadEvents>
-            _spatialPreviewVisibilityFailureLogged{};
-        std::array<SpatialPreviewVisibilityLease,
-            kMaxSpatialPreviewVisibilityLeases>
-            _spatialPreviewVisibilityLeases{};
         // Resolved attach-only set + the state it was computed from.
         std::uint32_t _eligiblePartCount{ 0 };
         std::array<WeaponPartDriveSandbox::EligiblePart, WeaponPartDriveSandbox::kMaxEligibleParts> _eligibleParts{};

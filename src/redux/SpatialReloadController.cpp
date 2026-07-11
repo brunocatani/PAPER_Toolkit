@@ -544,28 +544,6 @@ namespace redux::spatial_reload
         }
     }
 
-    void Controller::writeVisibilityOutput(
-        const motion_library::SpatialReloadProfile& profile,
-        std::uint32_t stageIndex,
-        FrameOutput& output) const
-    {
-        output.visibilityEventCount = 0;
-        for (std::uint32_t eventIndex = 0;
-             eventIndex < profile.mappedEvents.size() &&
-             output.visibilityEventCount < output.visibilityEventIndices.size();
-             ++eventIndex) {
-            const auto& event = profile.mappedEvents[eventIndex];
-            if (event.kind ==
-                    motion_library::SpatialReloadMappedEventKind::Visibility &&
-                event.trigger ==
-                    motion_library::SpatialReloadMappedEventTrigger::StageEnter &&
-                event.stageIndex == stageIndex) {
-                output.visibilityEventIndices[output.visibilityEventCount++] =
-                    eventIndex;
-            }
-        }
-    }
-
     float Controller::outwardFraction(
         const motion_library::SpatialReloadStage& stage,
         float pathDistance) const
@@ -705,7 +683,6 @@ namespace redux::spatial_reload
             output.outwardFraction =
                 outwardFraction(currentStage, groupState.pathDistance);
             writeDriverOutput(*profile, groupState.stageIndex, output);
-            writeVisibilityOutput(*profile, groupState.stageIndex, output);
         }
         return output;
     }

@@ -86,8 +86,8 @@ The curated interaction uses removal `0.00 -> 0.20`, then insertion `0.80 -> 1.0
 | `SoundPlay.WPN1AMRmagin` | direct sound at insertion position `0.90`, separated from the exchange sound |
 | `SoundPlay.WPN1AMRboltclose` | direct sound halfway through bolt closing |
 | `SoundPlay.WPN1AMRend` | direct sound at bolt-closed endpoint |
-| `CullBone.WeaponMagazineChild1` | preview-only outgoing mesh state; original cull value is leased and restored |
-| `UnCullBone.WeaponMagazineChild1` | preview-only incoming mesh state |
+| `CullBone.WeaponMagazineChild1` | inert visibility evidence |
+| `UnCullBone.WeaponMagazineChild1` | inert visibility evidence |
 | `reloadComplete` | inert gameplay evidence |
 | `initiateStart` | inert graph evidence |
 | `reloadEnd` | inert graph-exit evidence |
@@ -98,7 +98,11 @@ Sound command spelling is normalized to `Soundplay.<descriptor>` in the profile.
 
 The 18:44 runtime log proved that bolt sounds were re-arming: `reload_start`, `bolt_open`, `bolt_close`, and `reload_end` all played successfully across repeated cycles. The audible loss came from placement, not a one-shot latch. `bolt_open`/`bolt_close` and `mag_out`/`mag_in` had been assigned to the same transition frames, allowing one descriptor to mask the other.
 
-Return sounds are now spatially separated: bolt-close at closing position `0.50`, end at the closed endpoint, mag-out at the `0.20` exchange, and mag-in at insertion position `0.90`. The same test also showed that magazine visibility never changed because Cull/UnCull was metadata-only. The captured `WeaponMagazineChild1` pair is now a reversible preview-state lease and still never touches the animation graph.
+Return sounds are now spatially separated: bolt-close at closing position `0.50`, end at the closed endpoint, mag-out at the `0.20` exchange, and mag-in at insertion position `0.90`.
+
+### Direct-visibility regression and rollback
+
+The first attempt to apply `CullBone.WeaponMagazineChild1`/`UnCullBone.WeaponMagazineChild1` directly through scene-node cull state regressed the next live test. The profile still bound, both attach-only targets installed, and the magazine grip was recognized at `19:07:19.386`, but the spatial path never advanced far enough to reach its first `0.05` sound. Because the new visibility layer was the only behavior introduced at grip activation, it was removed completely from controller and runtime output. The captured markers remain inert evidence until mesh exchange has a movement-safe implementation.
 
 ## Test checklist
 
@@ -109,9 +113,8 @@ Return sounds are now spatially separated: bolt-close at closing position `0.50`
 5. Open/close continuously and confirm all three top-level bolt drivers move once, with no doubled descendant travel.
 6. Release and re-grip; confirm the cycle resets cleanly.
 7. Grip the magazine and confirm `WeaponMagazine` carries the complete subtree while `P-Mag` is never independently driven.
-8. Cross removal positions `0.05` and `0.20`; verify release/out sounds fire once and `WeaponMagazineChild1` selects the outgoing appearance.
-9. Continue through insertion position `0.90`; verify the incoming appearance replaces the outgoing one and the mag-in sound is audible separately from mag-out.
-10. Confirm the `0.20 -> 0.80` transition has no visible teleport, insertion reaches the exact seated endpoint, and returning to removal selects the outgoing appearance again.
+8. Cross removal positions `0.05` and `0.20`; verify release/out sounds fire once.
+9. Continue through insertion position `0.90`; verify the mag-in sound is audible separately from mag-out.
+10. Confirm the `0.20 -> 0.80` transition has no visible teleport and insertion reaches the exact seated endpoint.
 11. Open and close the bolt for at least two continuous cycles; verify bolt-open, bolt-close, and end each remain separately audible on every cycle.
-12. Release the magazine during both stages and confirm its original visibility is restored.
-13. Start and finish a normal native reload separately; confirm PAPER neither holds nor completes it.
+12. Start and finish a normal native reload separately; confirm PAPER neither holds nor completes it.

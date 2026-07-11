@@ -2,9 +2,7 @@
 
 #include "redux/WeaponPartMotionScrubPolicy.h"
 
-#include <algorithm>
 #include <charconv>
-#include <cctype>
 #include <cmath>
 #include <cstdio>
 
@@ -235,21 +233,6 @@ namespace redux::motion_library::spatial_profile_format
         {
             return name.size() >= 2 && (name[0] == 'P' || name[0] == 'p') &&
                 name[1] == '-';
-        }
-
-        [[nodiscard]] bool startsWithIgnoreCase(
-            std::string_view value,
-            std::string_view prefix)
-        {
-            return value.size() > prefix.size() &&
-                std::equal(
-                    prefix.begin(),
-                    prefix.end(),
-                    value.begin(),
-                    [](char left, char right) {
-                        return std::tolower(static_cast<unsigned char>(left)) ==
-                            std::tolower(static_cast<unsigned char>(right));
-                    });
         }
 
         template <class Range, class GetName>
@@ -904,14 +887,6 @@ namespace redux::motion_library::spatial_profile_format
                 return fail(outError, "event trigger or kind is unsupported");
             }
             event.sourceEvent = encoded["sourceEvent"].get<std::string>();
-            if (event.kind == SpatialReloadMappedEventKind::Visibility &&
-                (event.trigger != SpatialReloadMappedEventTrigger::StageEnter ||
-                    (!startsWithIgnoreCase(event.sourceEvent, "CullBone.") &&
-                        !startsWithIgnoreCase(
-                            event.sourceEvent, "UnCullBone.")))) {
-                return fail(outError,
-                    "visibility findings must be stageEnter CullBone./UnCullBone. preview state");
-            }
             if (event.trigger == SpatialReloadMappedEventTrigger::PathPosition) {
                 if (!encoded.contains("pathFraction") ||
                     !encoded["pathFraction"].is_number() ||

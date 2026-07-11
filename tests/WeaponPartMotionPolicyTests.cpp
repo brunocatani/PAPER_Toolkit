@@ -1015,8 +1015,7 @@ int main()
         collectSounds(output);
         ok &= expectTrue("bolt preview begins from a physical grip without a clip",
             output.newGrip && output.active && output.groupIndex == 0 &&
-                output.stageIndex == boltOpenIndex && output.driverCount == 3 &&
-                output.visibilityEventCount == 0);
+                output.stageIndex == boltOpenIndex && output.driverCount == 3);
 
         PoseSample rotationOnlyHand{};
         rotationOnlyHand.rotate = redux::weapon_part_motion_path::Quat{
@@ -1093,18 +1092,14 @@ int main()
             &profile, makeInput(false, Controller::kInvalidIndex, 0, {}));
         ok &= expectTrue("release ends preview drives without gameplay completion",
             !output.active && output.driverCount == 0 &&
-                output.soundEventCount == 0 &&
-                output.visibilityEventCount == 0);
+                output.soundEventCount == 0);
 
         output = controller.update(
             &profile, makeInput(true, 1, 2, {}));
         collectSounds(output);
         ok &= expectTrue("magazine preview begins on outgoing group stage",
             output.newGrip && output.active && output.groupIndex == 1 &&
-                output.stageIndex == magRemoveIndex && output.driverCount == 1 &&
-                output.visibilityEventCount == 1 &&
-                profile.mappedEvents[output.visibilityEventIndices[0]].sourceEvent ==
-                    "CullBone.WeaponMagazineChild1");
+                output.stageIndex == magRemoveIndex && output.driverCount == 1);
 
         const auto& magRemove = profile.stages[magRemoveIndex];
         const auto magExchangePose = anchoredTarget(
@@ -1119,10 +1114,7 @@ int main()
         ok &= expectTrue("magazine exchanges at 20 percent of outward travel",
             changed && output.stageIndex == magInsertIndex &&
                 std::abs(output.pathFraction - 0.80f) < 0.0002f &&
-                std::abs(output.outwardFraction - 0.20f) < 0.0002f &&
-                output.visibilityEventCount == 1 &&
-                profile.mappedEvents[output.visibilityEventIndices[0]].sourceEvent ==
-                    "UnCullBone.WeaponMagazineChild1");
+                std::abs(output.outwardFraction - 0.20f) < 0.0002f);
         expectTransitionContinuity(
             "20-percent magazine handoff has no driver teleport",
             magRemove, output);
@@ -1143,10 +1135,7 @@ int main()
         ok &= expectTrue("seated magazine resets to outgoing stage at outward zero",
             changed && output.stageIndex == magRemoveIndex &&
                 std::abs(output.pathFraction) < 0.0001f &&
-                std::abs(output.outwardFraction) < 0.0001f &&
-                output.visibilityEventCount == 1 &&
-                profile.mappedEvents[output.visibilityEventIndices[0]].sourceEvent ==
-                    "CullBone.WeaponMagazineChild1");
+                std::abs(output.outwardFraction) < 0.0001f);
 
         output = controller.update(
             &profile, makeInput(false, Controller::kInvalidIndex, 0, {}));
@@ -1215,17 +1204,6 @@ int main()
         removedExecutableEvents["spatialReload"]["events"] = nlohmann::json::array();
         ok &= expectFalse("removed executable event surface is rejected",
             parse(removedExecutableEvents.dump(), invalidProfile, nullptr));
-
-        auto invalidVisibilityCommand = nlohmann::json::parse(roundTripText);
-        for (auto& encodedEvent :
-             invalidVisibilityCommand["spatialReload"]["mappedEvents"]) {
-            if (encodedEvent["kind"] == "visibility") {
-                encodedEvent["sourceEvent"] = "HideSomething.WeaponMagazineChild1";
-                break;
-            }
-        }
-        ok &= expectFalse("visibility preview state accepts only CullBone/UnCullBone",
-            parse(invalidVisibilityCommand.dump(), invalidProfile, nullptr));
 
         auto brokenCycle = nlohmann::json::parse(roundTripText);
         brokenCycle["spatialReload"]["stages"][1]["nextStage"] = "bolt_close";

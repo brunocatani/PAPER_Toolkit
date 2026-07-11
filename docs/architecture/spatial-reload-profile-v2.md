@@ -88,10 +88,10 @@ These are positions along recorded paths, not animation-time fractions.
 `mappedEvents` separates authority:
 
 - `sound`: may request direct, edge-latched preview audio at a spatial/state gate;
-- `visibility`: may maintain a reversible preview-only `AppCulled` scene-node state;
+- `visibility`: retained evidence only;
 - `gameplay`: retained evidence only.
 
-No mapped event is sent through `NotifyAnimationGraphImpl`. Visibility is applied directly to the exact named equipped-weapon node only while its physical group is gripped. PAPER records the node's original `AppCulled` value, maintains the stage's Cull/UnCull state every active frame, and restores the original value on release. A weapon-generation change drops the name-only lease without dereferencing the discarded scene graph. Gameplay events such as `reloadComplete` and `reloadEnd` remain inert.
+No mapped event is sent through `NotifyAnimationGraphImpl`. Visibility commands, `reloadComplete`, `reloadEnd`, and similar gameplay/graph markers remain inert. Direct scene-node culling was tested and removed after it stopped live spatial movement immediately after grip activation.
 
 For sound only, PAPER removes the captured `Soundplay.` command prefix, resolves the descriptor through `BSAudioManager::GetSoundHandleByName`, and starts it directly with zero-millisecond `FadeInPlay`. Failures are logged once per mapped event. This audio path cannot alter reload state.
 
@@ -105,7 +105,6 @@ The profile is rejected as a unit for:
 - malformed poses, inconsistent arcs, or incomplete driver tracks;
 - temporal/clip/session authority fields;
 - invalid groups, cycles, fractions, OMODs, hierarchy, or event positions;
-- visibility state other than stage-enter `CullBone.<node>` or `UnCullBone.<node>`;
 - `P-*` used as a grip or driver.
 
 The old Ozzy `movementPreview` signature is intentionally rejected. This prevents the known-bad full-pose profile from remaining silently active.
@@ -124,6 +123,6 @@ Before any active-file replacement, preserve the original JSON and capture and r
 
 ## Validation boundary
 
-Policy tests prove schema rejection, exact key retention, translation-only input, group cycles, repeat sound re-arming, spatial separation of forward/return sounds, 20/80 magazine handoff continuity, declarative visibility state, and inert gameplay mappings. Builds prove compilation and deployment, not interaction feel.
+Policy tests prove schema rejection, exact key retention, translation-only input, group cycles, repeat sound re-arming, spatial separation of forward/return sounds, 20/80 magazine handoff continuity, sound-only output, and inert visibility/gameplay mappings. Builds prove compilation and deployment, not interaction feel.
 
 Live validation must still confirm physical body binding, directions, grouping, endpoint feel, 20/80 exchange feel, and descriptor resolution. The correct failure mode is a rejected profile, no preview drive, a rate-limited sound failure, or restored sandbox ownership—never clip interception or gameplay mutation.

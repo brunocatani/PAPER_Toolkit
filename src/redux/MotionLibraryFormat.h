@@ -71,9 +71,8 @@ namespace redux::motion_library
      * path rotations remain playback data, never controller input. No clip
      * interception, clip identity check, clock, gameplay event,
      * or reload-completion contract exists here. sourceClip is provenance;
-     * mapped gameplay stays inert. Sound findings may request direct audio;
-     * visibility findings may request a reversible preview-only scene-node
-     * cull lease. Neither surface notifies the animation graph.
+     * mapped visibility/gameplay stays inert, while sound-kind findings may
+     * request direct audio without graph notification.
      *
      * Values are equip-scoped and parsed off the hot path. The controller
      * copies only fixed-capacity state for per-frame work.
@@ -196,9 +195,8 @@ namespace redux::motion_library
     {
         std::string id;
         std::string stageId;
-        // Resolved by the parser. Sound entries may become edge-latched
-        // direct audio; visibility entries may become declarative,
-        // preview-only cull state. Gameplay always stays inert.
+        // Resolved by the parser. Visibility/gameplay stay inert; sound-kind
+        // entries may be surfaced as edge-latched direct-audio requests.
         std::uint32_t stageIndex{ 0 };
         SpatialReloadMappedEventKind kind{ SpatialReloadMappedEventKind::Sound };
         SpatialReloadMappedEventTrigger trigger{ SpatialReloadMappedEventTrigger::PathPosition };
@@ -209,10 +207,9 @@ namespace redux::motion_library
         bool targetPoseUsed{ false };
         weapon_part_motion_path::PoseSample targetPose{};
         // Captured graph annotation retained as metadata. The movement
-        // controller never dispatches it and cannot complete gameplay.
-        // Sound integration may play the descriptor directly; visibility
-        // integration may interpret only bounded CullBone./UnCullBone.
-        // commands as a reversible scene-node state lease.
+        // controller never dispatches it and cannot complete gameplay. For
+        // Sound only, integration may play the payload directly after
+        // stripping the captured "Soundplay." prefix.
         std::string sourceEvent;
         std::string notes;
     };

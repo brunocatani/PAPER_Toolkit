@@ -91198,7 +91198,7 @@
     "sourceCapture": "F4NV-AMR.esp_00000F99.capture.jsonl",
     "sourceActivityId": "23",
     "sourceClip": "Animations\\44Pistol\\WPNReload.hkt",
-    "notes": "Movement-only testbed built from the exact known-good learner paths. It never owns a reload clip, ammo, or gameplay; magazine visibility is a reversible preview-only node state.",
+    "notes": "Movement-only testbed built from the exact known-good learner paths. It never owns a reload clip, ammo, visibility, or gameplay.",
     "groups": [
       {
         "id": "bolt_group",
@@ -94659,7 +94659,7 @@
         "trigger": "stageEnter",
         "kind": "visibility",
         "sourceEvent": "CullBone.WeaponMagazineChild1",
-        "notes": "Preview-only outgoing magazine mesh selection; applied directly as reversible node cull state and never graph-dispatched."
+        "notes": "Captured visibility evidence only; never dispatched or applied."
       },
       {
         "id": "magazine_child_uncull",
@@ -94667,7 +94667,7 @@
         "trigger": "stageEnter",
         "kind": "visibility",
         "sourceEvent": "UnCullBone.WeaponMagazineChild1",
-        "notes": "Preview-only incoming magazine mesh selection; applied directly as reversible node cull state and never graph-dispatched."
+        "notes": "Captured visibility evidence only; never dispatched or applied."
       },
       {
         "id": "reload_complete",

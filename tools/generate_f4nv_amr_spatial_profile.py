@@ -376,7 +376,7 @@ def build(library: dict[str, Any], snapshot: dict[str, Any], reload_clip: dict[s
         "sourceCapture": "F4NV-AMR.esp_00000F99.capture.jsonl",
         "sourceActivityId": str(reload_clip["activityId"]),
         "sourceClip": RELOAD_CLIP,
-        "notes": "Movement-only testbed built from the exact known-good learner paths. It never owns a reload clip, ammo, or gameplay; magazine visibility is a reversible preview-only node state.",
+        "notes": "Movement-only testbed built from the exact known-good learner paths. It never owns a reload clip, ammo, visibility, or gameplay.",
         "groups": [
             {
                 "id": "bolt_group",
@@ -448,8 +448,8 @@ def build(library: dict[str, Any], snapshot: dict[str, Any], reload_clip: dict[s
             mapped_event("mag_in", "magazine_insert", "pathPosition", "sound", "Soundplay.WPN1AMRmagin", "Plays at insertion position 0.90, spatially separated from the mag-out exchange sound.", stages, 0.90),
             mapped_event("bolt_close", "bolt_close", "pathPosition", "sound", "Soundplay.WPN1AMRboltclose", "Plays halfway along the recorded closing path, spatially separated from bolt-open and end.", stages, 0.50),
             mapped_event("reload_end", "bolt_close", "stageComplete", "sound", "Soundplay.WPN1AMRend", "Direct preview audio at the spatial closed endpoint.", stages),
-            mapped_event("magazine_child_cull", "magazine_remove", "stageEnter", "visibility", "CullBone.WeaponMagazineChild1", "Preview-only outgoing magazine mesh selection; applied directly as reversible node cull state and never graph-dispatched.", stages),
-            mapped_event("magazine_child_uncull", "magazine_insert", "stageEnter", "visibility", "UnCullBone.WeaponMagazineChild1", "Preview-only incoming magazine mesh selection; applied directly as reversible node cull state and never graph-dispatched.", stages),
+            mapped_event("magazine_child_cull", "magazine_remove", "stageEnter", "visibility", "CullBone.WeaponMagazineChild1", "Captured visibility evidence only; never dispatched or applied.", stages),
+            mapped_event("magazine_child_uncull", "magazine_insert", "stageEnter", "visibility", "UnCullBone.WeaponMagazineChild1", "Captured visibility evidence only; never dispatched or applied.", stages),
             mapped_event("reload_complete", "bolt_close", "stageComplete", "gameplay", "reloadComplete", "Captured gameplay evidence only; never dispatched.", stages),
             mapped_event("initiate_start", "bolt_close", "stageComplete", "gameplay", "initiateStart", "Captured graph evidence only; never dispatched.", stages),
             mapped_event("reload_graph_end", "bolt_close", "stageComplete", "gameplay", "reloadEnd", "Captured graph-exit evidence only; never dispatched.", stages),
