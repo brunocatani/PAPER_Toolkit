@@ -344,43 +344,7 @@ namespace redux
         std::array<::rock::provider::RockProviderWeaponPartDriveTargetV1, 2 * (1 + weapon_clip_stroke::kMaxFollowers)> drives{};
         std::uint32_t driveCount = 0;
 
-        if (input.spatialPreviewActive) {
-            _sessions = {};
-            const auto spatialCount = (std::min)(
-                input.spatialPreviewDriveCount,
-                static_cast<std::uint32_t>(input.spatialPreviewDrives.size()));
-            for (std::uint32_t i = 0; i < spatialCount && driveCount < drives.size(); ++i) {
-                const auto& source = input.spatialPreviewDrives[i];
-                const auto sourceName = sessionName(source.sourceName);
-                if (sourceName.empty() || !std::isfinite(source.scale) ||
-                    std::fabs(source.scale) < 0.0001f) {
-                    continue;
-                }
-                auto& drive = drives[driveCount++];
-                drive.flags = static_cast<std::uint32_t>(
-                    ::rock::provider::RockProviderWeaponPartTargetFlagV1::MatchSourceName);
-                drive.driveSpace =
-                    ::rock::provider::RockProviderWeaponPartDriveSpaceV1::WeaponRootLocal;
-                drive.weaponGenerationKey = input.weaponGenerationKey;
-                drive.groupId = 100;
-                drive.priority = kDrivePriority;
-                drive.leaseFrames = kDriveLeaseFrames;
-                std::memcpy(
-                    drive.sourceName,
-                    sourceName.data(),
-                    (std::min)(sourceName.size(), sizeof(drive.sourceName) - 1));
-                quatToRotateRowMajor(source.target.rotate, drive.targetTransform.rotate);
-                drive.targetTransform.translate[0] = source.target.translate.x;
-                drive.targetTransform.translate[1] = source.target.translate.y;
-                drive.targetTransform.translate[2] = source.target.translate.z;
-                drive.targetTransform.scale = source.scale;
-            }
-        }
-
         for (std::size_t handIndex = 0; handIndex < 2; ++handIndex) {
-            if (input.spatialPreviewActive) {
-                break;
-            }
             const auto& hand = input.hands[handIndex];
             auto& session = _sessions[handIndex];
 

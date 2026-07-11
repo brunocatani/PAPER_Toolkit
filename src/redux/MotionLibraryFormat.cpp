@@ -1,7 +1,5 @@
 #include "redux/MotionLibraryFormat.h"
 
-#include "redux/SpatialReloadProfileFormat.h"
-
 #include <nlohmann/json.hpp>
 
 #include <charconv>
@@ -201,15 +199,11 @@ namespace redux::motion_library
             parts.push_back(std::move(p));
         }
         j["parts"] = std::move(parts);
-        if (library.spatialReload.used) {
-            j["spatialReload"] =
-                spatial_profile_format::toJson(library.spatialReload);
-        }
         // 2-space indent: these files are the hand-tuning surface.
         return j.dump(2);
     }
 
-    bool parse(std::string_view jsonText, WeaponLibrary& out, std::string* outError) try
+    bool parse(std::string_view jsonText, WeaponLibrary& out, std::string* outError)
     {
         out = WeaponLibrary{};
         if (outError) {
@@ -237,30 +231,6 @@ namespace redux::motion_library
         }
         out.weaponName = j.value("weaponName", std::string{});
         out.curated = j.value("curated", false);
-        if (j.contains("authoritativeReload")) {
-            if (outError) {
-                *outError = "authoritativeReload is the removed time-driven profile; regenerate as spatialReload";
-            }
-            return false;
-        }
-        if (j.contains("spatialReload")) {
-            if (out.formatVersion < 2) {
-                if (outError) {
-                    *outError = "spatialReload requires format 2";
-                }
-                return false;
-            }
-            if (!out.curated) {
-                if (outError) {
-                    *outError = "spatialReload requires curated=true so runtime learning cannot overwrite it";
-                }
-                return false;
-            }
-            if (!spatial_profile_format::fromJson(
-                    j["spatialReload"], out.spatialReload, outError)) {
-                return false;
-            }
-        }
         if (!j.contains("parts") || !j["parts"].is_array()) {
             if (outError) {
                 *outError = "missing parts array";
@@ -306,11 +276,5 @@ namespace redux::motion_library
             }
         }
         return true;
-    } catch (const json::exception& error) {
-        out = WeaponLibrary{};
-        if (outError) {
-            *outError = std::string("malformed field: ") + error.what();
-        }
-        return false;
     }
 }

@@ -48,15 +48,6 @@ namespace redux
             std::array<char, kMaxSourceName> sourceName{};
         };
         static constexpr std::size_t kMaxSentDrives = 2 * (1 + weapon_clip_stroke::kMaxFollowers);
-        static constexpr std::size_t kMaxSpatialDrives = 16;
-        static_assert(kMaxSpatialDrives <= kMaxSentDrives);
-
-        struct SpatialDrive
-        {
-            std::array<char, kMaxSourceName> sourceName{};
-            weapon_part_motion_path::PoseSample target{};
-            float scale{ 1.0f };
-        };
 
         struct HandInput
         {
@@ -183,15 +174,6 @@ namespace redux
             bool clipScrubSessionActive{ false };
             std::uint64_t clipScrubSessionId{ 0 };
             float clipScrubFraction{ 0.0f };
-            /*
-             * Curated movement-preview drives. When selected for this weapon
-             * they replace normal learner/ClipScrub hand sessions without
-             * owning any reload clip. The sandbox remains the sole owner of
-             * ROCK registration, target install, leases, and cleanup.
-             */
-            bool spatialPreviewActive{ false };
-            std::uint32_t spatialPreviewDriveCount{ 0 };
-            std::array<SpatialDrive, kMaxSpatialDrives> spatialPreviewDrives{};
             // Per-part attach-only whitelist for the current weapon
             // generation; targets reinstall only when this set changes.
             std::uint32_t eligiblePartCount{ 0 };

@@ -28,8 +28,8 @@ namespace redux::weapon_part_motion_scrub
     // Per-frame scrub travel clamp in arc units; generous for a 90 fps hand
     // pull but blocks single-frame teleports from tracking spikes.
     inline constexpr float kMaxScrubAdvancePerFrame = 2.0f;
-    // Segments whose translation span is below this cannot be projected by
-    // the legacy translation-only policy and are skipped there.
+    // Segments whose translation span is below this cannot be projected onto
+    // and are skipped (pure-rotation stretches of the stroke).
     inline constexpr float kDegenerateSegmentLengthGameUnits = 1.0e-3f;
 
     struct ScrubResult
@@ -113,7 +113,6 @@ namespace redux::weapon_part_motion_scrub
             }
             return best;
         }
-
     }
 
     /*
@@ -172,5 +171,4 @@ namespace redux::weapon_part_motion_scrub
             .target = poseAtArcPosition(path, newArc),
         };
     }
-
 }

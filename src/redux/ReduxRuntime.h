@@ -8,7 +8,6 @@
 
 #include "api/ROCKProviderApi.h"
 #include "redux/MotionLibraryStore.h"
-#include "redux/SpatialReloadController.h"
 #include "redux/WeaponClipMotionHarvest.h"
 #include "redux/WeaponClipStrokePolicy.h"
 #include "redux/WeaponPartDriveSandbox.h"
@@ -122,29 +121,6 @@ namespace redux
             std::array<DrivePartCacheEntry, WeaponPartMotionLearner::kMaxActiveRecorders> entries{};
         };
 
-        struct SpatialReloadBoundGroup
-        {
-            std::uint32_t eligiblePartCount{ 0 };
-            std::array<WeaponPartDriveSandbox::EligiblePart, WeaponPartDriveSandbox::kMaxEligibleParts>
-                eligibleParts{};
-        };
-
-        struct SpatialReloadProfileBinding
-        {
-            std::uint64_t generationKey{ 0 };
-            bool attempted{ false };
-            bool valid{ false };
-            std::uint32_t groupCount{ 0 };
-            std::array<SpatialReloadBoundGroup, motion_library::kMaxSpatialReloadGroups> groups{};
-            // Union of every group's concrete grip body. Movement preview
-            // exposes all groups at once; the controller selects the group
-            // from the body actually gripped.
-            std::uint32_t eligiblePartCount{ 0 };
-            std::array<WeaponPartDriveSandbox::EligiblePart,
-                WeaponPartDriveSandbox::kMaxEligibleParts>
-                eligibleParts{};
-        };
-
         // Parts driven by our own drive targets within the last lease window;
         // their observations are untrusted (leaders match by bodyId,
         // followers by source name).
@@ -165,12 +141,6 @@ namespace redux
          * allowlisted-but-unmapped exclusions whenever it actually changes.
          */
         void refreshEligibleParts(std::uint32_t weaponFormId);
-        void refreshSpatialReloadProfileBinding(std::uint64_t generationKey);
-        [[nodiscard]] const motion_library::SpatialReloadProfile* spatialReloadProfile() const;
-        [[nodiscard]] bool spatialReloadProfileReady(std::uint64_t generationKey) const;
-        void playSpatialPreviewSounds(
-            const motion_library::SpatialReloadProfile& profile,
-            const spatial_reload::Controller::FrameOutput& output);
         void observeWeaponPartMotion(RE::NiNode* weaponNode, std::uint64_t generationKey, std::uint32_t weaponFormId);
         void updateWeaponClipHarvestWalk(RE::NiNode* weaponNode, std::uint64_t generationKey, std::uint32_t weaponFormId);
         void drainWeaponClipHarvest(RE::NiNode* weaponNode, std::uint64_t generationKey, std::uint32_t weaponFormId);
@@ -222,13 +192,7 @@ namespace redux
 
         WeaponPartMotionLearner _learner{};
         WeaponPartDriveSandbox _sandbox{};
-        spatial_reload::Controller _spatialReloadController{};
         DrivePartCache _drivePartCache{};
-        SpatialReloadProfileBinding _spatialReloadBinding{};
-        // Direct-audio resolution failures are logged once per mapped event
-        // for the equipped profile; successful edge crossings remain visible.
-        std::array<bool, motion_library::kMaxSpatialReloadEvents>
-            _spatialPreviewSoundFailureLogged{};
         // Resolved attach-only set + the state it was computed from.
         std::uint32_t _eligiblePartCount{ 0 };
         std::array<WeaponPartDriveSandbox::EligiblePart, WeaponPartDriveSandbox::kMaxEligibleParts> _eligibleParts{};

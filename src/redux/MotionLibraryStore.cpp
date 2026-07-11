@@ -62,20 +62,6 @@ namespace redux::motion_library
             component += suffix;
             return component;
         }
-
-        std::string libraryFileName(const FormRef& weapon)
-        {
-            char idText[16]{};
-            std::snprintf(idText, sizeof(idText), "%08X", weapon.localFormId);
-            return collisionSafePluginComponent(weapon.plugin) + "_" + idText + ".json";
-        }
-
-        // Read-only profiles shipped with the mod. A user file in Documents
-        // always wins; this location only supplies a profile when no user
-        // override exists. Mod-manager deployment maps this relative Data
-        // path into the game exactly like the DLL.
-        constexpr const char* kBundledLibraryDirectory =
-            R"(Data\F4SE\Plugins\PAPERReduxMotionLibrary)";
     }
 
     MotionLibraryStore::MotionLibraryStore() :
@@ -125,7 +111,9 @@ namespace redux::motion_library
 
     std::string MotionLibraryStore::filePathForWeapon(const FormRef& weapon) const
     {
-        return _directory + "\\" + libraryFileName(weapon);
+        char idText[16]{};
+        std::snprintf(idText, sizeof(idText), "%08X", weapon.localFormId);
+        return _directory + "\\" + collisionSafePluginComponent(weapon.plugin) + "_" + idText + ".json";
     }
 
     std::string MotionLibraryStore::captureFilePathForWeapon(const FormRef& weapon) const
@@ -154,24 +142,14 @@ namespace redux::motion_library
             std::snprintf(idText, sizeof(idText), "%08X", weapon.localFormId);
             const auto legacyPath = _directory + "\\" + sanitizeForFileName(weapon.plugin) + "_" + idText + ".json";
             ec.clear();
-            if (legacyPath != path && std::filesystem::exists(legacyPath, ec)) {
-                path = legacyPath;
-                RDX_LOG_WARN(Config,
-                    "Motion library: loading legacy sanitized filename '{}' for plugin '{}'; the next save uses a collision-safe hash suffix",
-                    std::filesystem::path(path).filename().string(),
-                    weapon.plugin);
-            } else {
-                ec.clear();
-                const auto bundledPath =
-                    std::filesystem::path(kBundledLibraryDirectory) / libraryFileName(weapon);
-                if (!std::filesystem::exists(bundledPath, ec)) {
-                    return false;  // absent file: normal, empty error
-                }
-                path = bundledPath.string();
-                RDX_LOG_INFO(Config,
-                    "Motion library: loading bundled curated profile '{}' (no user override present)",
-                    bundledPath.filename().string());
+            if (legacyPath == path || !std::filesystem::exists(legacyPath, ec)) {
+                return false;  // absent file: normal, empty error
             }
+            path = legacyPath;
+            RDX_LOG_WARN(Config,
+                "Motion library: loading legacy sanitized filename '{}' for plugin '{}'; the next save uses a collision-safe hash suffix",
+                std::filesystem::path(path).filename().string(),
+                weapon.plugin);
         }
         std::ifstream stream(path, std::ios::binary);
         if (!stream) {

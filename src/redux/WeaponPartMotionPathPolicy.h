@@ -59,7 +59,6 @@ namespace redux::weapon_part_motion_path
     inline constexpr float kReplaceExcursionRatio = 1.02f;
 
     inline Vec3 sub(const Vec3& a, const Vec3& b) { return Vec3{ a.x - b.x, a.y - b.y, a.z - b.z }; }
-    inline Vec3 add(const Vec3& a, const Vec3& b) { return Vec3{ a.x + b.x, a.y + b.y, a.z + b.z }; }
     inline float dot(const Vec3& a, const Vec3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
     inline float length(const Vec3& a) { return std::sqrt(dot(a, a)); }
 
@@ -82,40 +81,6 @@ namespace redux::weapon_part_motion_path
         }
         const float inv = 1.0f / std::sqrt(lenSq);
         return Quat{ q.w * inv, q.x * inv, q.y * inv, q.z * inv };
-    }
-
-    inline Quat quatConjugate(const Quat& q)
-    {
-        const auto normalized = quatNormalizeOrIdentity(q);
-        return Quat{ normalized.w, -normalized.x, -normalized.y, -normalized.z };
-    }
-
-    inline Quat quatMultiply(const Quat& a, const Quat& b)
-    {
-        return quatNormalizeOrIdentity(Quat{
-            a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
-            a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
-            a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
-            a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
-        });
-    }
-
-    inline Vec3 quatRotate(const Quat& q, const Vec3& v)
-    {
-        const auto n = quatNormalizeOrIdentity(q);
-        const Vec3 u{ n.x, n.y, n.z };
-        const float uu = dot(u, u);
-        const float uv = dot(u, v);
-        const Vec3 cross{
-            u.y * v.z - u.z * v.y,
-            u.z * v.x - u.x * v.z,
-            u.x * v.y - u.y * v.x,
-        };
-        return Vec3{
-            2.0f * uv * u.x + (n.w * n.w - uu) * v.x + 2.0f * n.w * cross.x,
-            2.0f * uv * u.y + (n.w * n.w - uu) * v.y + 2.0f * n.w * cross.y,
-            2.0f * uv * u.z + (n.w * n.w - uu) * v.z + 2.0f * n.w * cross.z,
-        };
     }
 
     // Normalized linear interpolation along the shorter arc; adequate for the
