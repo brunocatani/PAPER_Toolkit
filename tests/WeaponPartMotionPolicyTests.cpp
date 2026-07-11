@@ -1,3 +1,4 @@
+#include "redux/AuthoritativeReloadController.h"
 #include "redux/MotionLibraryFormat.h"
 #include "redux/RichMotionCaptureFormat.h"
 #include "redux/WeaponClipStrokePolicy.h"
@@ -11,6 +12,9 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 
 #include <nlohmann/json.hpp>
 
@@ -754,6 +758,118 @@ int main()
         ok &= expectFalse("garbage text fails closed", parse("not json at all {", garbage, nullptr));
         ok &= expectFalse("future format version fails closed",
             parse(R"({"format": 999, "weapon": {"plugin": "a.esp", "id": "0x1"}, "parts": []})", garbage, nullptr));
+    }
+
+    {
+        // The bundled Ozzy profile is itself a regression fixture: validate
+        // the exact shipped file, its format round-trip, and the contiguous
+        // four-stage controller contract including all 15 one-shot events.
+        using namespace redux::motion_library;
+        using redux::authoritative_reload::Controller;
+
+        const auto profilePath = std::filesystem::path(PAPER_REDUX_TEST_SOURCE_DIR) /
+            "data" / "MotionLibrary" / "Ozzys_MCPR-300.esp_000020A6.json";
+        std::ifstream profileStream(profilePath, std::ios::binary);
+        ok &= expectTrue("bundled Ozzy profile opens", static_cast<bool>(profileStream));
+        std::ostringstream profileBuffer;
+        profileBuffer << profileStream.rdbuf();
+        WeaponLibrary ozzy;
+        std::string profileError;
+        ok &= expectTrue("bundled Ozzy profile parses", parse(profileBuffer.str(), ozzy, &profileError));
+        ok &= expectTrue("bundled Ozzy profile parse reports no error", profileError.empty());
+        ok &= expectTrue("Ozzy profile is curated authoritative format 2",
+            ozzy.formatVersion == 2 && ozzy.curated && ozzy.authoritativeReload.used);
+        ok &= expectEqual("Ozzy group count", ozzy.authoritativeReload.groups.size(), std::size_t{ 2 });
+        ok &= expectEqual("Ozzy stage count", ozzy.authoritativeReload.stages.size(), std::size_t{ 4 });
+        ok &= expectEqual("Ozzy event count", ozzy.authoritativeReload.events.size(), std::size_t{ 15 });
+        ok &= expectTrue("Ozzy receiver OMOD identity retained",
+            !ozzy.authoritativeReload.groups.empty() &&
+                !ozzy.authoritativeReload.groups[0].grips.empty() &&
+                ozzy.authoritativeReload.groups[0].grips[0].omod.plugin == "Ozzys_MCPR-300.esp" &&
+                ozzy.authoritativeReload.groups[0].grips[0].omod.localFormId == 0x1F48u);
+
+        WeaponLibrary ozzyRoundTrip;
+        profileError.clear();
+        ok &= expectTrue("authoritative profile serialize/parse round-trips",
+            parse(serialize(ozzy), ozzyRoundTrip, &profileError));
+        ok &= expectTrue("authoritative round-trip reports no error", profileError.empty());
+        ok &= expectEqual("authoritative round-trip stage count",
+            ozzyRoundTrip.authoritativeReload.stages.size(), std::size_t{ 4 });
+        ok &= expectEqual("authoritative round-trip inherited follower count",
+            ozzyRoundTrip.authoritativeReload.groups[1].drivers[0].inheritedFollowers.size(),
+            std::size_t{ 19 });
+
+        Controller controller;
+        const auto& profile = ozzy.authoritativeReload;
+        const auto makeInput = [&](float seconds, bool grip, std::uint64_t session = 1) {
+            return Controller::FrameInput{
+                .clip = {
+                    .active = true,
+                    .sessionId = session,
+                    .clipName = "Animations\\44Pistol\\WPNReload.hkt",
+                    .durationSeconds = profile.expectedDurationSeconds,
+                    .cropStartSeconds = 0.0f,
+                    .croppedDurationSeconds = profile.expectedDurationSeconds,
+                    .fraction = seconds / profile.expectedDurationSeconds,
+                },
+                .currentGroupGripActive = grip,
+            };
+        };
+
+        std::uint32_t emittedEvents = 0;
+        auto output = controller.update(&profile, makeInput(0.0f, false));
+        emittedEvents += output.eventCount;
+        ok &= expectTrue("authoritative controller captures valid Ozzy clip",
+            output.newSession && output.ownsClipSession && output.stageIndex == 0 && output.groupIndex == 0);
+
+        for (std::uint32_t stageIndex = 0; stageIndex < profile.stages.size(); ++stageIndex) {
+            output = controller.update(
+                &profile, makeInput(profile.stages[stageIndex].endSeconds, true));
+            emittedEvents += output.eventCount;
+            ok &= expectTrue("stage end waits for physical grip release",
+                output.awaitingRelease && output.stageIndex == stageIndex && !output.releaseClip);
+
+            output = controller.update(
+                &profile, makeInput(profile.stages[stageIndex].endSeconds, false));
+            emittedEvents += output.eventCount;
+            if (stageIndex + 1 < profile.stages.size()) {
+                ok &= expectTrue("grip release advances exactly one stage",
+                    output.stageChanged && output.stageIndex == stageIndex + 1 && !output.releaseClip);
+            } else {
+                ok &= expectTrue("final grip release returns clip to native",
+                    output.releaseClip && !output.ownsClipSession);
+            }
+        }
+        ok &= expectEqual("all Ozzy timeline events emit exactly once", emittedEvents, 15u);
+
+        auto badClip = makeInput(0.0f, false, 2);
+        badClip.clip.durationSeconds += 0.2f;
+        badClip.clip.croppedDurationSeconds += 0.2f;
+        output = controller.update(&profile, badClip);
+        ok &= expectTrue("duration-mismatched authoritative clip fails closed",
+            output.newSession && output.releaseClip &&
+                output.rejection == Controller::RejectionReason::DurationMismatch);
+
+        WeaponLibrary invalidProfile;
+        ok &= expectFalse("authoritative profile cannot be auto-overwritable",
+            parse(R"({"format":2,"weapon":{"plugin":"a.esp","id":"0x1"},"curated":false,"parts":[],"authoritativeReload":{}})",
+                invalidProfile, nullptr));
+        ok &= expectFalse("hand-edited wrong JSON field types fail closed without escaping",
+            parse(R"({"format":"two","weapon":{"plugin":"a.esp","id":"0x1"},"parts":[]})",
+                invalidProfile, nullptr));
+
+        auto invalidOmod = nlohmann::json::parse(serialize(ozzy));
+        invalidOmod["authoritativeReload"]["groups"][0]["grips"][0]["omod"] = {
+            { "plugin", "" }, { "id", "0x00000001" }
+        };
+        ok &= expectFalse("partial authoritative OMOD identity fails closed",
+            parse(invalidOmod.dump(), invalidProfile, nullptr));
+
+        auto connectorGrip = nlohmann::json::parse(serialize(ozzy));
+        connectorGrip["authoritativeReload"]["groups"][0]["grips"][0]["source"] =
+            "P-Bolt";
+        ok &= expectFalse("P-* connection point cannot become a physical grip",
+            parse(connectorGrip.dump(), invalidProfile, nullptr));
     }
 
     {

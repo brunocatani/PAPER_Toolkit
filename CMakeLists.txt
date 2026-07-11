@@ -63,11 +63,16 @@ source_group(TREE ${BUILD_DIR} FILES ${BUILD_DIR}/include/Version.h)
 
 file(GLOB_RECURSE headers CONFIGURE_DEPENDS "${SOURCE_DIR}/*.h")
 file(GLOB_RECURSE sources CONFIGURE_DEPENDS "${SOURCE_DIR}/*.cpp")
+file(GLOB bundled_motion_profiles CONFIGURE_DEPENDS "${ROOT_DIR}/data/MotionLibrary/*.json")
 source_group(TREE ${ROOT_DIR} FILES ${headers} ${sources})
+if(bundled_motion_profiles)
+  source_group("data\\MotionLibrary" FILES ${bundled_motion_profiles})
+endif()
 
 add_library(${PROJECT_NAME} SHARED
   ${headers}
   ${sources}
+  ${bundled_motion_profiles}
   ${BUILD_DIR}/include/Version.h
   ${BUILD_DIR}/version.rc
   "${ROOT_DIR}/.clang-format"
@@ -162,6 +167,16 @@ if(POST_BUILD_COPY_PLUGIN)
         COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:${PROJECT_NAME}> "${copy_path}/F4SE/Plugins/"
         COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_PDB_FILE:${PROJECT_NAME}> "${copy_path}/F4SE/Plugins/"
       )
+      if(bundled_motion_profiles)
+        add_custom_command(
+          TARGET ${PROJECT_NAME}
+          POST_BUILD
+          COMMENT "Copying bundled authoritative motion profiles to '${copy_path}/F4SE/Plugins/PAPERReduxMotionLibrary/'"
+          COMMAND ${CMAKE_COMMAND} -E make_directory "${copy_path}/F4SE/Plugins/PAPERReduxMotionLibrary/"
+          COMMAND ${CMAKE_COMMAND} -E copy_if_different ${bundled_motion_profiles} "${copy_path}/F4SE/Plugins/PAPERReduxMotionLibrary/"
+          COMMAND_EXPAND_LISTS
+        )
+      endif()
     endforeach()
   else()
     message(FATAL_ERROR "Variable 'COPY_PLUGIN_BASE_PATH' is not defined but 'POST_BUILD_COPY_PLUGIN' is true!")
@@ -181,13 +196,18 @@ if(BUILD_PAPER_REDUX_TESTS)
   find_package(nlohmann_json CONFIG REQUIRED)
   add_executable(PAPERReduxWeaponPartMotionPolicyTests
     "${ROOT_DIR}/tests/WeaponPartMotionPolicyTests.cpp"
+    "${SOURCE_DIR}/redux/AuthoritativeReloadController.cpp"
+    "${SOURCE_DIR}/redux/AuthoritativeReloadProfileFormat.cpp"
     "${SOURCE_DIR}/redux/WeaponPartMotionLearner.cpp"
     "${SOURCE_DIR}/redux/MotionLibraryFormat.cpp"
     "${SOURCE_DIR}/redux/RichMotionCaptureFormat.cpp"
   )
   target_compile_features(PAPERReduxWeaponPartMotionPolicyTests PRIVATE cxx_std_23)
   target_include_directories(PAPERReduxWeaponPartMotionPolicyTests PRIVATE ${SOURCE_DIR})
-  target_compile_definitions(PAPERReduxWeaponPartMotionPolicyTests PRIVATE REDUX_POLICY_TEST_NO_RUNTIME_LOGGER=1)
+  target_compile_definitions(PAPERReduxWeaponPartMotionPolicyTests PRIVATE
+    REDUX_POLICY_TEST_NO_RUNTIME_LOGGER=1
+    PAPER_REDUX_TEST_SOURCE_DIR="${ROOT_DIR}"
+  )
   target_link_libraries(PAPERReduxWeaponPartMotionPolicyTests PRIVATE nlohmann_json::nlohmann_json)
   add_test(NAME PAPERReduxWeaponPartMotionPolicyTests COMMAND $<TARGET_FILE:PAPERReduxWeaponPartMotionPolicyTests>)
   set_tests_properties(PAPERReduxWeaponPartMotionPolicyTests PROPERTIES LABELS "policy")

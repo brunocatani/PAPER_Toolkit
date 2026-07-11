@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "api/ROCKProviderApi.h"
+#include "redux/AuthoritativeReloadController.h"
 #include "redux/MotionLibraryStore.h"
 #include "redux/WeaponClipMotionHarvest.h"
 #include "redux/WeaponClipStrokePolicy.h"
@@ -121,6 +122,22 @@ namespace redux
             std::array<DrivePartCacheEntry, WeaponPartMotionLearner::kMaxActiveRecorders> entries{};
         };
 
+        struct AuthoritativeBoundGroup
+        {
+            std::uint32_t eligiblePartCount{ 0 };
+            std::array<WeaponPartDriveSandbox::EligiblePart, WeaponPartDriveSandbox::kMaxEligibleParts>
+                eligibleParts{};
+        };
+
+        struct AuthoritativeProfileBinding
+        {
+            std::uint64_t generationKey{ 0 };
+            bool attempted{ false };
+            bool valid{ false };
+            std::uint32_t groupCount{ 0 };
+            std::array<AuthoritativeBoundGroup, motion_library::kMaxAuthoritativeGroups> groups{};
+        };
+
         // Parts driven by our own drive targets within the last lease window;
         // their observations are untrusted (leaders match by bodyId,
         // followers by source name).
@@ -141,6 +158,12 @@ namespace redux
          * allowlisted-but-unmapped exclusions whenever it actually changes.
          */
         void refreshEligibleParts(std::uint32_t weaponFormId);
+        void refreshAuthoritativeProfileBinding(std::uint64_t generationKey);
+        [[nodiscard]] const motion_library::AuthoritativeReloadProfile* authoritativeProfile() const;
+        [[nodiscard]] bool authoritativeProfileReady(std::uint64_t generationKey) const;
+        void dispatchAuthoritativeEvents(
+            const motion_library::AuthoritativeReloadProfile& profile,
+            const authoritative_reload::Controller::FrameOutput& output);
         void observeWeaponPartMotion(RE::NiNode* weaponNode, std::uint64_t generationKey, std::uint32_t weaponFormId);
         void updateWeaponClipHarvestWalk(RE::NiNode* weaponNode, std::uint64_t generationKey, std::uint32_t weaponFormId);
         void drainWeaponClipHarvest(RE::NiNode* weaponNode, std::uint64_t generationKey, std::uint32_t weaponFormId);
@@ -192,7 +215,9 @@ namespace redux
 
         WeaponPartMotionLearner _learner{};
         WeaponPartDriveSandbox _sandbox{};
+        authoritative_reload::Controller _authoritativeController{};
         DrivePartCache _drivePartCache{};
+        AuthoritativeProfileBinding _authoritativeBinding{};
         // Resolved attach-only set + the state it was computed from.
         std::uint32_t _eligiblePartCount{ 0 };
         std::array<WeaponPartDriveSandbox::EligiblePart, WeaponPartDriveSandbox::kMaxEligibleParts> _eligibleParts{};

@@ -1,0 +1,272 @@
+{
+  "format": 2,
+  "weapon": {
+    "plugin": "Ozzys_MCPR-300.esp",
+    "id": "0x000020A6"
+  },
+  "weaponName": "MCPR-300 - Watchdog 141",
+  "curated": true,
+  "parts": [],
+  "authoritativeReload": {
+    "profileVersion": 1,
+    "archetype": "bolt_action_detachable_magazine",
+    "sourceCapture": "Ozzys_MCPR-300.esp_000020A6.capture.jsonl",
+    "notes": "Curated from activated WPNReload activity 173. The live engine clip owns every transform; PAPER owns stage windows, exact ROCK grip identities, and one-shot annotation replay. This profile intentionally supersedes every sMotionPathMode value for this weapon.",
+    "clip": {
+      "nameContains": "WPNReload",
+      "durationSeconds": 6.583333492279053,
+      "durationToleranceSeconds": 0.05,
+      "releaseSeconds": 5.75
+    },
+    "groups": [
+      {
+        "id": "bolt_action",
+        "role": "unlock_pull_push_lock",
+        "notes": "P-Bolt is a static connection subnode inside the bolt NIF, not the mesh or the whole part. The mechanism has three independent animation drivers. Helpers and meshes inherit from their driver and must never be driven separately.",
+        "grips": [
+          {
+            "source": "MCPR_3000_SEModelMesh_022:0",
+            "omod": {
+              "plugin": "Ozzys_MCPR-300.esp",
+              "id": "0x00001F48"
+            },
+            "omodName": "[Receiver] Standard",
+            "role": "bolt_handle"
+          },
+          {
+            "source": "MCPR_3000_SEModelMesh_007:0",
+            "omod": {
+              "plugin": "Ozzys_MCPR-300.esp",
+              "id": "0x00001F48"
+            },
+            "omodName": "[Receiver] Standard",
+            "role": "bolt_slide"
+          },
+          {
+            "source": "MCPR_3000_SEModelMesh_008:0",
+            "role": "bolt_body"
+          }
+        ],
+        "drivers": [
+          {
+            "node": "WeaponExtra2",
+            "role": "handle_unlock_lock_rotation",
+            "inheritedFollowers": [
+              "WeaponExtra2Helper",
+              "MCPR_3000_SEModelMesh_022:0"
+            ]
+          },
+          {
+            "node": "WeaponExtra1",
+            "role": "bolt_linear_slide",
+            "inheritedFollowers": [
+              "WeaponExtra1Helper",
+              "MCPR_3000_SEModelMesh_007:0"
+            ]
+          },
+          {
+            "node": "WeaponBolt",
+            "role": "main_bolt_combined_rotation_translation",
+            "inheritedFollowers": [
+              "WeaponBoltHelper",
+              "MCPR_3000_SEModelMesh_008:0"
+            ]
+          }
+        ]
+      },
+      {
+        "id": "magazine_exchange",
+        "role": "latch_extract_visual_swap_insert_seat",
+        "notes": "WeaponMagazine drives the physical magazine hierarchy through the P-Mag connection subnode inside the magazine NIF; P-Mag is not the mesh, whole part, or grip. WeaponOptics2 is a separately animated ammunition/replacement visual despite its misleading name. WeaponExtra3 is the magazine latch; all three share stage time but retain independent tracks.",
+        "grips": [
+          {
+            "source": "MCPR_3000_SEModelMesh_021:0",
+            "role": "magazine_body"
+          },
+          {
+            "source": "GM6_Magazine:13",
+            "role": "magazine_body_variant"
+          },
+          {
+            "source": "XMag_SEModelMesh_083:0",
+            "role": "magazine_body_variant"
+          }
+        ],
+        "drivers": [
+          {
+            "node": "WeaponMagazine",
+            "role": "physical_magazine_animation_driver",
+            "inheritedFollowers": [
+              "WeaponMagazineHelper",
+              "WeaponMagazineChild2",
+              "WeaponMagazineChild2:150",
+              "WeaponMagazineChild3",
+              "WeaponMagazineChild3:154",
+              "WeaponMagazineChild4",
+              "WeaponMagazineChild4:158",
+              "WeaponMagazineChild5",
+              "WeaponMagazineChild5:162",
+              "WeaponMagazineChild6",
+              "WeaponMagazineChild6:166",
+              "WeaponMagazineChild7",
+              "WeaponMagazineChild7:170",
+              "P-Mag",
+              "WeaponMagazineChild1",
+              "WeaponMagazineChild1Helper",
+              "MCPR_3000_SEModelMesh_021:0",
+              "GM6_Magazine:13",
+              "XMag_SEModelMesh_083:0"
+            ]
+          },
+          {
+            "node": "WeaponOptics2",
+            "role": "replacement_magazine_ammunition_visual",
+            "inheritedFollowers": [
+              "WeaponOptics2Helper",
+              "ammo_unspent_338nm_LOD0_SEModelMesh_001:0",
+              "ammo_unspent_338nm_LOD0_SEModelMesh:0",
+              "WeaponOptics2Helper:114",
+              "WeaponOptics2Helper:117",
+              "WeaponOptics2Helper:125",
+              "WeaponOptics2Helper:126",
+              "WeaponOptics2Helper:128",
+              "WeaponOptics2Helper:129"
+            ]
+          },
+          {
+            "node": "WeaponExtra3",
+            "role": "magazine_latch",
+            "inheritedFollowers": [
+              "WeaponExtra3Helper",
+              "MCPR_3000_SEModelMesh_003:0"
+            ]
+          }
+        ]
+      }
+    ],
+    "stages": [
+      {
+        "id": "bolt_open",
+        "group": "bolt_action",
+        "startSeconds": 0.0,
+        "endSeconds": 1.0416667461395264,
+        "notes": "Raise/preload, rotate handle unlocked, then pull the bolt fully rearward. Release the grip at the rear stop to advance."
+      },
+      {
+        "id": "magazine_remove",
+        "group": "magazine_exchange",
+        "startSeconds": 1.0416667461395264,
+        "endSeconds": 2.4166667461395264,
+        "notes": "Operate the latch, acquire the magazine, and pull until the authored Magout contact. Release at the out stop."
+      },
+      {
+        "id": "magazine_insert",
+        "group": "magazine_exchange",
+        "startSeconds": 2.4166667461395264,
+        "endSeconds": 4.5416669845581055,
+        "notes": "Traverse the authored visual swap, insert the replacement magazine, release the latch, and seat it through Magslap."
+      },
+      {
+        "id": "bolt_close",
+        "group": "bolt_action",
+        "startSeconds": 4.5416669845581055,
+        "endSeconds": 5.75,
+        "notes": "Push the bolt forward, rotate the handle locked, commit ReloadComplete, and play the end contact before native clip completion resumes."
+      }
+    ],
+    "events": [
+      {
+        "id": "raise",
+        "timeSeconds": 0.1666666716337204,
+        "kind": "sound",
+        "animationEvent": "Soundplay.WPNMCPR-300_XMags_Empty_Raise",
+        "notes": "Captured annotation payload."
+      },
+      {
+        "id": "show_loaded_magazine",
+        "timeSeconds": 0.2083333432674408,
+        "kind": "visibility",
+        "animationEvent": "UnCullBone.WeaponMagazineChild1"
+      },
+      {
+        "id": "hide_replacement_visual",
+        "timeSeconds": 0.25,
+        "kind": "visibility",
+        "animationEvent": "Cullbone.WeaponOptics2"
+      },
+      {
+        "id": "bolt_back",
+        "timeSeconds": 0.4583333432674408,
+        "kind": "sound",
+        "animationEvent": "Soundplay.WPNMCPR-300_XMags_Empty_Boltback"
+      },
+      {
+        "id": "weapon_grab",
+        "timeSeconds": 1.375,
+        "kind": "sound",
+        "animationEvent": "Soundplay.WPNMCPR-300_XMags_Empty_Grab"
+      },
+      {
+        "id": "magazine_grab",
+        "timeSeconds": 1.875,
+        "kind": "sound",
+        "animationEvent": "Soundplay.WPNMCPR-300_XMags_Empty_Maggrab"
+      },
+      {
+        "id": "magazine_out",
+        "timeSeconds": 2.4166667461395264,
+        "kind": "sound",
+        "animationEvent": "Soundplay.WPNMCPR-300_XMags_Empty_Magout"
+      },
+      {
+        "id": "show_replacement_visual",
+        "timeSeconds": 3.25,
+        "kind": "visibility",
+        "animationEvent": "Uncullbone.WeaponOptics2"
+      },
+      {
+        "id": "hide_removed_magazine",
+        "timeSeconds": 3.2916667461395264,
+        "kind": "visibility",
+        "animationEvent": "Cullbone.WeaponMagazineChild1"
+      },
+      {
+        "id": "magazine_rattle",
+        "timeSeconds": 3.3333334922790527,
+        "kind": "sound",
+        "animationEvent": "Soundplay.WPNMCPR-300_XMags_Empty_Rattle"
+      },
+      {
+        "id": "magazine_in",
+        "timeSeconds": 3.6666667461395264,
+        "kind": "sound",
+        "animationEvent": "Soundplay.WPNMCPR-300_XMags_Empty_Magin"
+      },
+      {
+        "id": "magazine_slap",
+        "timeSeconds": 4.5416669845581055,
+        "kind": "sound",
+        "animationEvent": "Soundplay.WPNMCPR-300_XMags_Empty_Magslap"
+      },
+      {
+        "id": "bolt_close",
+        "timeSeconds": 5.2916669845581055,
+        "kind": "sound",
+        "animationEvent": "Soundplay.WPNMCPR-300_XMags_Empty_Boltclose"
+      },
+      {
+        "id": "reload_complete",
+        "timeSeconds": 5.7083334922790527,
+        "kind": "gameplay",
+        "animationEvent": "reloadComplete",
+        "notes": "Canonical graph trigger name resolved from event id 56; this is the captured ammo-commit boundary."
+      },
+      {
+        "id": "reload_end_contact",
+        "timeSeconds": 5.75,
+        "kind": "sound",
+        "animationEvent": "Soundplay.WPNMCPR-300_XMags_Empty_End"
+      }
+    ]
+  }
+}

@@ -174,6 +174,16 @@ namespace redux
             bool clipScrubSessionActive{ false };
             std::uint64_t clipScrubSessionId{ 0 };
             float clipScrubFraction{ 0.0f };
+            /*
+             * Optional authoritative-profile window. The pursuit
+             * controller is unchanged, but its requested time can never
+             * cross into another physical interaction stage. The profile
+             * coordinator advances the window only after the current grip
+             * releases at the authored end pose.
+             */
+            bool clipScrubWindowEnabled{ false };
+            float clipScrubWindowMinFraction{ 0.0f };
+            float clipScrubWindowMaxFraction{ 1.0f };
             // Per-part attach-only whitelist for the current weapon
             // generation; targets reinstall only when this set changes.
             std::uint32_t eligiblePartCount{ 0 };
@@ -251,6 +261,8 @@ namespace redux
              */
             bool clipScrub{ false };
             std::uint64_t clipScrubSessionId{ 0 };
+            float clipScrubWindowMinFraction{ 0.0f };
+            float clipScrubWindowMaxFraction{ 1.0f };
             weapon_part_motion_path::Vec3 scrubPartStartTranslate{};
             weapon_part_motion_path::Vec3 scrubPrevPartTranslate{};
             float scrubPrevFraction{ 0.0f };

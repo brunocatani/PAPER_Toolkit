@@ -25,7 +25,7 @@
  */
 namespace redux::motion_library
 {
-    inline constexpr std::uint32_t kFormatVersion = 1;
+    inline constexpr std::uint32_t kFormatVersion = 2;
 
     // Load-order-independent form identity; empty = none (base-weapon part).
     struct FormRef
@@ -60,6 +60,100 @@ namespace redux::motion_library
         bool authoredFallback{ false };
     };
 
+    /*
+     * Format-v2 authoritative reload profile.
+     *
+     * A profile is intentionally different from a collection of learned
+     * paths. It binds one verified live reload clip to explicit interaction
+     * groups and contiguous stage windows. While the profile is active the
+     * engine remains the pose oracle for the complete weapon rig; PAPER only
+     * controls clip time and which concrete ROCK collider may manipulate the
+     * current stage. This preserves inherited scene-graph motion and avoids
+     * independently driving a parent and its descendants.
+     *
+     * These are equip-scoped values loaded from disk, never per-frame
+     * allocations. Fixed runtime limits are validated by the parser before a
+     * profile can become authoritative.
+     */
+    inline constexpr std::uint32_t kAuthoritativeProfileVersion = 1;
+    inline constexpr std::size_t kMaxAuthoritativeGroups = 8;
+    inline constexpr std::size_t kMaxAuthoritativeGripsPerGroup = 32;
+    inline constexpr std::size_t kMaxAuthoritativeDriversPerGroup = 16;
+    inline constexpr std::size_t kMaxAuthoritativeFollowersPerDriver = 64;
+    inline constexpr std::size_t kMaxAuthoritativeStages = 16;
+    inline constexpr std::size_t kMaxAuthoritativeEvents = 64;
+
+    struct AuthoritativeGripSource
+    {
+        std::string sourceName;
+        FormRef omod;
+        // Informational only; identity remains the FormRef above.
+        std::string omodName;
+        std::string role;
+    };
+
+    struct AuthoritativeDriver
+    {
+        // Independently animated rig node driven by the live clip.
+        std::string node;
+        std::string role;
+        // Nodes that must inherit this driver's motion and therefore must
+        // never be independently driven by PAPER.
+        std::vector<std::string> inheritedFollowers;
+    };
+
+    struct AuthoritativeInteractionGroup
+    {
+        std::string id;
+        std::string role;
+        std::string notes;
+        std::vector<AuthoritativeGripSource> grips;
+        std::vector<AuthoritativeDriver> drivers;
+    };
+
+    struct AuthoritativeStage
+    {
+        std::string id;
+        std::string groupId;
+        float startSeconds{ 0.0f };
+        float endSeconds{ 0.0f };
+        std::string notes;
+    };
+
+    enum class AuthoritativeEventKind : std::uint8_t
+    {
+        Sound = 0,
+        Visibility = 1,
+        Gameplay = 2,
+    };
+
+    struct AuthoritativeTimelineEvent
+    {
+        std::string id;
+        float timeSeconds{ 0.0f };
+        AuthoritativeEventKind kind{ AuthoritativeEventKind::Sound };
+        // Exact annotation payload sent to the player's animation graph.
+        std::string animationEvent;
+        std::string notes;
+    };
+
+    struct AuthoritativeReloadProfile
+    {
+        bool used{ false };
+        std::uint32_t profileVersion{ kAuthoritativeProfileVersion };
+        std::string archetype;
+        std::string sourceCapture;
+        std::string notes;
+        std::string clipNameContains;
+        float expectedDurationSeconds{ 0.0f };
+        float durationToleranceSeconds{ 0.05f };
+        // Mode-2 control ends here; the engine resumes natively afterward.
+        float releaseSeconds{ 0.0f };
+        std::vector<AuthoritativeInteractionGroup> groups;
+        std::vector<AuthoritativeStage> stages;
+        std::vector<AuthoritativeTimelineEvent> events;
+    };
+
     struct WeaponLibrary
     {
         std::uint32_t formatVersion{ kFormatVersion };
@@ -72,15 +166,20 @@ namespace redux::motion_library
          */
         bool curated{ false };
         std::vector<PartRecord> parts;
+        // When present, this profile supersedes Hybrid/Authored/Learned/
+        // Scrub selection for this weapon only.
+        AuthoritativeReloadProfile authoritativeReload{};
     };
 
     [[nodiscard]] std::string serialize(const WeaponLibrary& library);
 
     /*
      * Fail-closed parse: returns false when the document structure or format
-     * version is unusable. Individual malformed parts/stages (hand-edit
-     * typos) are SKIPPED, not fatal — the first such problem is described in
-     * outError (also set on fatal failures) so the runtime can log it.
+     * version is unusable. Individual malformed legacy motion parts/stages
+     * (hand-edit typos) are SKIPPED, not fatal. An authoritative profile is
+     * an all-or-nothing runtime contract, so any malformed field in it is
+     * fatal. The first problem is described in outError so the runtime can
+     * log it.
      */
     [[nodiscard]] bool parse(std::string_view jsonText, WeaponLibrary& out, std::string* outError);
 }

@@ -401,6 +401,13 @@ namespace redux
                     session.active = true;
                     session.clipScrub = true;
                     session.clipScrubSessionId = input.clipScrubSessionId;
+                    session.clipScrubWindowMinFraction = input.clipScrubWindowEnabled
+                        ? std::clamp(input.clipScrubWindowMinFraction, 0.0f, 1.0f)
+                        : 0.0f;
+                    session.clipScrubWindowMaxFraction = input.clipScrubWindowEnabled
+                        ? std::clamp(input.clipScrubWindowMaxFraction,
+                              session.clipScrubWindowMinFraction, 1.0f)
+                        : 1.0f;
                     session.gripSequence = hand.gripSequence;
                     session.bodyId = hand.bodyId;
                     session.weaponGenerationKey = input.weaponGenerationKey;
@@ -419,10 +426,12 @@ namespace redux
                     session.scrubLastLogDecile =
                         static_cast<std::uint32_t>(input.clipScrubFraction * 10.0f);
                     RDX_LOG_INFO(Weapon,
-                        "WeaponPartDriveSandbox: CLIP-SCRUB grip hand={} part='{}' fraction={:.3f} (pursuit controller live)",
+                        "WeaponPartDriveSandbox: CLIP-SCRUB grip hand={} part='{}' fraction={:.3f} window=[{:.3f},{:.3f}] (pursuit controller live)",
                         handIndex == 1 ? "left" : "right",
                         hand.sourceName,
-                        input.clipScrubFraction);
+                        input.clipScrubFraction,
+                        session.clipScrubWindowMinFraction,
+                        session.clipScrubWindowMaxFraction);
                     continue;
                 }
                 const auto group = learner.findGroup(
@@ -577,7 +586,10 @@ namespace redux
                     fractionStep = kScrubCrawlFractionPerFrame;
                 }
                 fractionStep = std::clamp(fractionStep, -kScrubMaxFractionPerFrame, kScrubMaxFractionPerFrame);
-                const float desired = std::clamp(fraction + fractionStep, 0.0f, 1.0f);
+                const float desired = std::clamp(
+                    fraction + fractionStep,
+                    session.clipScrubWindowMinFraction,
+                    session.clipScrubWindowMaxFraction);
                 if (outClipScrubFraction && outClipScrubFractionValid) {
                     *outClipScrubFraction = desired;
                     *outClipScrubFractionValid = true;

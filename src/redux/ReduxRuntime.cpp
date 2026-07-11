@@ -387,22 +387,34 @@ namespace redux
         _lastRockFrameIndex = snapshot.frameIndex;
         updateRichCaptureState(snapshot);
 
+        auto* weaponNode = reinterpret_cast<RE::NiNode*>(snapshot.weaponNode);
+        const auto generationKey = snapshot.weaponGenerationKey;
+        const auto weaponFormId = snapshot.weaponFormId;
+
+        // Equip-time import precedes profile arming and every consumer. A
+        // format-v2 authoritative file therefore takes effect on the first
+        // complete weapon-generation frame, independent of the INI mode.
+        updateMotionLibrary(weaponFormId);
+        const auto* profile = authoritativeProfile();
+        const bool profilePresent = profile != nullptr;
+        const bool profileReady = authoritativeProfileReady(generationKey);
+        const char* scrubFilter = profilePresent
+            ? profile->clipNameContains.c_str()
+            : g_reduxConfig.clipScrubSweepClipFilter.c_str();
+
         // Keep the sweep probe's view of the INI fresh across hot reloads;
         // one uncontended lock and a small copy per frame.
         weapon_clip_motion_harvest::setScrubSweepConfig(
-            g_reduxConfig.clipScrubSweepTest,
+            !profilePresent && g_reduxConfig.clipScrubSweepTest,
             g_reduxConfig.clipScrubSweepSeconds,
-            g_reduxConfig.clipScrubSweepClipFilter.c_str());
+            scrubFilter);
         // Scrub mode arms the session capture: the next activating clip
         // matching the filter freezes and waits for a hand. Same filter as
         // the sweep probe (the probe wins when both are enabled).
         weapon_clip_motion_harvest::setClipScrubCaptureConfig(
-            g_reduxConfig.motionPathMode == MotionPathMode::ClipScrub,
-            g_reduxConfig.clipScrubSweepClipFilter.c_str());
-
-        auto* weaponNode = reinterpret_cast<RE::NiNode*>(snapshot.weaponNode);
-        const auto generationKey = snapshot.weaponGenerationKey;
-        const auto weaponFormId = snapshot.weaponFormId;
+            profileReady ||
+                (!profilePresent && g_reduxConfig.motionPathMode == MotionPathMode::ClipScrub),
+            scrubFilter);
 
         /*
          * Same call order as the stack had inside ROCK's update: observe the
@@ -412,9 +424,6 @@ namespace redux
          * or zero generation, so holstered/transition frames only end the
          * drive sessions.
          */
-        // Library first: an equip-time import must land before this frame's
-        // observation/eligibility read the learner.
-        updateMotionLibrary(weaponFormId);
         observeWeaponPartMotion(weaponNode, generationKey, weaponFormId);
         drainRichClipCaptures(generationKey, weaponFormId, snapshot.frameIndex);
         drainWeaponClipHarvest(weaponNode, generationKey, weaponFormId);
@@ -1338,6 +1347,8 @@ namespace redux
             _libraryWeaponFormId = weaponFormId;
             _libraryWeaponRef = {};
             _libraryLoaded.reset();
+            _authoritativeBinding = {};
+            _authoritativeController.reset();
             _libraryStableFrames = 0;
             _librarySyncedRevision = _learner.revision();
             _libraryLastRevision = _librarySyncedRevision;
@@ -1364,6 +1375,182 @@ namespace redux
         if (++_libraryStableFrames >= kSaveDebounceFrames) {
             _libraryStableFrames = 0;
             flushMotionLibrarySave();
+        }
+    }
+
+    const motion_library::AuthoritativeReloadProfile* ReduxRuntime::authoritativeProfile() const
+    {
+        if (!_libraryLoaded || !_libraryLoaded->curated ||
+            !_libraryLoaded->authoritativeReload.used) {
+            return nullptr;
+        }
+        return &_libraryLoaded->authoritativeReload;
+    }
+
+    bool ReduxRuntime::authoritativeProfileReady(std::uint64_t generationKey) const
+    {
+        return authoritativeProfile() && generationKey != 0 &&
+            _authoritativeBinding.attempted && _authoritativeBinding.valid &&
+            _authoritativeBinding.generationKey == generationKey;
+    }
+
+    void ReduxRuntime::refreshAuthoritativeProfileBinding(std::uint64_t generationKey)
+    {
+        const auto* profile = authoritativeProfile();
+        if (!profile || generationKey == 0 || _drivePartCache.generationKey != generationKey) {
+            _authoritativeBinding = {};
+            return;
+        }
+        if (_authoritativeBinding.attempted &&
+            _authoritativeBinding.generationKey == generationKey) {
+            return;
+        }
+
+        _authoritativeBinding = {};
+        _authoritativeBinding.attempted = true;
+        _authoritativeBinding.generationKey = generationKey;
+        _authoritativeBinding.groupCount = static_cast<std::uint32_t>(
+            (std::min)(profile->groups.size(), _authoritativeBinding.groups.size()));
+
+        const auto findEntry = [this](std::string_view name, bool physicalOnly,
+                                   std::uint32_t requiredOmod,
+                                   bool& ambiguous) -> const DrivePartCacheEntry* {
+            ambiguous = false;
+            const DrivePartCacheEntry* match = nullptr;
+            for (std::uint32_t i = 0; i < _drivePartCache.count; ++i) {
+                const auto& entry = _drivePartCache.entries[i];
+                if (physicalOnly && entry.observationOnly) {
+                    continue;
+                }
+                const auto entryName = providerFixedStringView(
+                    entry.sourceName.data(), entry.sourceName.size());
+                if (entryName == name &&
+                    (!physicalOnly || entry.omodFormId == requiredOmod)) {
+                    if (match) {
+                        ambiguous = true;
+                        return nullptr;
+                    }
+                    match = &entry;
+                }
+            }
+            return match;
+        };
+        std::string missing;
+        const auto recordMissing = [&missing](std::string_view category, std::string_view name) {
+            if (!missing.empty()) {
+                missing += ", ";
+            }
+            missing += category;
+            missing += ":'";
+            missing.append(name.data(), name.size());
+            missing += "'";
+        };
+
+        for (std::uint32_t groupIndex = 0; groupIndex < _authoritativeBinding.groupCount; ++groupIndex) {
+            const auto& group = profile->groups[groupIndex];
+            auto& bound = _authoritativeBinding.groups[groupIndex];
+
+            // Driver/follower inventory is an executable invariant: if the
+            // exact captured assembly is not present, this profile does not
+            // silently control a different workbench variant.
+            for (const auto& driver : group.drivers) {
+                bool ambiguous = false;
+                if (!findEntry(driver.node, false, 0, ambiguous)) {
+                    recordMissing(ambiguous ? "ambiguous-driver" : "driver", driver.node);
+                }
+                for (const auto& follower : driver.inheritedFollowers) {
+                    ambiguous = false;
+                    if (!findEntry(follower, false, 0, ambiguous)) {
+                        recordMissing(ambiguous ? "ambiguous-follower" : "follower", follower);
+                    }
+                }
+            }
+
+            for (const auto& grip : group.grips) {
+                std::uint32_t omodRuntimeId = 0;
+                if (!grip.omod.empty()) {
+                    omodRuntimeId = motion_library::MotionLibraryStore::runtimeIdFromFormRef(grip.omod);
+                    if (omodRuntimeId == 0) {
+                        recordMissing("omod", grip.omod.plugin);
+                        continue;
+                    }
+                }
+                bool ambiguous = false;
+                const auto* entry = findEntry(
+                    grip.sourceName, true, omodRuntimeId, ambiguous);
+                if (!entry) {
+                    recordMissing(ambiguous ? "ambiguous-grip" : "grip", grip.sourceName);
+                    continue;
+                }
+                bool duplicateBody = false;
+                for (std::uint32_t i = 0; i < bound.eligiblePartCount; ++i) {
+                    duplicateBody |= bound.eligibleParts[i].bodyId == entry->bodyId;
+                }
+                if (duplicateBody || bound.eligiblePartCount >= bound.eligibleParts.size()) {
+                    continue;
+                }
+                auto& eligible = bound.eligibleParts[bound.eligiblePartCount++];
+                eligible.bodyId = entry->bodyId;
+                eligible.sourceName = entry->sourceName;
+            }
+            if (bound.eligiblePartCount == 0) {
+                recordMissing("group-without-bound-grip", group.id);
+            }
+        }
+
+        _authoritativeBinding.valid = missing.empty() &&
+            _authoritativeBinding.groupCount == profile->groups.size();
+        if (_authoritativeBinding.valid) {
+            RDX_LOG_INFO(Weapon,
+                "Authoritative reload profile bound: archetype='{}' groups={} stages={} events={} gen={:#x} — profile supersedes sMotionPathMode",
+                profile->archetype,
+                profile->groups.size(),
+                profile->stages.size(),
+                profile->events.size(),
+                generationKey);
+        } else {
+            RDX_LOG_WARN(Weapon,
+                "Authoritative reload profile rejected for generation {:#x}: exact captured assembly did not bind ({}) — PAPER leaves the native reload untouched",
+                generationKey,
+                missing.empty() ? "profile group capacity mismatch" : missing);
+        }
+    }
+
+    void ReduxRuntime::dispatchAuthoritativeEvents(
+        const motion_library::AuthoritativeReloadProfile& profile,
+        const authoritative_reload::Controller::FrameOutput& output)
+    {
+        if (output.eventCount == 0) {
+            return;
+        }
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player) {
+            RDX_LOG_WARN(Weapon,
+                "Authoritative reload crossed {} event(s), but the player animation graph was unavailable",
+                output.eventCount);
+            return;
+        }
+        for (std::uint32_t i = 0; i < output.eventCount; ++i) {
+            const auto eventIndex = output.eventIndices[i];
+            if (eventIndex >= profile.events.size()) {
+                continue;
+            }
+            const auto& event = profile.events[eventIndex];
+            const RE::BSFixedString graphEvent(event.animationEvent.c_str());
+            const bool accepted = player->NotifyAnimationGraphImpl(graphEvent);
+            const char* kind = "sound";
+            if (event.kind == motion_library::AuthoritativeEventKind::Visibility) {
+                kind = "visibility";
+            } else if (event.kind == motion_library::AuthoritativeEventKind::Gameplay) {
+                kind = "gameplay";
+            }
+            RDX_LOG_INFO(Weapon,
+                "Authoritative reload event id='{}' kind={} t={:.3f}s payload='{}' graphAccepted={}",
+                event.id,
+                kind,
+                event.timeSeconds,
+                event.animationEvent,
+                accepted);
         }
     }
 
@@ -1424,13 +1611,16 @@ namespace redux
             }
         }
         RDX_LOG_INFO(Weapon,
-            "Motion library: '{}' {:08X} loaded — {} part record(s), {} imported{}{}",
+            "Motion library: '{}' {:08X} loaded — {} part record(s), {} imported{}{}{}",
             _libraryWeaponRef.plugin,
             _libraryWeaponRef.localFormId,
             library->parts.size(),
             applied,
             library->curated ? " [CURATED — runtime never overwrites this file]" : "",
-            skippedOmods > 0 ? " (some skipped: omod plugin not in load order)" : "");
+            skippedOmods > 0 ? " (some skipped: omod plugin not in load order)" : "",
+            library->authoritativeReload.used
+                ? " [AUTHORITATIVE RELOAD — supersedes sMotionPathMode for this weapon]"
+                : "");
         _libraryLoaded = std::move(library);
         // Imported state counts as synced; only NEW learning dirties.
         _librarySyncedRevision = _learner.revision();
@@ -1546,6 +1736,8 @@ namespace redux
         _libraryWeaponFormId = 0;
         _libraryWeaponRef = {};
         _libraryStableFrames = 0;
+        _authoritativeBinding = {};
+        _authoritativeController.reset();
         RDX_LOG_INFO(Weapon,
             "Learned motion data WIPED (bResetLearnedPaths) — {} library file(s) deleted (curated kept); reloads re-record from scratch, authored strokes re-harvest on the next equip/clip playback",
             deletedFiles);
@@ -1600,6 +1792,8 @@ namespace redux
         _librarySyncedRevision = 0;
         _libraryLastRevision = 0;
         _libraryStableFrames = 0;
+        _authoritativeBinding = {};
+        _authoritativeController.reset();
 
         _sandbox.shutdown();
         _learner.reset();
@@ -1734,7 +1928,12 @@ namespace redux
          * see purely visual movers too. Never grip-eligible, never targets;
          * capacity left over from evidence parts bounds the walk.
          */
-        if (sawCurrentGeneration && weaponNode && g_reduxConfig.fullSubtreeObservation) {
+        // A curated profile declares exact visual drivers/followers and must
+        // be able to validate them independently of the mapper-only subtree
+        // toggle. The profile is already loaded before this equip-time cache
+        // build, so it owns that prerequisite without changing the INI.
+        if (sawCurrentGeneration && weaponNode &&
+            (g_reduxConfig.fullSubtreeObservation || authoritativeProfile())) {
             const auto nodeTaken = [this](const RE::NiAVObject* node) {
                 for (std::uint32_t i = 0; i < _drivePartCache.count; ++i) {
                     if (_drivePartCache.entries[i].node == node) {
@@ -1929,6 +2128,7 @@ namespace redux
         if (_drivePartCache.generationKey != generationKey) {
             return;
         }
+        refreshAuthoritativeProfileBinding(generationKey);
         captureRichWeaponSnapshot(weaponNode, generationKey, weaponFormId, _lastRockFrameIndex);
         if (_drivePartCache.count == 0) {
             return;
@@ -2708,7 +2908,10 @@ namespace redux
         WeaponPartDriveSandbox::FrameInput input{};
         input.weaponGenerationKey = generationKey;
         input.weaponFormId = weaponNode && generationKey != 0 ? weaponFormId : 0;
-        input.motionPathMode = g_reduxConfig.motionPathMode;
+        const auto* profile = authoritativeProfile();
+        const bool profilePresent = profile != nullptr;
+        const bool profileReady = authoritativeProfileReady(generationKey);
+        input.motionPathMode = profilePresent ? MotionPathMode::ClipScrub : g_reduxConfig.motionPathMode;
         input.stageTransitionsEnabled = g_reduxConfig.stageTransitions;
         input.travelExtremeToleranceFraction = g_reduxConfig.travelExtremeTolerance;
 
@@ -2723,10 +2926,23 @@ namespace redux
          */
         auto scrubSession = weapon_clip_motion_harvest::clipScrubSessionState();
         if (scrubSession.active) {
-            if (g_reduxConfig.motionPathMode != MotionPathMode::ClipScrub) {
+            if (scrubSession.weaponFormId != input.weaponFormId ||
+                scrubSession.weaponGenerationKey != generationKey) {
+                RDX_LOG_WARN(Weapon,
+                    "CLIP-SCRUB provenance mismatch (clip weapon={:08X}/gen={:#x}, frame weapon={:08X}/gen={:#x}) — releasing to native",
+                    scrubSession.weaponFormId,
+                    scrubSession.weaponGenerationKey,
+                    input.weaponFormId,
+                    generationKey);
                 weapon_clip_motion_harvest::endClipScrubSession();
                 scrubSession.active = false;
-            } else if (scrubSession.fraction >= kClipScrubCompleteFraction) {
+            } else if (profilePresent && !profileReady) {
+                weapon_clip_motion_harvest::endClipScrubSession();
+                scrubSession.active = false;
+            } else if (!profilePresent && g_reduxConfig.motionPathMode != MotionPathMode::ClipScrub) {
+                weapon_clip_motion_harvest::endClipScrubSession();
+                scrubSession.active = false;
+            } else if (!profilePresent && scrubSession.fraction >= kClipScrubCompleteFraction) {
                 RDX_LOG_INFO(Weapon,
                     "CLIP-SCRUB complete at fraction {:.3f} — releasing to native (engine finishes the reload)",
                     scrubSession.fraction);
@@ -2738,7 +2954,6 @@ namespace redux
             _scrubLastSessionId = scrubSession.sessionId;
             _scrubIdleFrames = 0;
         }
-        input.clipScrubSessionActive = scrubSession.active;
         input.clipScrubSessionId = scrubSession.sessionId;
         input.clipScrubFraction = scrubSession.fraction;
 
@@ -2775,6 +2990,119 @@ namespace redux
             _grippedBodyIds[handIndex] = gripReportValid[handIndex] && gripReports[handIndex].active != 0
                 ? gripReports[handIndex].bodyId
                 : 0x7FFF'FFFFu;
+        }
+
+        authoritative_reload::Controller::FrameOutput profileOutput{};
+        if (profileReady) {
+            const auto previewStage = _authoritativeController.previewStageIndex(scrubSession.sessionId);
+            std::uint32_t previewGroup = 0;
+            if (previewStage < profile->stages.size()) {
+                const auto& groupId = profile->stages[previewStage].groupId;
+                for (std::uint32_t i = 0; i < profile->groups.size(); ++i) {
+                    if (profile->groups[i].id == groupId) {
+                        previewGroup = i;
+                        break;
+                    }
+                }
+            }
+            bool currentGroupGripActive = false;
+            if (previewGroup < _authoritativeBinding.groupCount) {
+                const auto& bound = _authoritativeBinding.groups[previewGroup];
+                for (std::size_t handIndex = 0; handIndex < gripReports.size(); ++handIndex) {
+                    const auto& report = gripReports[handIndex];
+                    if (!gripReportValid[handIndex] || report.active == 0 || report.attachOnly == 0 ||
+                        report.providerOwnerToken != _sandbox.ownerToken() ||
+                        report.weaponGenerationKey != generationKey) {
+                        continue;
+                    }
+                    for (std::uint32_t i = 0; i < bound.eligiblePartCount; ++i) {
+                        if (bound.eligibleParts[i].bodyId == report.bodyId) {
+                            currentGroupGripActive = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            const auto clipName = providerFixedStringView(
+                scrubSession.clipName.data(), scrubSession.clipName.size());
+            profileOutput = _authoritativeController.update(
+                profile,
+                authoritative_reload::Controller::FrameInput{
+                    .clip = {
+                        .active = scrubSession.active,
+                        .sessionId = scrubSession.sessionId,
+                        .clipName = clipName,
+                        .durationSeconds = scrubSession.durationSeconds,
+                        .cropStartSeconds = scrubSession.cropStartSeconds,
+                        .croppedDurationSeconds = scrubSession.croppedDurationSeconds,
+                        .fraction = scrubSession.fraction,
+                    },
+                    .currentGroupGripActive = currentGroupGripActive,
+                });
+            dispatchAuthoritativeEvents(*profile, profileOutput);
+
+            if (profileOutput.newSession) {
+                if (profileOutput.rejection !=
+                    authoritative_reload::Controller::RejectionReason::None) {
+                    RDX_LOG_WARN(Weapon,
+                        "Authoritative reload rejected captured clip='{}' duration={:.3f}s crop={:.3f}+{:.3f}s: {} — releasing to native",
+                        clipName,
+                        scrubSession.durationSeconds,
+                        scrubSession.cropStartSeconds,
+                        scrubSession.croppedDurationSeconds,
+                        authoritative_reload::rejectionReasonName(profileOutput.rejection));
+                } else if (profileOutput.stageIndex < profile->stages.size() &&
+                    profileOutput.groupIndex < profile->groups.size()) {
+                    const auto& stage = profile->stages[profileOutput.stageIndex];
+                    RDX_LOG_INFO(Weapon,
+                        "Authoritative reload session {} started: stage='{}' group='{}' window=[{:.3f},{:.3f}]s clip='{}'",
+                        scrubSession.sessionId,
+                        stage.id,
+                        profile->groups[profileOutput.groupIndex].id,
+                        stage.startSeconds,
+                        stage.endSeconds,
+                        clipName);
+                }
+            } else if (profileOutput.stageChanged &&
+                profileOutput.stageIndex < profile->stages.size() &&
+                profileOutput.groupIndex < profile->groups.size()) {
+                const auto& stage = profile->stages[profileOutput.stageIndex];
+                RDX_LOG_INFO(Weapon,
+                    "Authoritative reload advanced: stage='{}' group='{}' window=[{:.3f},{:.3f}]s",
+                    stage.id,
+                    profile->groups[profileOutput.groupIndex].id,
+                    stage.startSeconds,
+                    stage.endSeconds);
+            }
+
+            input.clipScrubSessionActive = scrubSession.active &&
+                profileOutput.ownsClipSession && !profileOutput.releaseClip;
+            if (input.clipScrubSessionActive &&
+                profileOutput.stageIndex < profile->stages.size() &&
+                scrubSession.croppedDurationSeconds > 0.0f) {
+                const auto& stage = profile->stages[profileOutput.stageIndex];
+                input.clipScrubWindowEnabled = true;
+                input.clipScrubWindowMinFraction = std::clamp(
+                    (stage.startSeconds - scrubSession.cropStartSeconds) /
+                        scrubSession.croppedDurationSeconds,
+                    0.0f,
+                    1.0f);
+                input.clipScrubWindowMaxFraction = std::clamp(
+                    (stage.endSeconds - scrubSession.cropStartSeconds) /
+                        scrubSession.croppedDurationSeconds,
+                    input.clipScrubWindowMinFraction,
+                    1.0f);
+            }
+        } else if (profilePresent) {
+            // Presence is authoritative even when exact binding failed. Do
+            // not resurrect heuristic grouping or a prior INI scrub session;
+            // empty targets leave the native reload fully in control.
+            _authoritativeController.reset();
+            input.clipScrubSessionActive = false;
+        } else {
+            _authoritativeController.reset();
+            input.clipScrubSessionActive = scrubSession.active;
         }
 
         /*
@@ -2833,13 +3161,23 @@ namespace redux
                 _pipboySuppressionAvailable && api && api->isNativePipboyInputSuppressedV1 ? api->isNativePipboyInputSuppressedV1() : false);
         }
 
-        // Per-part attach-only whitelist: allowlisted class + motion path
-        // present ("must move"), installed only while armed; the sandbox
-        // reinstalls provider targets only when this set changes.
-        refreshEligibleParts(input.weaponFormId);
-        if (attachModeArmed) {
-            input.eligiblePartCount = _eligiblePartCount;
-            input.eligibleParts = _eligibleParts;
+        // A bound format-v2 profile supplies the exact collider set for the
+        // current stage and bypasses every heuristic/INI allowlist. Other
+        // weapons retain the existing class+motion-path resolution.
+        if (profilePresent) {
+            if (profileReady && attachModeArmed &&
+                (!scrubSession.active || profileOutput.ownsClipSession) &&
+                profileOutput.groupIndex < _authoritativeBinding.groupCount) {
+                const auto& bound = _authoritativeBinding.groups[profileOutput.groupIndex];
+                input.eligiblePartCount = bound.eligiblePartCount;
+                input.eligibleParts = bound.eligibleParts;
+            }
+        } else {
+            refreshEligibleParts(input.weaponFormId);
+            if (attachModeArmed) {
+                input.eligiblePartCount = _eligiblePartCount;
+                input.eligibleParts = _eligibleParts;
+            }
         }
 
         // Scene-graph chain table for the drive-time chain filter.
@@ -2943,7 +3281,20 @@ namespace redux
             &maxTravelEventCount, &scrubDesiredFraction, &scrubFractionValid);
 
         if (scrubSession.active) {
-            if (scrubFractionValid) {
+            if (profileReady) {
+                _scrubIdleFrames = 0;
+                if (profileOutput.releaseClip) {
+                    weapon_clip_motion_harvest::endClipScrubSession();
+                } else if (profileOutput.desiredFractionValid) {
+                    // Stage seeding/end hold outranks pursuit output. During
+                    // the open stage body the controller leaves this false,
+                    // so the hand remains the sole time authority.
+                    weapon_clip_motion_harvest::setClipScrubDesiredFraction(
+                        profileOutput.desiredFraction);
+                } else if (scrubFractionValid) {
+                    weapon_clip_motion_harvest::setClipScrubDesiredFraction(scrubDesiredFraction);
+                }
+            } else if (scrubFractionValid) {
                 weapon_clip_motion_harvest::setClipScrubDesiredFraction(scrubDesiredFraction);
                 _scrubIdleFrames = 0;
             } else if (++_scrubIdleFrames >= kClipScrubIdleTimeoutFrames) {

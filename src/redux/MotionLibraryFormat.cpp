@@ -1,5 +1,7 @@
 #include "redux/MotionLibraryFormat.h"
 
+#include "redux/AuthoritativeReloadProfileFormat.h"
+
 #include <nlohmann/json.hpp>
 
 #include <charconv>
@@ -199,11 +201,15 @@ namespace redux::motion_library
             parts.push_back(std::move(p));
         }
         j["parts"] = std::move(parts);
+        if (library.authoritativeReload.used) {
+            j["authoritativeReload"] =
+                authoritative_profile_format::toJson(library.authoritativeReload);
+        }
         // 2-space indent: these files are the hand-tuning surface.
         return j.dump(2);
     }
 
-    bool parse(std::string_view jsonText, WeaponLibrary& out, std::string* outError)
+    bool parse(std::string_view jsonText, WeaponLibrary& out, std::string* outError) try
     {
         out = WeaponLibrary{};
         if (outError) {
@@ -231,6 +237,24 @@ namespace redux::motion_library
         }
         out.weaponName = j.value("weaponName", std::string{});
         out.curated = j.value("curated", false);
+        if (j.contains("authoritativeReload")) {
+            if (out.formatVersion < 2) {
+                if (outError) {
+                    *outError = "authoritativeReload requires format 2";
+                }
+                return false;
+            }
+            if (!out.curated) {
+                if (outError) {
+                    *outError = "authoritativeReload requires curated=true so runtime learning cannot overwrite it";
+                }
+                return false;
+            }
+            if (!authoritative_profile_format::fromJson(
+                    j["authoritativeReload"], out.authoritativeReload, outError)) {
+                return false;
+            }
+        }
         if (!j.contains("parts") || !j["parts"].is_array()) {
             if (outError) {
                 *outError = "missing parts array";
@@ -276,5 +300,11 @@ namespace redux::motion_library
             }
         }
         return true;
+    } catch (const json::exception& error) {
+        out = WeaponLibrary{};
+        if (outError) {
+            *outError = std::string("malformed field: ") + error.what();
+        }
+        return false;
     }
 }
