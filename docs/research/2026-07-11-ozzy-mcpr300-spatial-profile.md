@@ -1,5 +1,7 @@
 # Ozzy MCPR-300 movement-preview findings
 
+> **Invalidated testbed (2026-07-11):** live testing showed that the generated full-hand-pose controller moved parts in incorrect directions and allowed in-place wrist rotation to advance the mechanisms. The profile is no longer shipped, and its `movementPreview` runtime signature is rejected. Identities, hierarchy, OMODs, annotations, and connector findings below remain research evidence; movement/controller claims are not implementation authority. F4NV-AMR's preserved learner paths replaced Ozzy as the movement testbed.
+
 Date: 2026-07-11
 
 Project/repo: PAPER_Redux

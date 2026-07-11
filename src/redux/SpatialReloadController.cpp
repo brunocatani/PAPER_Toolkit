@@ -38,23 +38,15 @@ namespace redux::spatial_reload
                 out.data(), name.data(), (std::min)(name.size(), out.size() - 1));
         }
 
-        [[nodiscard]] PoseSample rigidHandDesiredPose(
+        [[nodiscard]] Vec3 translatedHandDesiredPoint(
             const PoseSample& handStart,
             const PoseSample& handNow,
             const PoseSample& partStart)
         {
-            const Quat rotationDelta = weapon_part_motion_path::quatMultiply(
-                handNow.rotate,
-                weapon_part_motion_path::quatConjugate(handStart.rotate));
-            const Vec3 handToPart = weapon_part_motion_path::sub(
-                partStart.translate, handStart.translate);
-            return PoseSample{
-                .translate = weapon_part_motion_path::add(
-                    handNow.translate,
-                    weapon_part_motion_path::quatRotate(rotationDelta, handToPart)),
-                .rotate = weapon_part_motion_path::quatMultiply(
-                    rotationDelta, partStart.rotate),
-            };
+            return weapon_part_motion_path::add(
+                partStart.translate,
+                weapon_part_motion_path::sub(
+                    handNow.translate, handStart.translate));
         }
 
         void anchorControlPath(
@@ -167,7 +159,7 @@ namespace redux::spatial_reload
         _firedSoundEvents = {};
 
         if (profile.runtimeMode !=
-                motion_library::SpatialReloadRuntimeMode::MovementPreview ||
+                motion_library::SpatialReloadRuntimeMode::LearnerMovementPreview ||
             profile.groups.empty() || profile.stages.empty() ||
             profile.groups.size() > _groups.size() ||
             profile.stages.size() > _stageDriverMap.size()) {
@@ -638,9 +630,9 @@ namespace redux::spatial_reload
         const float entryDistance = stageDistance(stage, stage.entryFraction);
         const float gateDistance =
             stageDistance(stage, stage.transitionFraction);
-        const auto desired = rigidHandDesiredPose(
+        const auto desired = translatedHandDesiredPoint(
             _grip.handStart, hand.handPose, _grip.partStart);
-        const auto scrubbed = weapon_part_motion_scrub::scrubPose(
+        const auto scrubbed = weapon_part_motion_scrub::scrub(
             _grip.anchoredControlPath, groupState.pathDistance, desired);
         if (scrubbed.valid) {
             const float priorDistance = groupState.pathDistance;

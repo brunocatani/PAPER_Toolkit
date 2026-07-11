@@ -243,9 +243,8 @@ int main()
         ok &= expectTrue("scrub clamps at the end of the stroke", arc <= path.totalArcLength + 0.001f);
         ok &= expectTrue("scrub reaches the end of the stroke", arc > path.totalArcLength - 0.35f);
 
-        // A bolt-handle unlock can be rotation-only before the linear pull.
-        // The spatial controller must advance from wrist pose even when every
-        // translation segment is degenerate.
+        // Stored rotation is playback data, not a hand-input axis. A path
+        // with no translatable segment must remain parked.
         MotionPath rotationOnly{};
         rotationOnly.valid = true;
         constexpr float kQuarterTurn = 1.57079632679f;
@@ -257,14 +256,7 @@ int main()
                 std::cos(angle * 0.5f), 0.0f, 0.0f, std::sin(angle * 0.5f)
             };
         }
-        float rotationArc = 0.0f;
-        const PoseSample rotatedDesired = rotationOnly.keys.back();
-        for (int i = 0; i < 12; ++i) {
-            rotationArc = scrubPose(rotationOnly, rotationArc, rotatedDesired).arcPosition;
-        }
-        ok &= expectTrue("full-pose scrub traverses a pure-rotation bolt unlock",
-            rotationArc > rotationOnly.totalArcLength - 0.25f);
-        ok &= expectTrue("translation-only scrub remains parked on pure rotation",
+        ok &= expectTrue("learner scrub remains parked on pure rotation",
             scrub(rotationOnly, 0.0f, Vec3{}).arcPosition < 0.001f);
     }
 
@@ -786,66 +778,70 @@ int main()
     }
 
     {
-        // The shipped Ozzy file is a movement-only spatial fixture: no clock
-        // or clip authority, explicit groups/OMODs/connectors, group-local
-        // out/return cycles, and all captured annotations retained as mapped
-        // findings. Only sound crossings may become runtime output.
+        // The shipped F4NV-AMR file is the known-good learner-motion fixture.
+        // Its original parts remain present byte-for-value, while the curated
+        // profile reorganizes those exact recorded paths into explicit groups
+        // and position-driven cycles. Only sound crossings are executable.
         using namespace redux::motion_library;
         using redux::spatial_reload::Controller;
 
         const auto profilePath = std::filesystem::path(PAPER_REDUX_TEST_SOURCE_DIR) /
-            "data" / "MotionLibrary" / "Ozzys_MCPR-300.esp_000020A6.json";
+            "data" / "MotionLibrary" / "F4NV-AMR.esp_00000F99.json";
         std::ifstream profileStream(profilePath, std::ios::binary);
-        ok &= expectTrue("bundled Ozzy profile opens", static_cast<bool>(profileStream));
+        ok &= expectTrue("bundled F4NV-AMR profile opens", static_cast<bool>(profileStream));
         std::ostringstream profileBuffer;
         profileBuffer << profileStream.rdbuf();
-        WeaponLibrary ozzy;
+        WeaponLibrary f4nv;
         std::string profileError;
-        ok &= expectTrue("bundled Ozzy spatial profile parses",
-            parse(profileBuffer.str(), ozzy, &profileError));
-        ok &= expectTrue("bundled Ozzy spatial parse reports no error", profileError.empty());
-        ok &= expectTrue("Ozzy profile is curated movement-preview format 2",
-            ozzy.formatVersion == 2 && ozzy.curated && ozzy.spatialReload.used &&
-                ozzy.spatialReload.runtimeMode == SpatialReloadRuntimeMode::MovementPreview);
-        ok &= expectEqual("Ozzy spatial group count", ozzy.spatialReload.groups.size(), std::size_t{ 2 });
-        ok &= expectEqual("Ozzy physical stage count", ozzy.spatialReload.stages.size(), std::size_t{ 4 });
-        ok &= expectEqual("Ozzy mapped finding count", ozzy.spatialReload.mappedEvents.size(), std::size_t{ 16 });
+        ok &= expectTrue("bundled F4NV-AMR spatial profile parses",
+            parse(profileBuffer.str(), f4nv, &profileError));
+        ok &= expectTrue("bundled F4NV-AMR spatial parse reports no error", profileError.empty());
+        ok &= expectTrue("F4NV-AMR profile is curated learner movement format 2",
+            f4nv.formatVersion == 2 && f4nv.curated && f4nv.parts.size() == 23 &&
+                f4nv.spatialReload.used &&
+                f4nv.spatialReload.runtimeMode ==
+                    SpatialReloadRuntimeMode::LearnerMovementPreview);
+        ok &= expectEqual("F4NV-AMR spatial group count", f4nv.spatialReload.groups.size(), std::size_t{ 2 });
+        ok &= expectEqual("F4NV-AMR physical stage count", f4nv.spatialReload.stages.size(), std::size_t{ 4 });
+        ok &= expectEqual("F4NV-AMR mapped finding count", f4nv.spatialReload.mappedEvents.size(), std::size_t{ 12 });
         ok &= expectTrue("source clip is provenance only",
-            ozzy.spatialReload.sourceClip == "Animations\\44Pistol\\WPNReload.hkt");
-        ok &= expectTrue("Ozzy receiver OMOD identity retained",
-            !ozzy.spatialReload.groups.empty() &&
-                !ozzy.spatialReload.groups[0].grips.empty() &&
-                ozzy.spatialReload.groups[0].grips[0].omod.plugin == "Ozzys_MCPR-300.esp" &&
-                ozzy.spatialReload.groups[0].grips[0].omod.localFormId == 0x1F48u);
-        ok &= expectTrue("P-Bolt is hierarchy evidence rather than a grip",
-            ozzy.spatialReload.groups[0].connectorEvidence.size() == 1 &&
-                ozzy.spatialReload.groups[0].connectorEvidence[0] == "P-Bolt");
-        ok &= expectTrue("latch driver retains explicit physical-distance keys",
-            ozzy.spatialReload.stages[1].driverTracks[2].keys.size() > 3 &&
-                ozzy.spatialReload.stages[1].driverTracks[2].keys[1].pathDistance > 0.0f);
+            f4nv.spatialReload.sourceClip == "Animations\\44Pistol\\WPNReload.hkt");
+        ok &= expectTrue("F4NV magazine OMOD identity retained",
+            f4nv.spatialReload.groups.size() == 2 &&
+                !f4nv.spatialReload.groups[1].grips.empty() &&
+                f4nv.spatialReload.groups[1].grips[0].omod.plugin == "F4NV-AMR.esp" &&
+                f4nv.spatialReload.groups[1].grips[0].omod.localFormId == 0x6B57u);
+        ok &= expectTrue("P-Mag is connector evidence rather than a grip or driver",
+            f4nv.spatialReload.groups[1].connectorEvidence.size() == 1 &&
+                f4nv.spatialReload.groups[1].connectorEvidence[0] == "P-Mag" &&
+                f4nv.spatialReload.groups[1].grips[0].sourceName == "BSX" &&
+                f4nv.spatialReload.groups[1].drivers[0].node == "WeaponMagazine");
+        ok &= expectTrue("exact learner driver retains all 24 recorded keys",
+            f4nv.spatialReload.stages[0].driverTracks[0].keys.size() == 24 &&
+                f4nv.spatialReload.stages[0].driverTracks[0].keys[1].pathDistance > 0.0f);
         ok &= expectTrue("bolt stages cycle only at captured endpoints",
-            std::abs(ozzy.spatialReload.stages[0].transitionFraction - 1.0f) < 0.0001f &&
-                ozzy.spatialReload.stages[0].nextStageId == "bolt_close" &&
-                std::abs(ozzy.spatialReload.stages[3].transitionFraction - 1.0f) < 0.0001f &&
-                ozzy.spatialReload.stages[3].nextStageId == "bolt_open");
+            std::abs(f4nv.spatialReload.stages[0].transitionFraction - 1.0f) < 0.0001f &&
+                f4nv.spatialReload.stages[0].nextStageId == "bolt_close" &&
+                std::abs(f4nv.spatialReload.stages[1].transitionFraction - 1.0f) < 0.0001f &&
+                f4nv.spatialReload.stages[1].nextStageId == "bolt_open");
         ok &= expectTrue("magazine exchanges at 20 percent and enters at 80 percent",
-            std::abs(ozzy.spatialReload.stages[1].transitionFraction - 0.20f) < 0.0001f &&
-                ozzy.spatialReload.stages[1].nextStageId == "magazine_insert" &&
-                std::abs(ozzy.spatialReload.stages[1].nextStageEntryFraction - 0.80f) < 0.0001f &&
-                std::abs(ozzy.spatialReload.stages[2].entryFraction - 0.80f) < 0.0001f &&
-                ozzy.spatialReload.stages[2].nextStageId == "magazine_remove");
+            std::abs(f4nv.spatialReload.stages[2].transitionFraction - 0.20f) < 0.0001f &&
+                f4nv.spatialReload.stages[2].nextStageId == "magazine_insert" &&
+                std::abs(f4nv.spatialReload.stages[2].nextStageEntryFraction - 0.80f) < 0.0001f &&
+                std::abs(f4nv.spatialReload.stages[3].entryFraction - 0.80f) < 0.0001f &&
+                f4nv.spatialReload.stages[3].nextStageId == "magazine_remove");
 
         std::size_t soundFindingCount = 0;
         std::size_t visibilityFindingCount = 0;
         std::size_t gameplayFindingCount = 0;
-        for (const auto& event : ozzy.spatialReload.mappedEvents) {
+        for (const auto& event : f4nv.spatialReload.mappedEvents) {
             soundFindingCount += event.kind == SpatialReloadMappedEventKind::Sound ? 1u : 0u;
             visibilityFindingCount += event.kind == SpatialReloadMappedEventKind::Visibility ? 1u : 0u;
             gameplayFindingCount += event.kind == SpatialReloadMappedEventKind::Gameplay ? 1u : 0u;
         }
-        ok &= expectEqual("all ten captured sounds retained", soundFindingCount, std::size_t{ 10 });
-        ok &= expectEqual("all four visibility findings retained", visibilityFindingCount, std::size_t{ 4 });
-        ok &= expectEqual("both gameplay findings retained inertly", gameplayFindingCount, std::size_t{ 2 });
+        ok &= expectEqual("all seven mapped preview sounds retained", soundFindingCount, std::size_t{ 7 });
+        ok &= expectEqual("both visibility findings retained", visibilityFindingCount, std::size_t{ 2 });
+        ok &= expectEqual("all three gameplay findings retained inertly", gameplayFindingCount, std::size_t{ 3 });
 
         const auto containsTemporalField = [](const auto& self, const nlohmann::json& value) -> bool {
             static constexpr std::array<std::string_view, 9> blocked{
@@ -877,30 +873,32 @@ int main()
         ok &= expectFalse("shipped spatial profile contains no temporal authority fields",
             containsTemporalField(containsTemporalField, shippedJson["spatialReload"]));
         ok &= expectTrue("movement-only contract is explicit in JSON",
-            shippedJson["spatialReload"]["runtimeMode"] == "movementPreview" &&
+            shippedJson["spatialReload"]["runtimeMode"] == "learnerMovementPreview" &&
+                shippedJson["spatialReload"]["coordinateConventions"]["handProjection"] ==
+                    "weapon-root-local-translation" &&
                 shippedJson["spatialReload"].contains("sourceClip") &&
                 shippedJson["spatialReload"].contains("mappedEvents") &&
                 !shippedJson["spatialReload"].contains("activationClip") &&
                 !shippedJson["spatialReload"].contains("events"));
 
-        WeaponLibrary ozzyRoundTrip;
+        WeaponLibrary f4nvRoundTrip;
         profileError.clear();
-        const auto roundTripText = serialize(ozzy);
+        const auto roundTripText = serialize(f4nv);
         ok &= expectTrue("spatial profile serialize/parse round-trips",
-            parse(roundTripText, ozzyRoundTrip, &profileError));
+            parse(roundTripText, f4nvRoundTrip, &profileError));
         ok &= expectTrue("spatial round-trip reports no error", profileError.empty());
         ok &= expectEqual("spatial round-trip stage count",
-            ozzyRoundTrip.spatialReload.stages.size(), std::size_t{ 4 });
+            f4nvRoundTrip.spatialReload.stages.size(), std::size_t{ 4 });
         ok &= expectEqual("spatial round-trip inherited follower count",
-            ozzyRoundTrip.spatialReload.groups[1].drivers[0].inheritedFollowers.size(),
-            std::size_t{ 18 });
+            f4nvRoundTrip.spatialReload.groups[1].drivers[0].inheritedFollowers.size(),
+            std::size_t{ 9 });
         ok &= expectFalse("serialized spatial profile remains clock-free",
             containsTemporalField(
                 containsTemporalField,
                 nlohmann::json::parse(roundTripText)["spatialReload"]));
 
         Controller controller;
-        const auto& profile = ozzy.spatialReload;
+        const auto& profile = f4nv.spatialReload;
         using redux::weapon_part_motion_path::PoseSample;
         const auto makeInput = [&](bool grip, std::uint32_t groupIndex,
                                    std::uint64_t gripSequence,
@@ -1005,7 +1003,7 @@ int main()
         const auto boltCloseIndex = stageIndex("bolt_close");
         const auto magRemoveIndex = stageIndex("magazine_remove");
         const auto magInsertIndex = stageIndex("magazine_insert");
-        ok &= expectTrue("all named Ozzy stages resolve",
+        ok &= expectTrue("all named F4NV-AMR stages resolve",
             boltOpenIndex != Controller::kInvalidIndex &&
                 boltCloseIndex != Controller::kInvalidIndex &&
                 magRemoveIndex != Controller::kInvalidIndex &&
@@ -1017,6 +1015,17 @@ int main()
         ok &= expectTrue("bolt preview begins from a physical grip without a clip",
             output.newGrip && output.active && output.groupIndex == 0 &&
                 output.stageIndex == boltOpenIndex && output.driverCount == 3);
+
+        PoseSample rotationOnlyHand{};
+        rotationOnlyHand.rotate = redux::weapon_part_motion_path::Quat{
+            0.70710677f, 0.0f, 0.70710677f, 0.0f
+        };
+        output = controller.update(
+            &profile, makeInput(true, 0, 1, rotationOnlyHand, false));
+        collectSounds(output);
+        ok &= expectTrue("wrist rotation alone cannot advance learner movement",
+            output.stageIndex == boltOpenIndex &&
+                std::abs(output.pathFraction) < 0.0001f && !output.stageChanged);
 
         const auto boltOpenGate = anchoredTarget(
             profile.stages[boltOpenIndex], 0.0f, {}, 1.0f);
@@ -1062,7 +1071,7 @@ int main()
         collectSounds(output);
         ok &= expectTrue("magazine preview begins on outgoing group stage",
             output.newGrip && output.active && output.groupIndex == 1 &&
-                output.stageIndex == magRemoveIndex && output.driverCount == 3);
+                output.stageIndex == magRemoveIndex && output.driverCount == 1);
 
         const auto& magRemove = profile.stages[magRemoveIndex];
         const auto magExchangePose = anchoredTarget(
@@ -1110,14 +1119,11 @@ int main()
                 std::abs(output.pathFraction) < 0.0001f);
 
         for (const auto* expected : {
-                 "raise", "bolt_back", "weapon_grab", "bolt_close",
-                 "reload_end_contact", "magazine_grab", "magazine_out",
-                 "magazine_in", "magazine_slap" }) {
+                 "reload_start", "bolt_open", "bolt_close", "reload_end",
+                 "mag_release", "mag_out", "mag_in" }) {
             ok &= expectTrue("reachable preview sound emitted",
                 emittedSoundIds.contains(expected));
         }
-        ok &= expectFalse("sound outside the active 80-to-100 insertion segment stays mapped-only",
-            emittedSoundIds.contains("magazine_rattle"));
 
         WeaponLibrary invalidProfile;
         auto autoWritable = shippedJson;
@@ -1139,8 +1145,8 @@ int main()
             parse(invalidOmod.dump(), invalidProfile, nullptr));
 
         auto connectorGrip = nlohmann::json::parse(roundTripText);
-        connectorGrip["spatialReload"]["groups"][0]["grips"][0]["source"] =
-            "P-Bolt";
+        connectorGrip["spatialReload"]["groups"][1]["grips"][0]["source"] =
+            "P-Mag";
         ok &= expectFalse("P-* connection point cannot become a physical grip",
             parse(connectorGrip.dump(), invalidProfile, nullptr));
 
@@ -1153,6 +1159,12 @@ int main()
         wrongRuntimeMode["spatialReload"]["runtimeMode"] = "reloadReplacement";
         ok &= expectFalse("reload-replacement runtime mode is rejected",
             parse(wrongRuntimeMode.dump(), invalidProfile, nullptr));
+
+        auto supersededOzzyMode = nlohmann::json::parse(roundTripText);
+        supersededOzzyMode["spatialReload"]["runtimeMode"] = "movementPreview";
+        supersededOzzyMode["spatialReload"]["authority"] = "curatedSpatialMovement";
+        ok &= expectFalse("superseded full-pose Ozzy profile signature is rejected",
+            parse(supersededOzzyMode.dump(), invalidProfile, nullptr));
 
         auto removedClipAuthority = nlohmann::json::parse(roundTripText);
         removedClipAuthority["spatialReload"]["activationClip"] =

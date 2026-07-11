@@ -65,9 +65,11 @@ namespace redux::motion_library
      *
      * This is curated movement data, not a reload/clip authority. A physical
      * grip selects one interaction group, and that group cycles between its
-     * explicitly linked primary/return-style stages. Each stage owns a full
-     * translation+rotation control path and full weapon-root-local driver
-     * poses. No clip interception, clip identity check, clock, gameplay event,
+     * explicitly linked primary/return-style stages. Each stage owns an exact
+     * learner-recorded delta-pose control path and exact weapon-root-local
+     * driver poses. Hand progress uses the learner's translation projection;
+     * path rotations remain playback data, never controller input. No clip
+     * interception, clip identity check, clock, gameplay event,
      * or reload-completion contract exists here. sourceClip is provenance;
      * mapped visibility/gameplay stays inert, while sound-kind findings may
      * request direct audio without graph notification.
@@ -87,7 +89,13 @@ namespace redux::motion_library
 
     enum class SpatialReloadRuntimeMode : std::uint8_t
     {
-        MovementPreview = 0,
+        /*
+         * Curated profiles may reorganize exact learner-recorded paths, but
+         * they must retain the learner's proven translation-only hand
+         * projection. Stored path rotations still play back; controller
+         * rotation never becomes an input axis.
+         */
+        LearnerMovementPreview = 0,
     };
 
     struct SpatialReloadGripSource
@@ -210,7 +218,7 @@ namespace redux::motion_library
     {
         bool used{ false };
         std::uint32_t profileVersion{ kSpatialReloadProfileVersion };
-        SpatialReloadRuntimeMode runtimeMode{ SpatialReloadRuntimeMode::MovementPreview };
+        SpatialReloadRuntimeMode runtimeMode{ SpatialReloadRuntimeMode::LearnerMovementPreview };
         std::string archetype;
         std::string sourceCapture;
         std::string sourceActivityId;

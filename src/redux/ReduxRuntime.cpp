@@ -1594,7 +1594,7 @@ namespace redux
             _spatialReloadBinding.groupCount == profile->groups.size();
         if (_spatialReloadBinding.valid) {
             RDX_LOG_INFO(Weapon,
-                "Spatial movement-preview profile bound: archetype='{}' groups={} stages={} mappedEvents={} gen={:#x} — recorded physical poses supersede sMotionPathMode without controlling reload",
+                "Curated learner movement-preview bound: archetype='{}' groups={} stages={} mappedEvents={} gen={:#x} — exact recorded learner paths supersede sMotionPathMode without controlling reload",
                 profile->archetype,
                 profile->groups.size(),
                 profile->stages.size(),
@@ -1734,7 +1734,7 @@ namespace redux
             library->curated ? " [CURATED — runtime never overwrites this file]" : "",
             skippedOmods > 0 ? " (some skipped: omod plugin not in load order)" : "",
             library->spatialReload.used
-                ? " [CURATED MOVEMENT PREVIEW — recorded poses supersede sMotionPathMode; native reload untouched]"
+                ? " [CURATED LEARNER MOVEMENT PREVIEW — exact learner paths supersede sMotionPathMode; native reload untouched]"
                 : "");
         _libraryLoaded = std::move(library);
         // Imported state counts as synced; only NEW learning dirties.

@@ -330,13 +330,14 @@ namespace redux::motion_library::spatial_profile_format
     {
         json out;
         out["profileVersion"] = profile.profileVersion;
-        out["runtimeMode"] = "movementPreview";
-        out["authority"] = "curatedSpatialMovement";
+        out["runtimeMode"] = "learnerMovementPreview";
+        out["authority"] = "curatedRecordedMovement";
         out["coordinateConventions"] = {
-            { "controlPaths", "grip-relative-pose" },
+            { "controlPaths", "recorded-learner-delta-pose" },
             { "driverTracks", "weapon-root-local" },
             { "quaternionOrder", "w,x,y,z" },
-            { "pathDistance", "translation-plus-rotation-at-3-game-unit-radius" },
+            { "pathDistance", "recorded-learner-pose-arc" },
+            { "handProjection", "weapon-root-local-translation" },
         };
         out["archetype"] = profile.archetype;
         if (!profile.sourceClip.empty()) {
@@ -466,30 +467,32 @@ namespace redux::motion_library::spatial_profile_format
             return fail(outError, "temporal fields are forbidden; authority must be physical pose/path distance");
         }
         if (containsRemovedRuntimeControlField(value)) {
-            return fail(outError, "clip/session authority and the old graph-event surface are removed from movementPreview");
+            return fail(outError, "clip/session authority and the old graph-event surface are removed from learnerMovementPreview");
         }
         if (!value.contains("profileVersion") || !value["profileVersion"].is_number_unsigned() ||
             value["profileVersion"].get<std::uint32_t>() != kSpatialReloadProfileVersion) {
             return fail(outError, "missing or unsupported profileVersion");
         }
         out.profileVersion = value["profileVersion"].get<std::uint32_t>();
-        if (value.value("runtimeMode", std::string{}) != "movementPreview") {
-            return fail(outError, "runtimeMode must be movementPreview");
+        if (value.value("runtimeMode", std::string{}) != "learnerMovementPreview") {
+            return fail(outError, "runtimeMode must be learnerMovementPreview");
         }
-        out.runtimeMode = SpatialReloadRuntimeMode::MovementPreview;
-        if (value.value("authority", std::string{}) != "curatedSpatialMovement") {
-            return fail(outError, "authority must be curatedSpatialMovement");
+        out.runtimeMode = SpatialReloadRuntimeMode::LearnerMovementPreview;
+        if (value.value("authority", std::string{}) != "curatedRecordedMovement") {
+            return fail(outError, "authority must be curatedRecordedMovement");
         }
         if (!value.contains("coordinateConventions") ||
             !value["coordinateConventions"].is_object()) {
             return fail(outError, "missing coordinateConventions");
         }
         const auto& conventions = value["coordinateConventions"];
-        if (conventions.value("controlPaths", std::string{}) != "grip-relative-pose" ||
+        if (conventions.value("controlPaths", std::string{}) != "recorded-learner-delta-pose" ||
             conventions.value("driverTracks", std::string{}) != "weapon-root-local" ||
             conventions.value("quaternionOrder", std::string{}) != "w,x,y,z" ||
             conventions.value("pathDistance", std::string{}) !=
-                "translation-plus-rotation-at-3-game-unit-radius") {
+                "recorded-learner-pose-arc" ||
+            conventions.value("handProjection", std::string{}) !=
+                "weapon-root-local-translation") {
             return fail(outError, "unsupported coordinate convention");
         }
         if (!value.contains("archetype") || !value["archetype"].is_string() ||
