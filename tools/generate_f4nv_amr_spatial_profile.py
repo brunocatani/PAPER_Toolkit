@@ -271,6 +271,17 @@ def verify_capture_identity(snapshot: dict[str, Any], reload_clip: dict[str, Any
     missing = required - annotations
     if missing:
         raise ValueError(f"reload capture is missing annotations: {sorted(missing)}")
+    magazine_evidence = next(
+        (
+            entry
+            for entry in snapshot.get("evidence", [])
+            if entry.get("providerSourceName") == "BSX"
+            and entry.get("partKindName") == "Magazine"
+        ),
+        None,
+    )
+    if magazine_evidence is None or magazine_evidence.get("omod", {}).get("ref") != MAG_OMOD:
+        raise ValueError("source capture is missing the recorded 0x6B57 magazine evidence")
 
 
 def build(library: dict[str, Any], snapshot: dict[str, Any], reload_clip: dict[str, Any]) -> dict[str, Any]:
@@ -410,15 +421,21 @@ def build(library: dict[str, Any], snapshot: dict[str, Any], reload_clip: dict[s
             {
                 "id": "magazine_group",
                 "role": "detachable_magazine",
-                "notes": "BSX is the physical OMOD-backed grip. WeaponMagazine is the sole top-level driver and carries the complete magazine subtree through P-Mag.",
+                "notes": "The unique Object01/Object02/ammunition meshes are physical grips across recorded assembly variants. WeaponMagazine is the sole top-level driver. P-Mag and the original 0x6B57 BSX remain connector/motion evidence, never physical identity.",
                 "connectorEvidence": ["P-Mag"],
                 "grips": [
                     {
-                        "source": "BSX",
-                        "omod": MAG_OMOD,
-                        "omodName": "F4NV-AMR magazine assembly",
-                        "role": "physical_magazine_grip",
-                    }
+                        "source": "Object01",
+                        "role": "physical_magazine_mesh_primary",
+                    },
+                    {
+                        "source": "Object02",
+                        "role": "physical_magazine_mesh_secondary",
+                    },
+                    {
+                        "source": "308MagSmalBullets:0",
+                        "role": "physical_magazine_ammunition_mesh",
+                    },
                 ],
                 "drivers": [
                     {
@@ -433,7 +450,6 @@ def build(library: dict[str, Any], snapshot: dict[str, Any], reload_clip: dict[s
                             "308MagSmalBullets:0",
                             "WeaponMagazineChild5",
                             "WeaponMagazineChild2",
-                            "BSX",
                         ],
                     }
                 ],

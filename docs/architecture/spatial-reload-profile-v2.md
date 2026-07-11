@@ -121,6 +121,8 @@ The generator validates weapon identity and captured annotation inventory, retai
 
 Before any active-file replacement, preserve the original JSON and capture and record SHA-256 hashes. Runtime files are never the only copy of a known-good mapping again.
 
+Physical grip identity must use concrete, uniquely named evidence meshes that survive supported attachment variants. Generic NIF names such as `BSX` are not stable identities: unrelated OMODs may reuse them. OMOD and connector data remain valuable assembly evidence, but a connector is never a part and an optional OMOD child must not make an otherwise valid movement group ambiguous.
+
 ## Validation boundary
 
 Policy tests prove schema rejection, exact key retention, translation-only input, group cycles, repeat sound re-arming, spatial separation of forward/return sounds, 20/80 magazine handoff continuity, sound-only output, and inert visibility/gameplay mappings. Builds prove compilation and deployment, not interaction feel.

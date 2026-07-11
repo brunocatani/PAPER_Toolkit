@@ -59,17 +59,19 @@ This explicit direction selection avoids treating learner stage labels as semant
 
 ## Magazine group
 
-Physical grip:
+The source capture contains a magazine `BSX`, classified as `Magazine` with exact OMOD `F4NV-AMR.esp:0x00006B57`, under `WeaponMagazine/P-Mag`. That identity is retained as motion and assembly evidence, but it is not a stable grip identity: `BSX` is a generic name also used by scope OMODs and the magazine instance can be absent in another assembly of the same weapon form.
 
-- `BSX`, classified as `Magazine` / reload role `MagazineBody`;
-- exact OMOD `F4NV-AMR.esp:0x00006B57`;
-- attach point `Fallout4.esm:0x0005D4D7`, editor ID `ap_gun_Mag`, name `Magazine`.
+Physical grips use the unique magazine meshes present in both captured assemblies:
+
+- `Object01` under `WeaponMagazineChild1`;
+- `Object02` under `WeaponMagazineChild3`;
+- `308MagSmalBullets:0` under `WeaponMagazineChild4`.
 
 Top-level driver:
 
 - `WeaponMagazine`, carrying the full magazine subtree.
 
-`P-Mag` lies between `WeaponMagazine` and `BSX`. It is connector evidence only. PAPER drives `WeaponMagazine`, not `P-Mag` and not every descendant separately.
+`P-Mag` is connector evidence only. PAPER drives `WeaponMagazine`, not `P-Mag` and not every descendant separately. Grabbing any of the three concrete magazine meshes selects the same magazine group.
 
 The removal control is the exact `BSX.learnedPrimary` path. The insertion control is the exact `BSX.learnedReturn` path. `WeaponMagazine` supplies the matching exact driver stages.
 
@@ -103,6 +105,12 @@ Return sounds are now spatially separated: bolt-close at closing position `0.50`
 ### Direct-visibility regression and rollback
 
 The first attempt to apply `CullBone.WeaponMagazineChild1`/`UnCullBone.WeaponMagazineChild1` directly through scene-node cull state regressed the next live test. The profile still bound, both attach-only targets installed, and the magazine grip was recognized at `19:07:19.386`, but the spatial path never advanced far enough to reach its first `0.05` sound. Because the new visibility layer was the only behavior introduced at grip activation, it was removed completely from controller and runtime output. The captured markers remain inert evidence until mesh exchange has a movement-safe implementation.
+
+### Physical-identity correction
+
+The `19:20` session equipped a different assembly of the same weapon form. The scene contained two `BSX` nodes under separate `P-Scope` connectors, both classified as `Sight` with OMOD `0x6B56`, and no magazine `BSX` under `P-Mag`. The exact binder therefore rejected the complete profile with `ambiguous-follower:'BSX', grip:'BSX'`; no AttachOnly targets were installed, so ROCK correctly fell back to authority grabs.
+
+The profile no longer treats bare `BSX` as physical magazine identity or a required follower. It binds the three unique concrete magazine meshes above, while its movement remains the exact preserved `BSX.learnedPrimary`/`learnedReturn` data. This keeps physical identity assembly-stable without changing the known-good motion authority.
 
 ## Test checklist
 
