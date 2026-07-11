@@ -61,29 +61,36 @@ namespace redux::motion_library
     };
 
     /*
-     * Format-v2 authoritative reload profile.
+     * Format-v2 spatial movement-preview profile.
      *
-     * A profile is intentionally different from a collection of learned
-     * paths. It binds one verified live reload clip to explicit interaction
-     * groups and contiguous stage windows. While the profile is active the
-     * engine remains the pose oracle for the complete weapon rig; PAPER only
-     * controls clip time and which concrete ROCK collider may manipulate the
-     * current stage. This preserves inherited scene-graph motion and avoids
-     * independently driving a parent and its descendants.
+     * This is curated movement data, not a reload/clip authority. A physical
+     * grip selects one interaction group, and that group cycles between its
+     * explicitly linked primary/return-style stages. Each stage owns a full
+     * translation+rotation control path and full weapon-root-local driver
+     * poses. No clip interception, clip identity check, clock, gameplay event,
+     * or reload-completion contract exists here. sourceClip is provenance;
+     * mapped visibility/gameplay stays inert, while sound-kind findings may
+     * request direct audio without graph notification.
      *
-     * These are equip-scoped values loaded from disk, never per-frame
-     * allocations. Fixed runtime limits are validated by the parser before a
-     * profile can become authoritative.
+     * Values are equip-scoped and parsed off the hot path. The controller
+     * copies only fixed-capacity state for per-frame work.
      */
-    inline constexpr std::uint32_t kAuthoritativeProfileVersion = 1;
-    inline constexpr std::size_t kMaxAuthoritativeGroups = 8;
-    inline constexpr std::size_t kMaxAuthoritativeGripsPerGroup = 32;
-    inline constexpr std::size_t kMaxAuthoritativeDriversPerGroup = 16;
-    inline constexpr std::size_t kMaxAuthoritativeFollowersPerDriver = 64;
-    inline constexpr std::size_t kMaxAuthoritativeStages = 16;
-    inline constexpr std::size_t kMaxAuthoritativeEvents = 64;
+    inline constexpr std::uint32_t kSpatialReloadProfileVersion = 1;
+    inline constexpr std::size_t kMaxSpatialReloadGroups = 8;
+    inline constexpr std::size_t kMaxSpatialReloadGripsPerGroup = 32;
+    inline constexpr std::size_t kMaxSpatialReloadDrivers = 16;
+    inline constexpr std::size_t kMaxSpatialReloadDriverKeys = 64;
+    inline constexpr std::size_t kMaxSpatialReloadFollowersPerDriver = 64;
+    inline constexpr std::size_t kMaxSpatialReloadConnectorsPerGroup = 16;
+    inline constexpr std::size_t kMaxSpatialReloadStages = 16;
+    inline constexpr std::size_t kMaxSpatialReloadEvents = 64;
 
-    struct AuthoritativeGripSource
+    enum class SpatialReloadRuntimeMode : std::uint8_t
+    {
+        MovementPreview = 0,
+    };
+
+    struct SpatialReloadGripSource
     {
         std::string sourceName;
         FormRef omod;
@@ -92,66 +99,128 @@ namespace redux::motion_library
         std::string role;
     };
 
-    struct AuthoritativeDriver
+    struct SpatialReloadDriver
     {
-        // Independently animated rig node driven by the live clip.
+        // Independently animated rig node driven by PAPER.
         std::string node;
         std::string role;
-        // Nodes that must inherit this driver's motion and therefore must
-        // never be independently driven by PAPER.
+        // Descendants carried by this driver. They are executable hierarchy
+        // evidence and are never independently driven.
         std::vector<std::string> inheritedFollowers;
     };
 
-    struct AuthoritativeInteractionGroup
+    struct SpatialReloadInteractionGroup
     {
         std::string id;
         std::string role;
         std::string notes;
-        std::vector<AuthoritativeGripSource> grips;
-        std::vector<AuthoritativeDriver> drivers;
+        // P-* nodes are connection subnodes only. They may prove the captured
+        // hierarchy here, but can never be grips or physical driver identity.
+        std::vector<std::string> connectorEvidence;
+        std::vector<SpatialReloadGripSource> grips;
+        std::vector<SpatialReloadDriver> drivers;
     };
 
-    struct AuthoritativeStage
+    struct SpatialReloadDriverKey
+    {
+        float pathDistance{ 0.0f };
+        weapon_part_motion_path::PoseSample pose{};
+    };
+
+    struct SpatialReloadDriverTrack
+    {
+        std::string node;
+        float scale{ 1.0f };
+        // Weapon-root-local absolute poses keyed explicitly by physical
+        // distance along the stage control path. Variable keys preserve an
+        // auxiliary latch/linkage motion even when the gripped part barely
+        // moves; the parser bounds this to 64 keys per driver.
+        std::vector<SpatialReloadDriverKey> keys;
+    };
+
+    struct SpatialReloadStage
     {
         std::string id;
         std::string groupId;
-        float startSeconds{ 0.0f };
-        float endSeconds{ 0.0f };
+        // Stage-local normalized positions. The controller only scrubs from
+        // entryFraction toward transitionFraction; both refer to the full
+        // controlPath/driverTracks retained below.
+        float entryFraction{ 0.0f };
+        float transitionFraction{ 1.0f };
+        std::string nextStageId;
+        // Resolved by the parser; never serialized as identity.
+        std::uint32_t nextStageIndex{ 0 };
+        // Explicit handoff point on nextStage. This must agree with that
+        // stage's entryFraction, making every cycle edge self-contained.
+        float nextStageEntryFraction{ 0.0f };
+        // Conceptual outward travel for diagnostics/integration. It is
+        // independent of each captured stage's geometric arc length.
+        float outwardFractionAtEntry{ 0.0f };
+        float outwardFractionAtTransition{ 1.0f };
+        // Grip-relative delta pose path. Key zero is identity; arc length is
+        // translation plus rotation at the standard 3-unit lever radius.
+        weapon_part_motion_path::MotionPath controlPath{};
+        // Applied only when transitionFraction is the physical path endpoint.
+        // Interior fractional gates (for example magazine exchange at 0.20)
+        // transition on crossing, never early by this tolerance.
+        float endpointTolerance{ 0.35f };
+        std::vector<SpatialReloadDriverTrack> driverTracks;
         std::string notes;
     };
 
-    enum class AuthoritativeEventKind : std::uint8_t
+    enum class SpatialReloadMappedEventKind : std::uint8_t
     {
         Sound = 0,
         Visibility = 1,
         Gameplay = 2,
     };
 
-    struct AuthoritativeTimelineEvent
+    enum class SpatialReloadMappedEventTrigger : std::uint8_t
+    {
+        StageEnter = 0,
+        GripStart = 1,
+        PathPosition = 2,
+        StageComplete = 3,
+    };
+
+    struct SpatialReloadMappedEvent
     {
         std::string id;
-        float timeSeconds{ 0.0f };
-        AuthoritativeEventKind kind{ AuthoritativeEventKind::Sound };
-        // Exact annotation payload sent to the player's animation graph.
-        std::string animationEvent;
+        std::string stageId;
+        // Resolved by the parser. Visibility/gameplay stay inert; sound-kind
+        // entries may be surfaced as edge-latched direct-audio requests.
+        std::uint32_t stageIndex{ 0 };
+        SpatialReloadMappedEventKind kind{ SpatialReloadMappedEventKind::Sound };
+        SpatialReloadMappedEventTrigger trigger{ SpatialReloadMappedEventTrigger::PathPosition };
+        // PathPosition metadata uses normalized spatial position in the full
+        // stage, plus derived absolute distance and matching delta pose.
+        float pathFraction{ 0.0f };
+        float pathDistance{ 0.0f };
+        bool targetPoseUsed{ false };
+        weapon_part_motion_path::PoseSample targetPose{};
+        // Captured graph annotation retained as metadata. The movement
+        // controller never dispatches it and cannot complete gameplay. For
+        // Sound only, integration may play the payload directly after
+        // stripping the captured "Soundplay." prefix.
+        std::string sourceEvent;
         std::string notes;
     };
 
-    struct AuthoritativeReloadProfile
+    struct SpatialReloadProfile
     {
         bool used{ false };
-        std::uint32_t profileVersion{ kAuthoritativeProfileVersion };
+        std::uint32_t profileVersion{ kSpatialReloadProfileVersion };
+        SpatialReloadRuntimeMode runtimeMode{ SpatialReloadRuntimeMode::MovementPreview };
         std::string archetype;
         std::string sourceCapture;
+        std::string sourceActivityId;
+        // Offline provenance only; never matched, intercepted, frozen, or
+        // sampled by the movement-preview controller.
+        std::string sourceClip;
         std::string notes;
-        std::string clipNameContains;
-        float expectedDurationSeconds{ 0.0f };
-        float durationToleranceSeconds{ 0.05f };
-        // Mode-2 control ends here; the engine resumes natively afterward.
-        float releaseSeconds{ 0.0f };
-        std::vector<AuthoritativeInteractionGroup> groups;
-        std::vector<AuthoritativeStage> stages;
-        std::vector<AuthoritativeTimelineEvent> events;
+        std::vector<SpatialReloadInteractionGroup> groups;
+        std::vector<SpatialReloadStage> stages;
+        std::vector<SpatialReloadMappedEvent> mappedEvents;
     };
 
     struct WeaponLibrary
@@ -166,9 +235,8 @@ namespace redux::motion_library
          */
         bool curated{ false };
         std::vector<PartRecord> parts;
-        // When present, this profile supersedes Hybrid/Authored/Learned/
-        // Scrub selection for this weapon only.
-        AuthoritativeReloadProfile authoritativeReload{};
+        // Curated movement-preview data for physical part grips.
+        SpatialReloadProfile spatialReload{};
     };
 
     [[nodiscard]] std::string serialize(const WeaponLibrary& library);
@@ -176,8 +244,8 @@ namespace redux::motion_library
     /*
      * Fail-closed parse: returns false when the document structure or format
      * version is unusable. Individual malformed legacy motion parts/stages
-     * (hand-edit typos) are SKIPPED, not fatal. An authoritative profile is
-     * an all-or-nothing runtime contract, so any malformed field in it is
+     * (hand-edit typos) are SKIPPED, not fatal. A spatial preview profile is
+     * an all-or-nothing movement contract, so any malformed field in it is
      * fatal. The first problem is described in outError so the runtime can
      * log it.
      */

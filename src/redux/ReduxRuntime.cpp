@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -132,6 +133,23 @@ namespace redux
             transform_math::niRowsToHavokQuaternion(transform.rotate, quaternion);
             pose.rotate = { quaternion[3], quaternion[0], quaternion[1], quaternion[2] };
             return pose;
+        }
+
+        [[nodiscard]] RE::NiTransform providerTransformToNi(
+            const ::rock::provider::RockProviderTransform& source)
+        {
+            RE::NiTransform result{};
+            for (int row = 0; row < 3; ++row) {
+                for (int column = 0; column < 3; ++column) {
+                    result.rotate.entry[row][column] =
+                        source.rotate[static_cast<std::size_t>(row * 3 + column)];
+                }
+            }
+            result.translate = {
+                source.translate[0], source.translate[1], source.translate[2]
+            };
+            result.scale = source.scale;
+            return result;
         }
 
         [[nodiscard]] std::string rootRelativeNodePath(RE::NiAVObject* root, RE::NiAVObject* target)
@@ -392,15 +410,12 @@ namespace redux
         const auto weaponFormId = snapshot.weaponFormId;
 
         // Equip-time import precedes profile arming and every consumer. A
-        // format-v2 authoritative file therefore takes effect on the first
-        // complete weapon-generation frame, independent of the INI mode.
+        // format-v2 spatial file therefore takes effect independent of the
+        // INI mode as soon as its exact captured assembly binds.
         updateMotionLibrary(weaponFormId);
-        const auto* profile = authoritativeProfile();
+        const auto* profile = spatialReloadProfile();
         const bool profilePresent = profile != nullptr;
-        const bool profileReady = authoritativeProfileReady(generationKey);
-        const char* scrubFilter = profilePresent
-            ? profile->clipNameContains.c_str()
-            : g_reduxConfig.clipScrubSweepClipFilter.c_str();
+        const char* scrubFilter = g_reduxConfig.clipScrubSweepClipFilter.c_str();
 
         // Keep the sweep probe's view of the INI fresh across hot reloads;
         // one uncontended lock and a small copy per frame.
@@ -408,12 +423,12 @@ namespace redux
             !profilePresent && g_reduxConfig.clipScrubSweepTest,
             g_reduxConfig.clipScrubSweepSeconds,
             scrubFilter);
-        // Scrub mode arms the session capture: the next activating clip
-        // matching the filter freezes and waits for a hand. Same filter as
-        // the sweep probe (the probe wins when both are enabled).
+        // A curated movement-preview profile must never freeze or steer a
+        // native reload clip. Other weapons retain the learner/ClipScrub
+        // behavior selected by the INI exactly as before this testbed.
         weapon_clip_motion_harvest::setClipScrubCaptureConfig(
-            profileReady ||
-                (!profilePresent && g_reduxConfig.motionPathMode == MotionPathMode::ClipScrub),
+            !profilePresent &&
+                g_reduxConfig.motionPathMode == MotionPathMode::ClipScrub,
             scrubFilter);
 
         /*
@@ -1347,8 +1362,9 @@ namespace redux
             _libraryWeaponFormId = weaponFormId;
             _libraryWeaponRef = {};
             _libraryLoaded.reset();
-            _authoritativeBinding = {};
-            _authoritativeController.reset();
+            _spatialReloadBinding = {};
+            _spatialPreviewSoundFailureLogged = {};
+            _spatialReloadController.reset();
             _libraryStableFrames = 0;
             _librarySyncedRevision = _learner.revision();
             _libraryLastRevision = _librarySyncedRevision;
@@ -1378,39 +1394,42 @@ namespace redux
         }
     }
 
-    const motion_library::AuthoritativeReloadProfile* ReduxRuntime::authoritativeProfile() const
+    const motion_library::SpatialReloadProfile* ReduxRuntime::spatialReloadProfile() const
     {
         if (!_libraryLoaded || !_libraryLoaded->curated ||
-            !_libraryLoaded->authoritativeReload.used) {
+            !_libraryLoaded->spatialReload.used) {
             return nullptr;
         }
-        return &_libraryLoaded->authoritativeReload;
+        return &_libraryLoaded->spatialReload;
     }
 
-    bool ReduxRuntime::authoritativeProfileReady(std::uint64_t generationKey) const
+    bool ReduxRuntime::spatialReloadProfileReady(std::uint64_t generationKey) const
     {
-        return authoritativeProfile() && generationKey != 0 &&
-            _authoritativeBinding.attempted && _authoritativeBinding.valid &&
-            _authoritativeBinding.generationKey == generationKey;
+        return spatialReloadProfile() && generationKey != 0 &&
+            _spatialReloadBinding.attempted && _spatialReloadBinding.valid &&
+            _spatialReloadBinding.generationKey == generationKey;
     }
 
-    void ReduxRuntime::refreshAuthoritativeProfileBinding(std::uint64_t generationKey)
+    void ReduxRuntime::refreshSpatialReloadProfileBinding(std::uint64_t generationKey)
     {
-        const auto* profile = authoritativeProfile();
-        if (!profile || generationKey == 0 || _drivePartCache.generationKey != generationKey) {
-            _authoritativeBinding = {};
+        const auto* profile = spatialReloadProfile();
+        if (!profile || generationKey == 0 ||
+            _drivePartCache.generationKey != generationKey) {
+            _spatialReloadBinding = {};
+            _spatialPreviewSoundFailureLogged = {};
             return;
         }
-        if (_authoritativeBinding.attempted &&
-            _authoritativeBinding.generationKey == generationKey) {
+        if (_spatialReloadBinding.attempted &&
+            _spatialReloadBinding.generationKey == generationKey) {
             return;
         }
 
-        _authoritativeBinding = {};
-        _authoritativeBinding.attempted = true;
-        _authoritativeBinding.generationKey = generationKey;
-        _authoritativeBinding.groupCount = static_cast<std::uint32_t>(
-            (std::min)(profile->groups.size(), _authoritativeBinding.groups.size()));
+        _spatialReloadBinding = {};
+        _spatialPreviewSoundFailureLogged = {};
+        _spatialReloadBinding.attempted = true;
+        _spatialReloadBinding.generationKey = generationKey;
+        _spatialReloadBinding.groupCount = static_cast<std::uint32_t>((std::min)(
+            profile->groups.size(), _spatialReloadBinding.groups.size()));
 
         const auto findEntry = [this](std::string_view name, bool physicalOnly,
                                    std::uint32_t requiredOmod,
@@ -1435,6 +1454,29 @@ namespace redux
             }
             return match;
         };
+        const auto isCacheAncestor = [this](
+                                         const DrivePartCacheEntry* possibleAncestor,
+                                         const DrivePartCacheEntry* possibleChild) {
+            if (!possibleAncestor || !possibleChild || possibleAncestor == possibleChild) {
+                return false;
+            }
+            const auto ancestorIndex = static_cast<std::int32_t>(
+                possibleAncestor - _drivePartCache.entries.data());
+            auto parentIndex = possibleChild->chainParentIndex;
+            for (std::uint32_t hops = 0;
+                 parentIndex >= 0 && hops < _drivePartCache.count;
+                 ++hops) {
+                if (parentIndex == ancestorIndex) {
+                    return true;
+                }
+                if (parentIndex >= static_cast<std::int32_t>(_drivePartCache.count)) {
+                    return false;
+                }
+                parentIndex = _drivePartCache.entries[parentIndex].chainParentIndex;
+            }
+            return false;
+        };
+
         std::string missing;
         const auto recordMissing = [&missing](std::string_view category, std::string_view name) {
             if (!missing.empty()) {
@@ -1446,22 +1488,52 @@ namespace redux
             missing += "'";
         };
 
-        for (std::uint32_t groupIndex = 0; groupIndex < _authoritativeBinding.groupCount; ++groupIndex) {
+        for (std::uint32_t groupIndex = 0;
+             groupIndex < _spatialReloadBinding.groupCount;
+             ++groupIndex) {
             const auto& group = profile->groups[groupIndex];
-            auto& bound = _authoritativeBinding.groups[groupIndex];
+            auto& bound = _spatialReloadBinding.groups[groupIndex];
+            std::array<const DrivePartCacheEntry*,
+                motion_library::kMaxSpatialReloadDrivers>
+                driverEntries{};
+            std::uint32_t driverEntryCount = 0;
 
-            // Driver/follower inventory is an executable invariant: if the
-            // exact captured assembly is not present, this profile does not
-            // silently control a different workbench variant.
+            for (const auto& connector : group.connectorEvidence) {
+                bool ambiguous = false;
+                const auto* entry = findEntry(connector, false, 0, ambiguous);
+                if (!entry || !entry->observationOnly) {
+                    recordMissing(
+                        ambiguous ? "ambiguous-connector" : "connector",
+                        connector);
+                }
+            }
+
+            // The profile drives only independent rig nodes. Descendants and
+            // P-* connectors are inventory evidence, never extra transforms.
             for (const auto& driver : group.drivers) {
                 bool ambiguous = false;
-                if (!findEntry(driver.node, false, 0, ambiguous)) {
-                    recordMissing(ambiguous ? "ambiguous-driver" : "driver", driver.node);
+                const auto* entry = findEntry(driver.node, false, 0, ambiguous);
+                if (!entry || !entry->observationOnly) {
+                    recordMissing(
+                        ambiguous ? "ambiguous-driver" : "driver",
+                        driver.node);
+                } else if (driverEntryCount < driverEntries.size()) {
+                    driverEntries[driverEntryCount++] = entry;
                 }
                 for (const auto& follower : driver.inheritedFollowers) {
                     ambiguous = false;
                     if (!findEntry(follower, false, 0, ambiguous)) {
-                        recordMissing(ambiguous ? "ambiguous-follower" : "follower", follower);
+                        recordMissing(
+                            ambiguous ? "ambiguous-follower" : "follower",
+                            follower);
+                    }
+                }
+            }
+            for (std::uint32_t a = 0; a < driverEntryCount; ++a) {
+                for (std::uint32_t b = a + 1; b < driverEntryCount; ++b) {
+                    if (isCacheAncestor(driverEntries[a], driverEntries[b]) ||
+                        isCacheAncestor(driverEntries[b], driverEntries[a])) {
+                        recordMissing("nested-drivers", group.id);
                     }
                 }
             }
@@ -1469,7 +1541,8 @@ namespace redux
             for (const auto& grip : group.grips) {
                 std::uint32_t omodRuntimeId = 0;
                 if (!grip.omod.empty()) {
-                    omodRuntimeId = motion_library::MotionLibraryStore::runtimeIdFromFormRef(grip.omod);
+                    omodRuntimeId =
+                        motion_library::MotionLibraryStore::runtimeIdFromFormRef(grip.omod);
                     if (omodRuntimeId == 0) {
                         recordMissing("omod", grip.omod.plugin);
                         continue;
@@ -1479,78 +1552,120 @@ namespace redux
                 const auto* entry = findEntry(
                     grip.sourceName, true, omodRuntimeId, ambiguous);
                 if (!entry) {
-                    recordMissing(ambiguous ? "ambiguous-grip" : "grip", grip.sourceName);
+                    recordMissing(
+                        ambiguous ? "ambiguous-grip" : "grip", grip.sourceName);
                     continue;
                 }
                 bool duplicateBody = false;
                 for (std::uint32_t i = 0; i < bound.eligiblePartCount; ++i) {
                     duplicateBody |= bound.eligibleParts[i].bodyId == entry->bodyId;
                 }
-                if (duplicateBody || bound.eligiblePartCount >= bound.eligibleParts.size()) {
+                if (duplicateBody ||
+                    bound.eligiblePartCount >= bound.eligibleParts.size()) {
                     continue;
                 }
                 auto& eligible = bound.eligibleParts[bound.eligiblePartCount++];
                 eligible.bodyId = entry->bodyId;
                 eligible.sourceName = entry->sourceName;
+
+                bool duplicateAcrossGroups = false;
+                for (std::uint32_t i = 0;
+                     i < _spatialReloadBinding.eligiblePartCount;
+                     ++i) {
+                    duplicateAcrossGroups |=
+                        _spatialReloadBinding.eligibleParts[i].bodyId == entry->bodyId;
+                }
+                if (duplicateAcrossGroups) {
+                    recordMissing("grip-in-multiple-groups", grip.sourceName);
+                } else if (_spatialReloadBinding.eligiblePartCount >=
+                    _spatialReloadBinding.eligibleParts.size()) {
+                    recordMissing("combined-grip-capacity", group.id);
+                } else {
+                    _spatialReloadBinding
+                        .eligibleParts[_spatialReloadBinding.eligiblePartCount++] = eligible;
+                }
             }
             if (bound.eligiblePartCount == 0) {
                 recordMissing("group-without-bound-grip", group.id);
             }
         }
 
-        _authoritativeBinding.valid = missing.empty() &&
-            _authoritativeBinding.groupCount == profile->groups.size();
-        if (_authoritativeBinding.valid) {
+        _spatialReloadBinding.valid = missing.empty() &&
+            _spatialReloadBinding.groupCount == profile->groups.size();
+        if (_spatialReloadBinding.valid) {
             RDX_LOG_INFO(Weapon,
-                "Authoritative reload profile bound: archetype='{}' groups={} stages={} events={} gen={:#x} — profile supersedes sMotionPathMode",
+                "Spatial movement-preview profile bound: archetype='{}' groups={} stages={} mappedEvents={} gen={:#x} — recorded physical poses supersede sMotionPathMode without controlling reload",
                 profile->archetype,
                 profile->groups.size(),
                 profile->stages.size(),
-                profile->events.size(),
+                profile->mappedEvents.size(),
                 generationKey);
         } else {
             RDX_LOG_WARN(Weapon,
-                "Authoritative reload profile rejected for generation {:#x}: exact captured assembly did not bind ({}) — PAPER leaves the native reload untouched",
+                "Spatial movement-preview profile rejected for generation {:#x}: exact captured assembly did not bind ({}) — PAPER leaves native behavior untouched",
                 generationKey,
                 missing.empty() ? "profile group capacity mismatch" : missing);
         }
     }
 
-    void ReduxRuntime::dispatchAuthoritativeEvents(
-        const motion_library::AuthoritativeReloadProfile& profile,
-        const authoritative_reload::Controller::FrameOutput& output)
+    void ReduxRuntime::playSpatialPreviewSounds(
+        const motion_library::SpatialReloadProfile& profile,
+        const spatial_reload::Controller::FrameOutput& output)
     {
-        if (output.eventCount == 0) {
+        if (output.soundEventCount == 0) {
             return;
         }
-        auto* player = RE::PlayerCharacter::GetSingleton();
-        if (!player) {
-            RDX_LOG_WARN(Weapon,
-                "Authoritative reload crossed {} event(s), but the player animation graph was unavailable",
-                output.eventCount);
-            return;
-        }
-        for (std::uint32_t i = 0; i < output.eventCount; ++i) {
-            const auto eventIndex = output.eventIndices[i];
-            if (eventIndex >= profile.events.size()) {
+        constexpr std::string_view kSoundCommandPrefix = "Soundplay.";
+        for (std::uint32_t i = 0; i < output.soundEventCount; ++i) {
+            const auto eventIndex = output.soundEventIndices[i];
+            if (eventIndex >= profile.mappedEvents.size() ||
+                eventIndex >= _spatialPreviewSoundFailureLogged.size()) {
                 continue;
             }
-            const auto& event = profile.events[eventIndex];
-            const RE::BSFixedString graphEvent(event.animationEvent.c_str());
-            const bool accepted = player->NotifyAnimationGraphImpl(graphEvent);
-            const char* kind = "sound";
-            if (event.kind == motion_library::AuthoritativeEventKind::Visibility) {
-                kind = "visibility";
-            } else if (event.kind == motion_library::AuthoritativeEventKind::Gameplay) {
-                kind = "gameplay";
+            const auto& event = profile.mappedEvents[eventIndex];
+            if (event.kind != motion_library::SpatialReloadMappedEventKind::Sound) {
+                continue;
             }
-            RDX_LOG_INFO(Weapon,
-                "Authoritative reload event id='{}' kind={} t={:.3f}s payload='{}' graphAccepted={}",
-                event.id,
-                kind,
-                event.timeSeconds,
-                event.animationEvent,
-                accepted);
+            const bool validCommand = event.sourceEvent.size() > kSoundCommandPrefix.size() &&
+                std::equal(
+                    kSoundCommandPrefix.begin(),
+                    kSoundCommandPrefix.end(),
+                    event.sourceEvent.begin(),
+                    [](char left, char right) {
+                        return std::tolower(static_cast<unsigned char>(left)) ==
+                            std::tolower(static_cast<unsigned char>(right));
+                    });
+            auto* audio = validCommand ? RE::BSAudioManager::GetSingleton() : nullptr;
+            bool played = false;
+            if (audio) {
+                RE::BSSoundHandle handle{};
+                // The captured annotation is a graph command; the audio
+                // manager resolves only the NUL-terminated descriptor after
+                // "Soundplay.". Direct playback preserves the sound without
+                // notifying or changing the player's animation graph.
+                audio->GetSoundHandleByName(
+                    handle,
+                    event.sourceEvent.c_str() + kSoundCommandPrefix.size(),
+                    1.0f,
+                    0,
+                    nullptr);
+                played = handle.FadeInPlay(0);
+            }
+            if (played) {
+                RDX_LOG_INFO(Weapon,
+                    "Spatial preview sound id='{}' stage='{}' path={:.3f} descriptor='{}'",
+                    event.id,
+                    event.stageId,
+                    output.pathDistance,
+                    event.sourceEvent.c_str() + kSoundCommandPrefix.size());
+            } else if (!_spatialPreviewSoundFailureLogged[eventIndex]) {
+                _spatialPreviewSoundFailureLogged[eventIndex] = true;
+                RDX_LOG_WARN(Weapon,
+                    "Spatial preview sound id='{}' could not play source annotation '{}' ({})",
+                    event.id,
+                    event.sourceEvent,
+                    validCommand ? "audio descriptor did not resolve" : "expected Soundplay.<descriptor>");
+            }
         }
     }
 
@@ -1618,8 +1733,8 @@ namespace redux
             applied,
             library->curated ? " [CURATED — runtime never overwrites this file]" : "",
             skippedOmods > 0 ? " (some skipped: omod plugin not in load order)" : "",
-            library->authoritativeReload.used
-                ? " [AUTHORITATIVE RELOAD — supersedes sMotionPathMode for this weapon]"
+            library->spatialReload.used
+                ? " [CURATED MOVEMENT PREVIEW — recorded poses supersede sMotionPathMode; native reload untouched]"
                 : "");
         _libraryLoaded = std::move(library);
         // Imported state counts as synced; only NEW learning dirties.
@@ -1736,8 +1851,9 @@ namespace redux
         _libraryWeaponFormId = 0;
         _libraryWeaponRef = {};
         _libraryStableFrames = 0;
-        _authoritativeBinding = {};
-        _authoritativeController.reset();
+        _spatialReloadBinding = {};
+        _spatialPreviewSoundFailureLogged = {};
+        _spatialReloadController.reset();
         RDX_LOG_INFO(Weapon,
             "Learned motion data WIPED (bResetLearnedPaths) — {} library file(s) deleted (curated kept); reloads re-record from scratch, authored strokes re-harvest on the next equip/clip playback",
             deletedFiles);
@@ -1792,8 +1908,9 @@ namespace redux
         _librarySyncedRevision = 0;
         _libraryLastRevision = 0;
         _libraryStableFrames = 0;
-        _authoritativeBinding = {};
-        _authoritativeController.reset();
+        _spatialReloadBinding = {};
+        _spatialPreviewSoundFailureLogged = {};
+        _spatialReloadController.reset();
 
         _sandbox.shutdown();
         _learner.reset();
@@ -1933,7 +2050,7 @@ namespace redux
         // toggle. The profile is already loaded before this equip-time cache
         // build, so it owns that prerequisite without changing the INI.
         if (sawCurrentGeneration && weaponNode &&
-            (g_reduxConfig.fullSubtreeObservation || authoritativeProfile())) {
+            (g_reduxConfig.fullSubtreeObservation || spatialReloadProfile())) {
             const auto nodeTaken = [this](const RE::NiAVObject* node) {
                 for (std::uint32_t i = 0; i < _drivePartCache.count; ++i) {
                     if (_drivePartCache.entries[i].node == node) {
@@ -2128,7 +2245,7 @@ namespace redux
         if (_drivePartCache.generationKey != generationKey) {
             return;
         }
-        refreshAuthoritativeProfileBinding(generationKey);
+        refreshSpatialReloadProfileBinding(generationKey);
         captureRichWeaponSnapshot(weaponNode, generationKey, weaponFormId, _lastRockFrameIndex);
         if (_drivePartCache.count == 0) {
             return;
@@ -2908,24 +3025,26 @@ namespace redux
         WeaponPartDriveSandbox::FrameInput input{};
         input.weaponGenerationKey = generationKey;
         input.weaponFormId = weaponNode && generationKey != 0 ? weaponFormId : 0;
-        const auto* profile = authoritativeProfile();
+        const auto* profile = spatialReloadProfile();
         const bool profilePresent = profile != nullptr;
-        const bool profileReady = authoritativeProfileReady(generationKey);
-        input.motionPathMode = profilePresent ? MotionPathMode::ClipScrub : g_reduxConfig.motionPathMode;
+        const bool profileReady = spatialReloadProfileReady(generationKey);
+        input.motionPathMode = g_reduxConfig.motionPathMode;
         input.stageTransitionsEnabled = g_reduxConfig.stageTransitions;
         input.travelExtremeToleranceFraction = g_reduxConfig.travelExtremeTolerance;
 
         /*
-         * Clip-scrub session lifecycle (mode == scrub). The captured clip
-         * is queried before the sandbox update so this frame's grips see
-         * the live state; the end conditions run here because they are
-         * runtime policy, not clip mechanics: completion hands the clip
-         * back to the engine (native finish = v1 commit semantics), the
-         * idle timeout frees a frozen reload nobody is driving, and a mode
-         * hot-switch away from scrub must not leave a clip frozen.
+         * Curated movement preview is deliberately independent of reload
+         * clips. If this weapon was equipped while an older ClipScrub
+         * session was alive, release it immediately; other weapons retain
+         * the learner's original ClipScrub lifecycle.
          */
         auto scrubSession = weapon_clip_motion_harvest::clipScrubSessionState();
-        if (scrubSession.active) {
+        if (profilePresent && scrubSession.active) {
+            RDX_LOG_INFO(Weapon,
+                "Curated movement preview releasing an existing ClipScrub session — native reload remains unowned");
+            weapon_clip_motion_harvest::endClipScrubSession();
+            scrubSession.active = false;
+        } else if (scrubSession.active) {
             if (scrubSession.weaponFormId != input.weaponFormId ||
                 scrubSession.weaponGenerationKey != generationKey) {
                 RDX_LOG_WARN(Weapon,
@@ -2936,13 +3055,10 @@ namespace redux
                     generationKey);
                 weapon_clip_motion_harvest::endClipScrubSession();
                 scrubSession.active = false;
-            } else if (profilePresent && !profileReady) {
+            } else if (g_reduxConfig.motionPathMode != MotionPathMode::ClipScrub) {
                 weapon_clip_motion_harvest::endClipScrubSession();
                 scrubSession.active = false;
-            } else if (!profilePresent && g_reduxConfig.motionPathMode != MotionPathMode::ClipScrub) {
-                weapon_clip_motion_harvest::endClipScrubSession();
-                scrubSession.active = false;
-            } else if (!profilePresent && scrubSession.fraction >= kClipScrubCompleteFraction) {
+            } else if (scrubSession.fraction >= kClipScrubCompleteFraction) {
                 RDX_LOG_INFO(Weapon,
                     "CLIP-SCRUB complete at fraction {:.3f} — releasing to native (engine finishes the reload)",
                     scrubSession.fraction);
@@ -2950,12 +3066,15 @@ namespace redux
                 scrubSession.active = false;
             }
         }
-        if (scrubSession.sessionId != _scrubLastSessionId) {
+        if (!profilePresent && scrubSession.sessionId != _scrubLastSessionId) {
             _scrubLastSessionId = scrubSession.sessionId;
             _scrubIdleFrames = 0;
         }
-        input.clipScrubSessionId = scrubSession.sessionId;
-        input.clipScrubFraction = scrubSession.fraction;
+        if (!profilePresent) {
+            input.clipScrubSessionActive = scrubSession.active;
+            input.clipScrubSessionId = scrubSession.sessionId;
+            input.clipScrubFraction = scrubSession.fraction;
+        }
 
         const auto* api = ::rock::provider::RockProviderApi::inst;
         // Trigger-arming support probe, once: an older ROCK without raw wand
@@ -2992,117 +3111,10 @@ namespace redux
                 : 0x7FFF'FFFFu;
         }
 
-        authoritative_reload::Controller::FrameOutput profileOutput{};
-        if (profileReady) {
-            const auto previewStage = _authoritativeController.previewStageIndex(scrubSession.sessionId);
-            std::uint32_t previewGroup = 0;
-            if (previewStage < profile->stages.size()) {
-                const auto& groupId = profile->stages[previewStage].groupId;
-                for (std::uint32_t i = 0; i < profile->groups.size(); ++i) {
-                    if (profile->groups[i].id == groupId) {
-                        previewGroup = i;
-                        break;
-                    }
-                }
-            }
-            bool currentGroupGripActive = false;
-            if (previewGroup < _authoritativeBinding.groupCount) {
-                const auto& bound = _authoritativeBinding.groups[previewGroup];
-                for (std::size_t handIndex = 0; handIndex < gripReports.size(); ++handIndex) {
-                    const auto& report = gripReports[handIndex];
-                    if (!gripReportValid[handIndex] || report.active == 0 || report.attachOnly == 0 ||
-                        report.providerOwnerToken != _sandbox.ownerToken() ||
-                        report.weaponGenerationKey != generationKey) {
-                        continue;
-                    }
-                    for (std::uint32_t i = 0; i < bound.eligiblePartCount; ++i) {
-                        if (bound.eligibleParts[i].bodyId == report.bodyId) {
-                            currentGroupGripActive = true;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            const auto clipName = providerFixedStringView(
-                scrubSession.clipName.data(), scrubSession.clipName.size());
-            profileOutput = _authoritativeController.update(
-                profile,
-                authoritative_reload::Controller::FrameInput{
-                    .clip = {
-                        .active = scrubSession.active,
-                        .sessionId = scrubSession.sessionId,
-                        .clipName = clipName,
-                        .durationSeconds = scrubSession.durationSeconds,
-                        .cropStartSeconds = scrubSession.cropStartSeconds,
-                        .croppedDurationSeconds = scrubSession.croppedDurationSeconds,
-                        .fraction = scrubSession.fraction,
-                    },
-                    .currentGroupGripActive = currentGroupGripActive,
-                });
-            dispatchAuthoritativeEvents(*profile, profileOutput);
-
-            if (profileOutput.newSession) {
-                if (profileOutput.rejection !=
-                    authoritative_reload::Controller::RejectionReason::None) {
-                    RDX_LOG_WARN(Weapon,
-                        "Authoritative reload rejected captured clip='{}' duration={:.3f}s crop={:.3f}+{:.3f}s: {} — releasing to native",
-                        clipName,
-                        scrubSession.durationSeconds,
-                        scrubSession.cropStartSeconds,
-                        scrubSession.croppedDurationSeconds,
-                        authoritative_reload::rejectionReasonName(profileOutput.rejection));
-                } else if (profileOutput.stageIndex < profile->stages.size() &&
-                    profileOutput.groupIndex < profile->groups.size()) {
-                    const auto& stage = profile->stages[profileOutput.stageIndex];
-                    RDX_LOG_INFO(Weapon,
-                        "Authoritative reload session {} started: stage='{}' group='{}' window=[{:.3f},{:.3f}]s clip='{}'",
-                        scrubSession.sessionId,
-                        stage.id,
-                        profile->groups[profileOutput.groupIndex].id,
-                        stage.startSeconds,
-                        stage.endSeconds,
-                        clipName);
-                }
-            } else if (profileOutput.stageChanged &&
-                profileOutput.stageIndex < profile->stages.size() &&
-                profileOutput.groupIndex < profile->groups.size()) {
-                const auto& stage = profile->stages[profileOutput.stageIndex];
-                RDX_LOG_INFO(Weapon,
-                    "Authoritative reload advanced: stage='{}' group='{}' window=[{:.3f},{:.3f}]s",
-                    stage.id,
-                    profile->groups[profileOutput.groupIndex].id,
-                    stage.startSeconds,
-                    stage.endSeconds);
-            }
-
-            input.clipScrubSessionActive = scrubSession.active &&
-                profileOutput.ownsClipSession && !profileOutput.releaseClip;
-            if (input.clipScrubSessionActive &&
-                profileOutput.stageIndex < profile->stages.size() &&
-                scrubSession.croppedDurationSeconds > 0.0f) {
-                const auto& stage = profile->stages[profileOutput.stageIndex];
-                input.clipScrubWindowEnabled = true;
-                input.clipScrubWindowMinFraction = std::clamp(
-                    (stage.startSeconds - scrubSession.cropStartSeconds) /
-                        scrubSession.croppedDurationSeconds,
-                    0.0f,
-                    1.0f);
-                input.clipScrubWindowMaxFraction = std::clamp(
-                    (stage.endSeconds - scrubSession.cropStartSeconds) /
-                        scrubSession.croppedDurationSeconds,
-                    input.clipScrubWindowMinFraction,
-                    1.0f);
-            }
-        } else if (profilePresent) {
-            // Presence is authoritative even when exact binding failed. Do
-            // not resurrect heuristic grouping or a prior INI scrub session;
-            // empty targets leave the native reload fully in control.
-            _authoritativeController.reset();
-            input.clipScrubSessionActive = false;
-        } else {
-            _authoritativeController.reset();
-            input.clipScrubSessionActive = scrubSession.active;
+        spatial_reload::Controller::FrameInput spatialInput{};
+        spatial_reload::Controller::FrameOutput profileOutput{};
+        if (!profileReady) {
+            _spatialReloadController.reset();
         }
 
         /*
@@ -3161,16 +3173,14 @@ namespace redux
                 _pipboySuppressionAvailable && api && api->isNativePipboyInputSuppressedV1 ? api->isNativePipboyInputSuppressedV1() : false);
         }
 
-        // A bound format-v2 profile supplies the exact collider set for the
-        // current stage and bypasses every heuristic/INI allowlist. Other
-        // weapons retain the existing class+motion-path resolution.
+        // A bound preview exposes every explicit physical grip at once; the
+        // body actually grabbed selects its group. P-* connector evidence
+        // and rig drivers never enter this target list. Other weapons retain
+        // the learner's normal class+motion-path resolution.
         if (profilePresent) {
-            if (profileReady && attachModeArmed &&
-                (!scrubSession.active || profileOutput.ownsClipSession) &&
-                profileOutput.groupIndex < _authoritativeBinding.groupCount) {
-                const auto& bound = _authoritativeBinding.groups[profileOutput.groupIndex];
-                input.eligiblePartCount = bound.eligiblePartCount;
-                input.eligibleParts = bound.eligibleParts;
+            if (profileReady && attachModeArmed) {
+                input.eligiblePartCount = _spatialReloadBinding.eligiblePartCount;
+                input.eligibleParts = _spatialReloadBinding.eligibleParts;
             }
         } else {
             refreshEligibleParts(input.weaponFormId);
@@ -3248,28 +3258,97 @@ namespace redux
                 }
             }
             if (hasWeaponInverse && node && nodeContainsNode(weaponNode, node, 64)) {
-                const RE::NiTransform partWeaponLocal = transform_math::composeTransforms(weaponWorldInverse, node->world);
-                // Hand anchor: the provider hand frame. Only hand DISPLACEMENT
-                // from grip start feeds the scrub, so any hand-rigid point is
-                // equivalent to the grab anchor ROCK used internally.
-                const auto& handTransform = isLeft ? snapshot.leftHandTransform : snapshot.rightHandTransform;
-                const RE::NiPoint3 handWorld{
-                    handTransform.translate[0],
-                    handTransform.translate[1],
-                    handTransform.translate[2],
-                };
-                const RE::NiPoint3 handWeaponLocal = transform_math::worldPointToLocal(weaponNode->world, handWorld);
-                if (finiteNiTransform(partWeaponLocal)) {
+                const RE::NiTransform partWeaponLocal =
+                    transform_math::composeTransforms(weaponWorldInverse, node->world);
+                const auto& providerHand = isLeft
+                    ? snapshot.leftHandTransform
+                    : snapshot.rightHandTransform;
+                const RE::NiTransform handWeaponLocal = transform_math::composeTransforms(
+                    weaponWorldInverse, providerTransformToNi(providerHand));
+                if (finiteNiTransform(partWeaponLocal) &&
+                    finiteNiTransform(handWeaponLocal)) {
                     handInput.partTranslate = weapon_part_motion_path::Vec3{
                         partWeaponLocal.translate.x,
                         partWeaponLocal.translate.y,
                         partWeaponLocal.translate.z,
                     };
                     handInput.partScale = partWeaponLocal.scale;
-                    handInput.handTranslate = weapon_part_motion_path::Vec3{ handWeaponLocal.x, handWeaponLocal.y, handWeaponLocal.z };
+                    handInput.handTranslate = weapon_part_motion_path::Vec3{
+                        handWeaponLocal.translate.x,
+                        handWeaponLocal.translate.y,
+                        handWeaponLocal.translate.z,
+                    };
                     handInput.transformsValid = true;
+
+                    if (profileReady) {
+                        for (std::uint32_t groupIndex = 0;
+                             groupIndex < _spatialReloadBinding.groupCount;
+                             ++groupIndex) {
+                            const auto& bound = _spatialReloadBinding.groups[groupIndex];
+                            bool belongsToGroup = false;
+                            for (std::uint32_t i = 0; i < bound.eligiblePartCount; ++i) {
+                                belongsToGroup |=
+                                    bound.eligibleParts[i].bodyId == report.bodyId;
+                            }
+                            if (!belongsToGroup) {
+                                continue;
+                            }
+                            auto& spatialHand = spatialInput.hands[isLeft ? 1u : 0u];
+                            spatialHand.gripActive = true;
+                            spatialHand.triggerHeld = handInput.triggerHeld;
+                            spatialHand.groupIndex = groupIndex;
+                            spatialHand.gripSequence = report.gripSequence;
+                            spatialHand.partPose = poseFromNiTransform(partWeaponLocal);
+                            spatialHand.handPose = poseFromNiTransform(handWeaponLocal);
+                            spatialHand.posesValid = true;
+                            break;
+                        }
+                    }
                 }
             }
+        }
+
+        if (profileReady) {
+            profileOutput = _spatialReloadController.update(profile, spatialInput);
+            playSpatialPreviewSounds(*profile, profileOutput);
+            if (profileOutput.newGrip &&
+                profileOutput.stageIndex < profile->stages.size() &&
+                profileOutput.groupIndex < profile->groups.size()) {
+                const auto& stage = profile->stages[profileOutput.stageIndex];
+                RDX_LOG_INFO(Weapon,
+                    "Spatial preview grip started: stage='{}' group='{}' segment={:.3f}->{:.3f} outward={:.3f}->{:.3f}",
+                    stage.id,
+                    profile->groups[profileOutput.groupIndex].id,
+                    stage.entryFraction,
+                    stage.transitionFraction,
+                    stage.outwardFractionAtEntry,
+                    stage.outwardFractionAtTransition);
+            } else if (profileOutput.stageChanged &&
+                profileOutput.stageIndex < profile->stages.size() &&
+                profileOutput.groupIndex < profile->groups.size()) {
+                const auto& stage = profile->stages[profileOutput.stageIndex];
+                RDX_LOG_INFO(Weapon,
+                    "Spatial preview path switched by physical gate: stage='{}' group='{}' entry={:.3f} outward={:.3f}",
+                    stage.id,
+                    profile->groups[profileOutput.groupIndex].id,
+                    profileOutput.pathFraction,
+                    profileOutput.outwardFraction);
+            }
+
+            input.spatialPreviewActive = true;
+            input.spatialPreviewDriveCount = (std::min)(
+                profileOutput.driverCount,
+                static_cast<std::uint32_t>(input.spatialPreviewDrives.size()));
+            for (std::uint32_t i = 0; i < input.spatialPreviewDriveCount; ++i) {
+                input.spatialPreviewDrives[i].sourceName = profileOutput.drivers[i].node;
+                input.spatialPreviewDrives[i].target = profileOutput.drivers[i].target;
+                input.spatialPreviewDrives[i].scale = profileOutput.drivers[i].scale;
+            }
+        } else if (profilePresent) {
+            // A malformed/unbound curated profile is fail-closed: clear any
+            // prior preview/learner drive without installing attach targets.
+            _spatialReloadController.reset();
+            input.spatialPreviewActive = true;
         }
 
         std::array<WeaponPartDriveSandbox::SentDrive, WeaponPartDriveSandbox::kMaxSentDrives> sentDrives{};
@@ -3280,21 +3359,8 @@ namespace redux
         const auto sentCount = _sandbox.update(input, _learner, sentDrives.data(), maxTravelEvents.data(),
             &maxTravelEventCount, &scrubDesiredFraction, &scrubFractionValid);
 
-        if (scrubSession.active) {
-            if (profileReady) {
-                _scrubIdleFrames = 0;
-                if (profileOutput.releaseClip) {
-                    weapon_clip_motion_harvest::endClipScrubSession();
-                } else if (profileOutput.desiredFractionValid) {
-                    // Stage seeding/end hold outranks pursuit output. During
-                    // the open stage body the controller leaves this false,
-                    // so the hand remains the sole time authority.
-                    weapon_clip_motion_harvest::setClipScrubDesiredFraction(
-                        profileOutput.desiredFraction);
-                } else if (scrubFractionValid) {
-                    weapon_clip_motion_harvest::setClipScrubDesiredFraction(scrubDesiredFraction);
-                }
-            } else if (scrubFractionValid) {
+        if (!profilePresent && scrubSession.active) {
+            if (scrubFractionValid) {
                 weapon_clip_motion_harvest::setClipScrubDesiredFraction(scrubDesiredFraction);
                 _scrubIdleFrames = 0;
             } else if (++_scrubIdleFrames >= kClipScrubIdleTimeoutFrames) {

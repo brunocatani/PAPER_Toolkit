@@ -1,6 +1,6 @@
-#include "redux/AuthoritativeReloadController.h"
 #include "redux/MotionLibraryFormat.h"
 #include "redux/RichMotionCaptureFormat.h"
+#include "redux/SpatialReloadController.h"
 #include "redux/WeaponClipStrokePolicy.h"
 #include "redux/WeaponPartEligibility.h"
 #include "redux/WeaponPartMotionLearner.h"
@@ -14,6 +14,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <sstream>
 
 #include <nlohmann/json.hpp>
@@ -241,6 +242,30 @@ int main()
         }
         ok &= expectTrue("scrub clamps at the end of the stroke", arc <= path.totalArcLength + 0.001f);
         ok &= expectTrue("scrub reaches the end of the stroke", arc > path.totalArcLength - 0.35f);
+
+        // A bolt-handle unlock can be rotation-only before the linear pull.
+        // The spatial controller must advance from wrist pose even when every
+        // translation segment is degenerate.
+        MotionPath rotationOnly{};
+        rotationOnly.valid = true;
+        constexpr float kQuarterTurn = 1.57079632679f;
+        rotationOnly.totalArcLength = kQuarterTurn * kRotationArcRadiusGameUnits;
+        for (std::uint32_t key = 0; key < kResampledKeyCount; ++key) {
+            const float angle = kQuarterTurn * static_cast<float>(key) /
+                static_cast<float>(kResampledKeyCount - 1);
+            rotationOnly.keys[key].rotate = Quat{
+                std::cos(angle * 0.5f), 0.0f, 0.0f, std::sin(angle * 0.5f)
+            };
+        }
+        float rotationArc = 0.0f;
+        const PoseSample rotatedDesired = rotationOnly.keys.back();
+        for (int i = 0; i < 12; ++i) {
+            rotationArc = scrubPose(rotationOnly, rotationArc, rotatedDesired).arcPosition;
+        }
+        ok &= expectTrue("full-pose scrub traverses a pure-rotation bolt unlock",
+            rotationArc > rotationOnly.totalArcLength - 0.25f);
+        ok &= expectTrue("translation-only scrub remains parked on pure rotation",
+            scrub(rotationOnly, 0.0f, Vec3{}).arcPosition < 0.001f);
     }
 
     {
@@ -761,11 +786,12 @@ int main()
     }
 
     {
-        // The bundled Ozzy profile is itself a regression fixture: validate
-        // the exact shipped file, its format round-trip, and the contiguous
-        // four-stage controller contract including all 15 one-shot events.
+        // The shipped Ozzy file is a movement-only spatial fixture: no clock
+        // or clip authority, explicit groups/OMODs/connectors, group-local
+        // out/return cycles, and all captured annotations retained as mapped
+        // findings. Only sound crossings may become runtime output.
         using namespace redux::motion_library;
-        using redux::authoritative_reload::Controller;
+        using redux::spatial_reload::Controller;
 
         const auto profilePath = std::filesystem::path(PAPER_REDUX_TEST_SOURCE_DIR) /
             "data" / "MotionLibrary" / "Ozzys_MCPR-300.esp_000020A6.json";
@@ -775,101 +801,384 @@ int main()
         profileBuffer << profileStream.rdbuf();
         WeaponLibrary ozzy;
         std::string profileError;
-        ok &= expectTrue("bundled Ozzy profile parses", parse(profileBuffer.str(), ozzy, &profileError));
-        ok &= expectTrue("bundled Ozzy profile parse reports no error", profileError.empty());
-        ok &= expectTrue("Ozzy profile is curated authoritative format 2",
-            ozzy.formatVersion == 2 && ozzy.curated && ozzy.authoritativeReload.used);
-        ok &= expectEqual("Ozzy group count", ozzy.authoritativeReload.groups.size(), std::size_t{ 2 });
-        ok &= expectEqual("Ozzy stage count", ozzy.authoritativeReload.stages.size(), std::size_t{ 4 });
-        ok &= expectEqual("Ozzy event count", ozzy.authoritativeReload.events.size(), std::size_t{ 15 });
+        ok &= expectTrue("bundled Ozzy spatial profile parses",
+            parse(profileBuffer.str(), ozzy, &profileError));
+        ok &= expectTrue("bundled Ozzy spatial parse reports no error", profileError.empty());
+        ok &= expectTrue("Ozzy profile is curated movement-preview format 2",
+            ozzy.formatVersion == 2 && ozzy.curated && ozzy.spatialReload.used &&
+                ozzy.spatialReload.runtimeMode == SpatialReloadRuntimeMode::MovementPreview);
+        ok &= expectEqual("Ozzy spatial group count", ozzy.spatialReload.groups.size(), std::size_t{ 2 });
+        ok &= expectEqual("Ozzy physical stage count", ozzy.spatialReload.stages.size(), std::size_t{ 4 });
+        ok &= expectEqual("Ozzy mapped finding count", ozzy.spatialReload.mappedEvents.size(), std::size_t{ 16 });
+        ok &= expectTrue("source clip is provenance only",
+            ozzy.spatialReload.sourceClip == "Animations\\44Pistol\\WPNReload.hkt");
         ok &= expectTrue("Ozzy receiver OMOD identity retained",
-            !ozzy.authoritativeReload.groups.empty() &&
-                !ozzy.authoritativeReload.groups[0].grips.empty() &&
-                ozzy.authoritativeReload.groups[0].grips[0].omod.plugin == "Ozzys_MCPR-300.esp" &&
-                ozzy.authoritativeReload.groups[0].grips[0].omod.localFormId == 0x1F48u);
+            !ozzy.spatialReload.groups.empty() &&
+                !ozzy.spatialReload.groups[0].grips.empty() &&
+                ozzy.spatialReload.groups[0].grips[0].omod.plugin == "Ozzys_MCPR-300.esp" &&
+                ozzy.spatialReload.groups[0].grips[0].omod.localFormId == 0x1F48u);
+        ok &= expectTrue("P-Bolt is hierarchy evidence rather than a grip",
+            ozzy.spatialReload.groups[0].connectorEvidence.size() == 1 &&
+                ozzy.spatialReload.groups[0].connectorEvidence[0] == "P-Bolt");
+        ok &= expectTrue("latch driver retains explicit physical-distance keys",
+            ozzy.spatialReload.stages[1].driverTracks[2].keys.size() > 3 &&
+                ozzy.spatialReload.stages[1].driverTracks[2].keys[1].pathDistance > 0.0f);
+        ok &= expectTrue("bolt stages cycle only at captured endpoints",
+            std::abs(ozzy.spatialReload.stages[0].transitionFraction - 1.0f) < 0.0001f &&
+                ozzy.spatialReload.stages[0].nextStageId == "bolt_close" &&
+                std::abs(ozzy.spatialReload.stages[3].transitionFraction - 1.0f) < 0.0001f &&
+                ozzy.spatialReload.stages[3].nextStageId == "bolt_open");
+        ok &= expectTrue("magazine exchanges at 20 percent and enters at 80 percent",
+            std::abs(ozzy.spatialReload.stages[1].transitionFraction - 0.20f) < 0.0001f &&
+                ozzy.spatialReload.stages[1].nextStageId == "magazine_insert" &&
+                std::abs(ozzy.spatialReload.stages[1].nextStageEntryFraction - 0.80f) < 0.0001f &&
+                std::abs(ozzy.spatialReload.stages[2].entryFraction - 0.80f) < 0.0001f &&
+                ozzy.spatialReload.stages[2].nextStageId == "magazine_remove");
+
+        std::size_t soundFindingCount = 0;
+        std::size_t visibilityFindingCount = 0;
+        std::size_t gameplayFindingCount = 0;
+        for (const auto& event : ozzy.spatialReload.mappedEvents) {
+            soundFindingCount += event.kind == SpatialReloadMappedEventKind::Sound ? 1u : 0u;
+            visibilityFindingCount += event.kind == SpatialReloadMappedEventKind::Visibility ? 1u : 0u;
+            gameplayFindingCount += event.kind == SpatialReloadMappedEventKind::Gameplay ? 1u : 0u;
+        }
+        ok &= expectEqual("all ten captured sounds retained", soundFindingCount, std::size_t{ 10 });
+        ok &= expectEqual("all four visibility findings retained", visibilityFindingCount, std::size_t{ 4 });
+        ok &= expectEqual("both gameplay findings retained inertly", gameplayFindingCount, std::size_t{ 2 });
+
+        const auto containsTemporalField = [](const auto& self, const nlohmann::json& value) -> bool {
+            static constexpr std::array<std::string_view, 9> blocked{
+                "timeSeconds", "durationSeconds", "durationToleranceSeconds",
+                "startSeconds", "endSeconds", "releaseSeconds", "fraction",
+                "normalizedTime", "clipTime"
+            };
+            if (value.is_object()) {
+                for (const auto& [name, child] : value.items()) {
+                    for (const auto field : blocked) {
+                        if (name == field) {
+                            return true;
+                        }
+                    }
+                    if (self(self, child)) {
+                        return true;
+                    }
+                }
+            } else if (value.is_array()) {
+                for (const auto& child : value) {
+                    if (self(self, child)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+        const auto shippedJson = nlohmann::json::parse(profileBuffer.str());
+        ok &= expectFalse("shipped spatial profile contains no temporal authority fields",
+            containsTemporalField(containsTemporalField, shippedJson["spatialReload"]));
+        ok &= expectTrue("movement-only contract is explicit in JSON",
+            shippedJson["spatialReload"]["runtimeMode"] == "movementPreview" &&
+                shippedJson["spatialReload"].contains("sourceClip") &&
+                shippedJson["spatialReload"].contains("mappedEvents") &&
+                !shippedJson["spatialReload"].contains("activationClip") &&
+                !shippedJson["spatialReload"].contains("events"));
 
         WeaponLibrary ozzyRoundTrip;
         profileError.clear();
-        ok &= expectTrue("authoritative profile serialize/parse round-trips",
-            parse(serialize(ozzy), ozzyRoundTrip, &profileError));
-        ok &= expectTrue("authoritative round-trip reports no error", profileError.empty());
-        ok &= expectEqual("authoritative round-trip stage count",
-            ozzyRoundTrip.authoritativeReload.stages.size(), std::size_t{ 4 });
-        ok &= expectEqual("authoritative round-trip inherited follower count",
-            ozzyRoundTrip.authoritativeReload.groups[1].drivers[0].inheritedFollowers.size(),
-            std::size_t{ 19 });
+        const auto roundTripText = serialize(ozzy);
+        ok &= expectTrue("spatial profile serialize/parse round-trips",
+            parse(roundTripText, ozzyRoundTrip, &profileError));
+        ok &= expectTrue("spatial round-trip reports no error", profileError.empty());
+        ok &= expectEqual("spatial round-trip stage count",
+            ozzyRoundTrip.spatialReload.stages.size(), std::size_t{ 4 });
+        ok &= expectEqual("spatial round-trip inherited follower count",
+            ozzyRoundTrip.spatialReload.groups[1].drivers[0].inheritedFollowers.size(),
+            std::size_t{ 18 });
+        ok &= expectFalse("serialized spatial profile remains clock-free",
+            containsTemporalField(
+                containsTemporalField,
+                nlohmann::json::parse(roundTripText)["spatialReload"]));
 
         Controller controller;
-        const auto& profile = ozzy.authoritativeReload;
-        const auto makeInput = [&](float seconds, bool grip, std::uint64_t session = 1) {
-            return Controller::FrameInput{
-                .clip = {
-                    .active = true,
-                    .sessionId = session,
-                    .clipName = "Animations\\44Pistol\\WPNReload.hkt",
-                    .durationSeconds = profile.expectedDurationSeconds,
-                    .cropStartSeconds = 0.0f,
-                    .croppedDurationSeconds = profile.expectedDurationSeconds,
-                    .fraction = seconds / profile.expectedDurationSeconds,
-                },
-                .currentGroupGripActive = grip,
+        const auto& profile = ozzy.spatialReload;
+        using redux::weapon_part_motion_path::PoseSample;
+        const auto makeInput = [&](bool grip, std::uint32_t groupIndex,
+                                   std::uint64_t gripSequence,
+                                   const PoseSample& handPose,
+                                   bool triggerHeld = true) {
+            Controller::FrameInput input{};
+            input.hands[0] = Controller::HandInput{
+                .gripActive = grip,
+                .triggerHeld = triggerHeld,
+                .groupIndex = groupIndex,
+                .gripSequence = gripSequence,
+                .posesValid = grip,
+                .partPose = {},
+                .handPose = handPose,
+            };
+            return input;
+        };
+        const auto stageIndex = [&](std::string_view id) {
+            for (std::uint32_t i = 0; i < profile.stages.size(); ++i) {
+                if (profile.stages[i].id == id) {
+                    return i;
+                }
+            }
+            return Controller::kInvalidIndex;
+        };
+        const auto anchoredTarget = [&](const SpatialReloadStage& stage,
+                                        float entryFraction,
+                                        const PoseSample& currentPart,
+                                        float targetFraction) {
+            const auto entry = redux::weapon_part_motion_scrub::poseAtArcPosition(
+                stage.controlPath, entryFraction * stage.controlPath.totalArcLength);
+            const auto target = redux::weapon_part_motion_scrub::poseAtArcPosition(
+                stage.controlPath, targetFraction * stage.controlPath.totalArcLength);
+            const auto rotationDelta = redux::weapon_part_motion_path::quatMultiply(
+                target.rotate,
+                redux::weapon_part_motion_path::quatConjugate(entry.rotate));
+            return PoseSample{
+                .translate = redux::weapon_part_motion_path::add(
+                    currentPart.translate,
+                    redux::weapon_part_motion_path::sub(
+                        target.translate, entry.translate)),
+                .rotate = redux::weapon_part_motion_path::quatMultiply(
+                    rotationDelta, currentPart.rotate),
             };
         };
-
-        std::uint32_t emittedEvents = 0;
-        auto output = controller.update(&profile, makeInput(0.0f, false));
-        emittedEvents += output.eventCount;
-        ok &= expectTrue("authoritative controller captures valid Ozzy clip",
-            output.newSession && output.ownsClipSession && output.stageIndex == 0 && output.groupIndex == 0);
-
-        for (std::uint32_t stageIndex = 0; stageIndex < profile.stages.size(); ++stageIndex) {
-            output = controller.update(
-                &profile, makeInput(profile.stages[stageIndex].endSeconds, true));
-            emittedEvents += output.eventCount;
-            ok &= expectTrue("stage end waits for physical grip release",
-                output.awaitingRelease && output.stageIndex == stageIndex && !output.releaseClip);
-
-            output = controller.update(
-                &profile, makeInput(profile.stages[stageIndex].endSeconds, false));
-            emittedEvents += output.eventCount;
-            if (stageIndex + 1 < profile.stages.size()) {
-                ok &= expectTrue("grip release advances exactly one stage",
-                    output.stageChanged && output.stageIndex == stageIndex + 1 && !output.releaseClip);
-            } else {
-                ok &= expectTrue("final grip release returns clip to native",
-                    output.releaseClip && !output.ownsClipSession);
+        const auto trackPoseAt = [](const SpatialReloadDriverTrack& track, float distance) {
+            if (distance <= track.keys.front().pathDistance) {
+                return track.keys.front().pose;
             }
-        }
-        ok &= expectEqual("all Ozzy timeline events emit exactly once", emittedEvents, 15u);
+            for (std::size_t i = 1; i < track.keys.size(); ++i) {
+                if (distance <= track.keys[i].pathDistance) {
+                    const float span = track.keys[i].pathDistance -
+                        track.keys[i - 1].pathDistance;
+                    const float t = span > 0.0f
+                        ? (distance - track.keys[i - 1].pathDistance) / span
+                        : 1.0f;
+                    return redux::weapon_part_motion_path::lerpPose(
+                        track.keys[i - 1].pose, track.keys[i].pose, t);
+                }
+            }
+            return track.keys.back().pose;
+        };
 
-        auto badClip = makeInput(0.0f, false, 2);
-        badClip.clip.durationSeconds += 0.2f;
-        badClip.clip.croppedDurationSeconds += 0.2f;
-        output = controller.update(&profile, badClip);
-        ok &= expectTrue("duration-mismatched authoritative clip fails closed",
-            output.newSession && output.releaseClip &&
-                output.rejection == Controller::RejectionReason::DurationMismatch);
+        std::set<std::string> emittedSoundIds;
+        const auto collectSounds = [&](const Controller::FrameOutput& output) {
+            for (std::uint32_t i = 0; i < output.soundEventCount; ++i) {
+                const auto index = output.soundEventIndices[i];
+                ok &= expectTrue("controller sound index is in range",
+                    index < profile.mappedEvents.size());
+                if (index < profile.mappedEvents.size()) {
+                    ok &= expectEqual("controller emits only sound findings",
+                        profile.mappedEvents[index].kind,
+                        SpatialReloadMappedEventKind::Sound);
+                    emittedSoundIds.insert(profile.mappedEvents[index].id);
+                }
+            }
+        };
+        const auto expectTransitionContinuity = [&](const char* label,
+                                                    const SpatialReloadStage& outgoing,
+                                                    const Controller::FrameOutput& output) {
+            bool continuous = output.driverCount == outgoing.driverTracks.size();
+            const float gateDistance = outgoing.transitionFraction *
+                outgoing.controlPath.totalArcLength;
+            for (std::uint32_t i = 0; i < output.driverCount && continuous; ++i) {
+                const std::string_view node(output.drivers[i].node.data());
+                const SpatialReloadDriverTrack* oldTrack = nullptr;
+                for (const auto& track : outgoing.driverTracks) {
+                    if (track.node == node) {
+                        oldTrack = &track;
+                        break;
+                    }
+                }
+                continuous = oldTrack &&
+                    redux::weapon_part_motion_path::poseDistance(
+                        trackPoseAt(*oldTrack, gateDistance),
+                        output.drivers[i].target) < 0.002f;
+            }
+            ok &= expectTrue(label, continuous);
+        };
+
+        const auto boltOpenIndex = stageIndex("bolt_open");
+        const auto boltCloseIndex = stageIndex("bolt_close");
+        const auto magRemoveIndex = stageIndex("magazine_remove");
+        const auto magInsertIndex = stageIndex("magazine_insert");
+        ok &= expectTrue("all named Ozzy stages resolve",
+            boltOpenIndex != Controller::kInvalidIndex &&
+                boltCloseIndex != Controller::kInvalidIndex &&
+                magRemoveIndex != Controller::kInvalidIndex &&
+                magInsertIndex != Controller::kInvalidIndex);
+
+        auto output = controller.update(
+            &profile, makeInput(true, 0, 1, {}));
+        collectSounds(output);
+        ok &= expectTrue("bolt preview begins from a physical grip without a clip",
+            output.newGrip && output.active && output.groupIndex == 0 &&
+                output.stageIndex == boltOpenIndex && output.driverCount == 3);
+
+        const auto boltOpenGate = anchoredTarget(
+            profile.stages[boltOpenIndex], 0.0f, {}, 1.0f);
+        bool changed = false;
+        for (std::uint32_t step = 0; step < 128 && !changed; ++step) {
+            output = controller.update(
+                &profile, makeInput(true, 0, 1, boltOpenGate, false));
+            collectSounds(output);
+            changed = output.stageChanged;
+        }
+        ok &= expectTrue("bolt outgoing switches at its physical maximum",
+            changed && output.stageIndex == boltCloseIndex &&
+                std::abs(output.pathFraction) < 0.0001f &&
+                std::abs(output.outwardFraction - 1.0f) < 0.0001f);
+        expectTransitionContinuity(
+            "bolt open-to-close handoff preserves driver poses",
+            profile.stages[boltOpenIndex], output);
+
+        const auto boltCloseGate = anchoredTarget(
+            profile.stages[boltCloseIndex],
+            profile.stages[boltCloseIndex].entryFraction,
+            boltOpenGate,
+            profile.stages[boltCloseIndex].transitionFraction);
+        changed = false;
+        for (std::uint32_t step = 0; step < 128 && !changed; ++step) {
+            output = controller.update(
+                &profile, makeInput(true, 0, 1, boltCloseGate, false));
+            collectSounds(output);
+            changed = output.stageChanged;
+        }
+        ok &= expectTrue("bolt incoming switches back only at seated minimum",
+            changed && output.stageIndex == boltOpenIndex &&
+                std::abs(output.pathFraction) < 0.0001f &&
+                std::abs(output.outwardFraction) < 0.0001f);
+
+        output = controller.update(
+            &profile, makeInput(false, Controller::kInvalidIndex, 0, {}));
+        ok &= expectTrue("release ends preview drives without gameplay completion",
+            !output.active && output.driverCount == 0 && output.soundEventCount == 0);
+
+        output = controller.update(
+            &profile, makeInput(true, 1, 2, {}));
+        collectSounds(output);
+        ok &= expectTrue("magazine preview begins on outgoing group stage",
+            output.newGrip && output.active && output.groupIndex == 1 &&
+                output.stageIndex == magRemoveIndex && output.driverCount == 3);
+
+        const auto& magRemove = profile.stages[magRemoveIndex];
+        const auto magExchangePose = anchoredTarget(
+            magRemove, magRemove.entryFraction, {}, magRemove.transitionFraction);
+        changed = false;
+        for (std::uint32_t step = 0; step < 128 && !changed; ++step) {
+            output = controller.update(
+                &profile, makeInput(true, 1, 2, magExchangePose, false));
+            collectSounds(output);
+            changed = output.stageChanged;
+        }
+        ok &= expectTrue("magazine exchanges at 20 percent of outward travel",
+            changed && output.stageIndex == magInsertIndex &&
+                std::abs(output.pathFraction - 0.80f) < 0.0002f &&
+                std::abs(output.outwardFraction - 0.20f) < 0.0002f);
+        expectTransitionContinuity(
+            "20-percent magazine handoff has no driver teleport",
+            magRemove, output);
+
+        const auto& magInsert = profile.stages[magInsertIndex];
+        const auto magSeatedPose = anchoredTarget(
+            magInsert,
+            magInsert.entryFraction,
+            magExchangePose,
+            magInsert.transitionFraction);
+        changed = false;
+        for (std::uint32_t step = 0; step < 128 && !changed; ++step) {
+            output = controller.update(
+                &profile, makeInput(true, 1, 2, magSeatedPose, false));
+            collectSounds(output);
+            changed = output.stageChanged;
+        }
+        ok &= expectTrue("seated magazine resets to outgoing stage at outward zero",
+            changed && output.stageIndex == magRemoveIndex &&
+                std::abs(output.pathFraction) < 0.0001f &&
+                std::abs(output.outwardFraction) < 0.0001f);
+
+        output = controller.update(
+            &profile, makeInput(false, Controller::kInvalidIndex, 0, {}));
+        output = controller.update(
+            &profile, makeInput(true, 1, 3, {}));
+        collectSounds(output);
+        ok &= expectTrue("release resets magazine session to clean outgoing baseline",
+            output.newGrip && output.stageIndex == magRemoveIndex &&
+                std::abs(output.pathFraction) < 0.0001f);
+
+        for (const auto* expected : {
+                 "raise", "bolt_back", "weapon_grab", "bolt_close",
+                 "reload_end_contact", "magazine_grab", "magazine_out",
+                 "magazine_in", "magazine_slap" }) {
+            ok &= expectTrue("reachable preview sound emitted",
+                emittedSoundIds.contains(expected));
+        }
+        ok &= expectFalse("sound outside the active 80-to-100 insertion segment stays mapped-only",
+            emittedSoundIds.contains("magazine_rattle"));
 
         WeaponLibrary invalidProfile;
-        ok &= expectFalse("authoritative profile cannot be auto-overwritable",
-            parse(R"({"format":2,"weapon":{"plugin":"a.esp","id":"0x1"},"curated":false,"parts":[],"authoritativeReload":{}})",
+        auto autoWritable = shippedJson;
+        autoWritable["curated"] = false;
+        ok &= expectFalse("spatial profile cannot be auto-overwritable",
+            parse(autoWritable.dump(), invalidProfile, nullptr));
+        ok &= expectFalse("removed time-driven profile is rejected explicitly",
+            parse(R"({"format":2,"weapon":{"plugin":"a.esp","id":"0x1"},"curated":true,"parts":[],"authoritativeReload":{}})",
                 invalidProfile, nullptr));
         ok &= expectFalse("hand-edited wrong JSON field types fail closed without escaping",
             parse(R"({"format":"two","weapon":{"plugin":"a.esp","id":"0x1"},"parts":[]})",
                 invalidProfile, nullptr));
 
-        auto invalidOmod = nlohmann::json::parse(serialize(ozzy));
-        invalidOmod["authoritativeReload"]["groups"][0]["grips"][0]["omod"] = {
+        auto invalidOmod = nlohmann::json::parse(roundTripText);
+        invalidOmod["spatialReload"]["groups"][0]["grips"][0]["omod"] = {
             { "plugin", "" }, { "id", "0x00000001" }
         };
-        ok &= expectFalse("partial authoritative OMOD identity fails closed",
+        ok &= expectFalse("partial spatial OMOD identity fails closed",
             parse(invalidOmod.dump(), invalidProfile, nullptr));
 
-        auto connectorGrip = nlohmann::json::parse(serialize(ozzy));
-        connectorGrip["authoritativeReload"]["groups"][0]["grips"][0]["source"] =
+        auto connectorGrip = nlohmann::json::parse(roundTripText);
+        connectorGrip["spatialReload"]["groups"][0]["grips"][0]["source"] =
             "P-Bolt";
         ok &= expectFalse("P-* connection point cannot become a physical grip",
             parse(connectorGrip.dump(), invalidProfile, nullptr));
+
+        auto temporalInjection = nlohmann::json::parse(roundTripText);
+        temporalInjection["spatialReload"]["stages"][0]["startSeconds"] = 0.0;
+        ok &= expectFalse("any temporal field invalidates the spatial profile",
+            parse(temporalInjection.dump(), invalidProfile, nullptr));
+
+        auto wrongRuntimeMode = nlohmann::json::parse(roundTripText);
+        wrongRuntimeMode["spatialReload"]["runtimeMode"] = "reloadReplacement";
+        ok &= expectFalse("reload-replacement runtime mode is rejected",
+            parse(wrongRuntimeMode.dump(), invalidProfile, nullptr));
+
+        auto removedClipAuthority = nlohmann::json::parse(roundTripText);
+        removedClipAuthority["spatialReload"]["activationClip"] =
+            "Animations\\44Pistol\\WPNReload.hkt";
+        ok &= expectFalse("removed activation clip authority is rejected",
+            parse(removedClipAuthority.dump(), invalidProfile, nullptr));
+
+        auto removedExecutableEvents = nlohmann::json::parse(roundTripText);
+        removedExecutableEvents["spatialReload"]["events"] = nlohmann::json::array();
+        ok &= expectFalse("removed executable event surface is rejected",
+            parse(removedExecutableEvents.dump(), invalidProfile, nullptr));
+
+        auto brokenCycle = nlohmann::json::parse(roundTripText);
+        brokenCycle["spatialReload"]["stages"][1]["nextStage"] = "bolt_close";
+        ok &= expectFalse("stage cycle cannot cross interaction groups",
+            parse(brokenCycle.dump(), invalidProfile, nullptr));
+
+        auto wrongEventPose = nlohmann::json::parse(roundTripText);
+        for (auto& encodedEvent : wrongEventPose["spatialReload"]["mappedEvents"]) {
+            if (encodedEvent["trigger"] == "pathPosition") {
+                encodedEvent["targetPose"][0] = 999.0;
+                break;
+            }
+        }
+        ok &= expectFalse("mapped event pose must agree with its physical path fraction",
+            parse(wrongEventPose.dump(), invalidProfile, nullptr));
     }
 
     {

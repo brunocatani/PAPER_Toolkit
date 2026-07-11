@@ -28,9 +28,13 @@ namespace redux::weapon_part_motion_scrub
     // Per-frame scrub travel clamp in arc units; generous for a 90 fps hand
     // pull but blocks single-frame teleports from tracking spikes.
     inline constexpr float kMaxScrubAdvancePerFrame = 2.0f;
-    // Segments whose translation span is below this cannot be projected onto
-    // and are skipped (pure-rotation stretches of the stroke).
+    // Segments whose translation span is below this cannot be projected by
+    // the legacy translation-only policy and are skipped there.
     inline constexpr float kDegenerateSegmentLengthGameUnits = 1.0e-3f;
+    // Full-pose projection samples each nearby segment at a fixed resolution.
+    // Nine points are enough for the 24-key spatial paths while keeping the
+    // hot path bounded and allocation-free.
+    inline constexpr std::uint32_t kPoseProjectionSubdivisions = 8;
 
     struct ScrubResult
     {
@@ -113,6 +117,46 @@ namespace redux::weapon_part_motion_scrub
             }
             return best;
         }
+
+        inline SegmentProjection projectPoseOntoSegment(
+            const MotionPath& path,
+            std::uint32_t segment,
+            const PoseSample& desiredPose)
+        {
+            SegmentProjection best{};
+            const float keySpacing = path.totalArcLength / static_cast<float>(kResampledKeyCount - 1);
+            for (std::uint32_t sample = 0; sample <= kPoseProjectionSubdivisions; ++sample) {
+                const float t = static_cast<float>(sample) /
+                    static_cast<float>(kPoseProjectionSubdivisions);
+                const auto candidate = weapon_part_motion_path::lerpPose(
+                    path.keys[segment], path.keys[segment + 1], t);
+                const float distance = weapon_part_motion_path::poseDistance(desiredPose, candidate);
+                if (!best.valid || distance < best.distance) {
+                    best = SegmentProjection{
+                        .valid = true,
+                        .distance = distance,
+                        .arcPosition = keySpacing * (static_cast<float>(segment) + t),
+                    };
+                }
+            }
+            return best;
+        }
+
+        inline SegmentProjection bestPoseProjectionInRange(
+            const MotionPath& path,
+            std::uint32_t firstSegment,
+            std::uint32_t lastSegment,
+            const PoseSample& desiredPose)
+        {
+            SegmentProjection best{};
+            for (std::uint32_t segment = firstSegment; segment <= lastSegment; ++segment) {
+                const auto candidate = projectPoseOntoSegment(path, segment, desiredPose);
+                if (candidate.valid && (!best.valid || candidate.distance < best.distance)) {
+                    best = candidate;
+                }
+            }
+            return best;
+        }
     }
 
     /*
@@ -164,6 +208,52 @@ namespace redux::weapon_part_motion_scrub
             const float advance = best.arcPosition - clampedCurrent;
             const float clampedAdvance = (std::min)(kMaxScrubAdvancePerFrame, (std::max)(-kMaxScrubAdvancePerFrame, advance));
             newArc = (std::min)(path.totalArcLength, (std::max)(0.0f, clampedCurrent + clampedAdvance));
+        }
+        return ScrubResult{
+            .valid = true,
+            .arcPosition = newArc,
+            .target = poseAtArcPosition(path, newArc),
+        };
+    }
+
+    /*
+     * Full translation+rotation projection for curated spatial previews. This
+     * is deliberately separate from the legacy translation-only entry point:
+     * old learned behavior keeps its exact tuning, while a bolt-handle unlock
+     * whose first segment is pure rotation can progress from wrist rotation.
+     */
+    inline ScrubResult scrubPose(
+        const MotionPath& path,
+        float currentArcPosition,
+        const PoseSample& desiredPose)
+    {
+        if (!path.valid || !(path.totalArcLength > 0.0f)) {
+            return {};
+        }
+        const float keySpacing = path.totalArcLength / static_cast<float>(kResampledKeyCount - 1);
+        const float clampedCurrent = (std::min)(
+            path.totalArcLength, (std::max)(0.0f, currentArcPosition));
+        const std::uint32_t currentSegment = (std::min)(
+            kResampledKeyCount - 2,
+            keySpacing > 0.0f ? static_cast<std::uint32_t>(clampedCurrent / keySpacing) : 0u);
+        const std::uint32_t firstSegment = currentSegment >= kScrubSearchWindowSegments
+            ? currentSegment - kScrubSearchWindowSegments
+            : 0u;
+        const std::uint32_t lastSegment = (std::min)(
+            kResampledKeyCount - 2,
+            currentSegment + kScrubSearchWindowSegments);
+
+        const auto best = detail::bestPoseProjectionInRange(
+            path, firstSegment, lastSegment, desiredPose);
+        float newArc = clampedCurrent;
+        if (best.valid) {
+            const float advance = best.arcPosition - clampedCurrent;
+            const float clampedAdvance = (std::min)(
+                kMaxScrubAdvancePerFrame,
+                (std::max)(-kMaxScrubAdvancePerFrame, advance));
+            newArc = (std::min)(
+                path.totalArcLength,
+                (std::max)(0.0f, clampedCurrent + clampedAdvance));
         }
         return ScrubResult{
             .valid = true,

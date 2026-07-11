@@ -171,7 +171,7 @@ if(POST_BUILD_COPY_PLUGIN)
         add_custom_command(
           TARGET ${PROJECT_NAME}
           POST_BUILD
-          COMMENT "Copying bundled authoritative motion profiles to '${copy_path}/F4SE/Plugins/PAPERReduxMotionLibrary/'"
+          COMMENT "Copying bundled curated motion profiles to '${copy_path}/F4SE/Plugins/PAPERReduxMotionLibrary/'"
           COMMAND ${CMAKE_COMMAND} -E make_directory "${copy_path}/F4SE/Plugins/PAPERReduxMotionLibrary/"
           COMMAND ${CMAKE_COMMAND} -E copy_if_different ${bundled_motion_profiles} "${copy_path}/F4SE/Plugins/PAPERReduxMotionLibrary/"
           COMMAND_EXPAND_LISTS
@@ -196,8 +196,8 @@ if(BUILD_PAPER_REDUX_TESTS)
   find_package(nlohmann_json CONFIG REQUIRED)
   add_executable(PAPERReduxWeaponPartMotionPolicyTests
     "${ROOT_DIR}/tests/WeaponPartMotionPolicyTests.cpp"
-    "${SOURCE_DIR}/redux/AuthoritativeReloadController.cpp"
-    "${SOURCE_DIR}/redux/AuthoritativeReloadProfileFormat.cpp"
+    "${SOURCE_DIR}/redux/SpatialReloadController.cpp"
+    "${SOURCE_DIR}/redux/SpatialReloadProfileFormat.cpp"
     "${SOURCE_DIR}/redux/WeaponPartMotionLearner.cpp"
     "${SOURCE_DIR}/redux/MotionLibraryFormat.cpp"
     "${SOURCE_DIR}/redux/RichMotionCaptureFormat.cpp"

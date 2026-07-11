@@ -169,7 +169,7 @@ namespace redux::motion_library
                 }
                 path = bundledPath.string();
                 RDX_LOG_INFO(Config,
-                    "Motion library: loading bundled authoritative profile '{}' (no user override present)",
+                    "Motion library: loading bundled curated profile '{}' (no user override present)",
                     bundledPath.filename().string());
             }
         }

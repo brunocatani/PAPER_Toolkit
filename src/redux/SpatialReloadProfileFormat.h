@@ -6,11 +6,11 @@
 
 #include "redux/MotionLibraryFormat.h"
 
-namespace redux::motion_library::authoritative_profile_format
+namespace redux::motion_library::spatial_profile_format
 {
-    [[nodiscard]] nlohmann::json toJson(const AuthoritativeReloadProfile& profile);
+    [[nodiscard]] nlohmann::json toJson(const SpatialReloadProfile& profile);
     [[nodiscard]] bool fromJson(
         const nlohmann::json& json,
-        AuthoritativeReloadProfile& out,
+        SpatialReloadProfile& out,
         std::string* outError);
 }

@@ -1,6 +1,6 @@
 #include "redux/MotionLibraryFormat.h"
 
-#include "redux/AuthoritativeReloadProfileFormat.h"
+#include "redux/SpatialReloadProfileFormat.h"
 
 #include <nlohmann/json.hpp>
 
@@ -201,9 +201,9 @@ namespace redux::motion_library
             parts.push_back(std::move(p));
         }
         j["parts"] = std::move(parts);
-        if (library.authoritativeReload.used) {
-            j["authoritativeReload"] =
-                authoritative_profile_format::toJson(library.authoritativeReload);
+        if (library.spatialReload.used) {
+            j["spatialReload"] =
+                spatial_profile_format::toJson(library.spatialReload);
         }
         // 2-space indent: these files are the hand-tuning surface.
         return j.dump(2);
@@ -238,20 +238,26 @@ namespace redux::motion_library
         out.weaponName = j.value("weaponName", std::string{});
         out.curated = j.value("curated", false);
         if (j.contains("authoritativeReload")) {
+            if (outError) {
+                *outError = "authoritativeReload is the removed time-driven profile; regenerate as spatialReload";
+            }
+            return false;
+        }
+        if (j.contains("spatialReload")) {
             if (out.formatVersion < 2) {
                 if (outError) {
-                    *outError = "authoritativeReload requires format 2";
+                    *outError = "spatialReload requires format 2";
                 }
                 return false;
             }
             if (!out.curated) {
                 if (outError) {
-                    *outError = "authoritativeReload requires curated=true so runtime learning cannot overwrite it";
+                    *outError = "spatialReload requires curated=true so runtime learning cannot overwrite it";
                 }
                 return false;
             }
-            if (!authoritative_profile_format::fromJson(
-                    j["authoritativeReload"], out.authoritativeReload, outError)) {
+            if (!spatial_profile_format::fromJson(
+                    j["spatialReload"], out.spatialReload, outError)) {
                 return false;
             }
         }
