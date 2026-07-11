@@ -183,6 +183,7 @@ if(BUILD_PAPER_REDUX_TESTS)
     "${ROOT_DIR}/tests/WeaponPartMotionPolicyTests.cpp"
     "${SOURCE_DIR}/redux/WeaponPartMotionLearner.cpp"
     "${SOURCE_DIR}/redux/MotionLibraryFormat.cpp"
+    "${SOURCE_DIR}/redux/RichMotionCaptureFormat.cpp"
   )
   target_compile_features(PAPERReduxWeaponPartMotionPolicyTests PRIVATE cxx_std_23)
   target_include_directories(PAPERReduxWeaponPartMotionPolicyTests PRIVATE ${SOURCE_DIR})

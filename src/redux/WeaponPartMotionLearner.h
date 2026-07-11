@@ -5,6 +5,7 @@
 #include <string_view>
 
 #include "redux/MotionPathMode.h"
+#include "redux/RichMotionCaptureFormat.h"
 #include "redux/WeaponClipStrokePolicy.h"
 #include "redux/WeaponPartMotionPathPolicy.h"
 
@@ -49,14 +50,19 @@ namespace redux
     class WeaponPartMotionLearner
     {
     public:
-        static constexpr std::size_t kMaxStoredPaths = 64;
+        // A rich modded weapon can expose close to ROCK's 100-body budget;
+        // keep enough serving records for several currently encountered
+        // weapons without evicting data before its weapon-switch flush.
+        static constexpr std::size_t kMaxStoredPaths = 256;
         // One recorder per evidence part — the learner observes EVERY part,
         // unfiltered by grab eligibility, so every mover of a reload records
         // simultaneously: co-movement grouping needs concurrent recordings
         // to compare, and later-phase motions need parts that are still at
         // grab time to be watched too.
-        static constexpr std::size_t kMaxActiveRecorders = 48;
+        static constexpr std::size_t kMaxActiveRecorders = 128;
         static constexpr std::size_t kMaxSourceName = 64;
+        static constexpr std::size_t kMaxCaptureNodePath = 256;
+        static constexpr std::uint32_t kMinimumFollowerOverlapSamples = 8;
         // A recorder whose part was not observed for this many observations is
         // stale (weapon switched / part removed) and may be reclaimed.
         static constexpr std::uint64_t kRecorderStaleObservationAge = 300;
@@ -99,6 +105,22 @@ namespace redux
             float scale{ 1.0f };
             // False when a provider drive owned the node this frame.
             bool trusted{ true };
+            // Rich-capture diagnostics/identity. None of these affect the
+            // serving key or learner policy.
+            std::uint64_t rockFrameIndex{ 0 };
+            std::uint64_t weaponGenerationKey{ 0 };
+            std::uint32_t catalogPartId{ 0 };
+            std::uint32_t bodyId{ 0x7FFF'FFFFu };
+            std::string_view nodePath{};
+            bool nodePathTruncated{ false };
+            std::uint64_t clipActivityId{ 0 };
+            std::uint64_t clipScrubSessionId{ 0 };
+            std::uint32_t clipConcurrentActivityCount{ 0 };
+            float clipFraction{ 0.0f };
+            float clipLocalTimeSeconds{ 0.0f };
+            std::string_view clipName{};
+            float clipDurationSeconds{ 0.0f };
+            float clipCroppedDurationSeconds{ 0.0f };
         };
 
         /*
@@ -129,6 +151,71 @@ namespace redux
         void beginObservationFrame();
 
         void observe(const Observation& observation);
+
+        /*
+         * Rich raw-capture sink. The view and every pointed-to array remain
+         * valid only during the callback. The runtime immediately copies it
+         * into an owned, event-scoped value and the disk writer serializes it
+         * off-thread. No callback means the original learner hot path.
+         */
+        struct RawCaptureView
+        {
+            struct SelectedFollowerView
+            {
+                std::uint32_t omodFormId{ 0 };
+                std::uint32_t catalogPartId{ 0 };
+                std::uint32_t bodyId{ 0x7FFF'FFFFu };
+                std::string_view sourceName{};
+                bool rigid{ false };
+            };
+            std::uint32_t weaponFormId{ 0 };
+            std::uint32_t omodFormId{ 0 };
+            std::string_view sourceName{};
+            std::uint64_t weaponGenerationKey{ 0 };
+            std::uint32_t catalogPartId{ 0 };
+            std::uint32_t bodyId{ 0x7FFF'FFFFu };
+            std::string_view nodePath{};
+            bool nodePathTruncated{ false };
+            rich_capture::StrokeTermination termination{ rich_capture::StrokeTermination::Settled };
+            rich_capture::ServingDecision servingDecision{ rich_capture::ServingDecision::NotEvaluated };
+            std::uint64_t learnerStartFrame{ 0 };
+            const weapon_part_motion_path::PoseSample* samples{ nullptr };
+            const std::uint64_t* rockFrameIndices{ nullptr };
+            const float* scales{ nullptr };
+            const std::uint64_t* clipActivityIds{ nullptr };
+            const std::uint64_t* clipScrubSessionIds{ nullptr };
+            const std::uint32_t* clipConcurrentActivityCounts{ nullptr };
+            const float* clipFractions{ nullptr };
+            const float* clipLocalTimesSeconds{ nullptr };
+            std::uint32_t sampleCount{ 0 };
+            bool terminalSamplePresent{ false };
+            Observation terminalSample{};
+            std::uint32_t peakSampleIndex{ 0 };
+            float peakExcursion{ 0.0f };
+            float fullRecordingArcLength{ 0.0f };
+            weapon_part_motion_path::MotionPath candidatePath{};
+            bool classifiedAsReturnStage{ false };
+            bool replacedServingPath{ false };
+            std::uint32_t selectedRigidFollowerCount{ 0 };
+            std::uint32_t selectedCoTimedFollowerCount{ 0 };
+            const SelectedFollowerView* selectedFollowers{ nullptr };
+            std::uint32_t selectedFollowerCount{ 0 };
+            GroupingTuning tuning{};
+            std::string_view clipName{};
+            float clipDurationSeconds{ 0.0f };
+            float clipCroppedDurationSeconds{ 0.0f };
+        };
+        using RawCaptureSink = void (*)(const RawCaptureView&, void* context);
+        void setRawCaptureSink(RawCaptureSink sink, void* context)
+        {
+            _rawCaptureSink = sink;
+            _rawCaptureContext = context;
+        }
+
+        // End and preserve every in-flight recorder before a weapon switch,
+        // reset, capture-disable transition, or shutdown. Serving paths are
+        // untouched; recorder slots become immediately reusable.
+        void resetRecorders(rich_capture::StrokeTermination termination);
 
         [[nodiscard]] const weapon_part_motion_path::MotionPath* findPath(
             const PartKey& key,
@@ -257,11 +344,47 @@ namespace redux
             // Last observed weapon-root-local scale of the part; stamped on
             // learned followers so drives restore the authored mesh scale.
             float lastScale{ 1.0f };
+            std::uint64_t lastRockFrameIndex{ 0 };
+            std::uint64_t lastClipActivityId{ 0 };
+            std::uint64_t lastClipScrubSessionId{ 0 };
+            std::uint32_t lastClipConcurrentActivityCount{ 0 };
+            float lastClipFraction{ 0.0f };
+            float lastClipLocalTimeSeconds{ 0.0f };
+            std::uint64_t weaponGenerationKey{ 0 };
+            std::uint32_t catalogPartId{ 0 };
+            std::uint32_t bodyId{ 0x7FFF'FFFFu };
+            std::array<char, kMaxCaptureNodePath> nodePath{};
+            bool nodePathTruncated{ false };
+            std::array<char, kMaxSourceName> clipName{};
+            float clipDurationSeconds{ 0.0f };
+            float clipCroppedDurationSeconds{ 0.0f };
             // Frame index of buffer[1] (buffer[0] is the pre-motion rest
             // pose); aligns concurrent recordings for co-movement checks.
             std::uint64_t startFrame{ 0 };
             weapon_part_motion_path::RecorderState state{};
             std::array<weapon_part_motion_path::PoseSample, weapon_part_motion_path::kMaxRecordingSamples> buffer{};
+            std::array<std::uint64_t, weapon_part_motion_path::kMaxRecordingSamples> rockFrameIndices{};
+            std::array<float, weapon_part_motion_path::kMaxRecordingSamples> scales{};
+            std::array<std::uint64_t, weapon_part_motion_path::kMaxRecordingSamples> clipActivityIds{};
+            std::array<std::uint64_t, weapon_part_motion_path::kMaxRecordingSamples> clipScrubSessionIds{};
+            std::array<std::uint32_t, weapon_part_motion_path::kMaxRecordingSamples>
+                clipConcurrentActivityCounts{};
+            std::array<float, weapon_part_motion_path::kMaxRecordingSamples> clipFractions{};
+            std::array<float, weapon_part_motion_path::kMaxRecordingSamples> clipLocalTimesSeconds{};
+        };
+
+        struct StoreCompletedResult
+        {
+            rich_capture::ServingDecision decision{ rich_capture::ServingDecision::NotEvaluated };
+            weapon_part_motion_path::MotionPath candidate{};
+            std::uint32_t peakSampleIndex{ 0 };
+            float peakExcursion{ 0.0f };
+            bool isReturnStage{ false };
+            bool replaced{ false };
+            std::uint32_t rigidFollowerCount{ 0 };
+            std::uint32_t coTimedFollowerCount{ 0 };
+            std::array<RawCaptureView::SelectedFollowerView, weapon_clip_stroke::kMaxFollowers> selectedFollowers{};
+            std::uint32_t selectedFollowerCount{ 0 };
         };
 
         [[nodiscard]] static const StrokeGroup* selectPrimary(const PathSlot& slot, MotionPathMode mode);
@@ -269,8 +392,17 @@ namespace redux
         // preferSlotsWithoutLearnedData: authored stores must not evict a
         // slot holding a learned stroke while a purely-authored slot exists.
         PathSlot* findOrClaimSlot(const PartKey& key, bool preferSlotsWithoutLearnedData);
-        RecorderSlot* acquireRecorderSlot(const PartKey& key);
-        void storeCompletedPath(const RecorderSlot& recorder);
+        RecorderSlot* acquireRecorderSlot(
+            const PartKey& key,
+            std::uint64_t weaponGenerationKey,
+            std::uint32_t catalogPartId);
+        StoreCompletedResult storeCompletedPath(const RecorderSlot& recorder);
+        void emitRawCapture(
+            const RecorderSlot& recorder,
+            std::uint32_t sampleCount,
+            rich_capture::StrokeTermination termination,
+            const StoreCompletedResult* storeResult,
+            const Observation* terminalSample);
 
         std::array<PathSlot, kMaxStoredPaths> _paths{};
         std::array<RecorderSlot, kMaxActiveRecorders> _recorders{};
@@ -278,5 +410,7 @@ namespace redux
         std::uint64_t _observationCounter{ 0 };
         std::uint64_t _frameCounter{ 0 };
         std::uint64_t _revision{ 0 };
+        RawCaptureSink _rawCaptureSink{ nullptr };
+        void* _rawCaptureContext{ nullptr };
     };
 }

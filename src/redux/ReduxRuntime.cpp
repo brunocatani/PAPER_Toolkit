@@ -8,12 +8,18 @@
 #include "redux/WeaponPartEligibility.h"
 #include "redux/WeaponPartMotionScrubPolicy.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <limits>
+#include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace redux
 {
@@ -23,6 +29,7 @@ namespace redux
         // node's baseline on the frame the lease expires, and that restore
         // write is not animation evidence either.
         constexpr std::uint32_t kDrivenPartUntrustedFrames = 3;
+        static_assert(WeaponPartDriveSandbox::kMaxChainLinks >= WeaponPartMotionLearner::kMaxActiveRecorders);
 
         // A part stationary (recorder stillness epsilons), ungripped, and
         // undriven for this many frames counts as sitting at its authored
@@ -111,6 +118,72 @@ namespace redux
                    std::isfinite(transform.translate.z) &&
                    std::isfinite(transform.scale) &&
                    std::abs(transform.scale) > 0.0001f;
+        }
+
+        [[nodiscard]] weapon_part_motion_path::PoseSample poseFromNiTransform(const RE::NiTransform& transform)
+        {
+            weapon_part_motion_path::PoseSample pose{};
+            pose.translate = {
+                transform.translate.x,
+                transform.translate.y,
+                transform.translate.z,
+            };
+            float quaternion[4]{};
+            transform_math::niRowsToHavokQuaternion(transform.rotate, quaternion);
+            pose.rotate = { quaternion[3], quaternion[0], quaternion[1], quaternion[2] };
+            return pose;
+        }
+
+        [[nodiscard]] std::string rootRelativeNodePath(RE::NiAVObject* root, RE::NiAVObject* target)
+        {
+            if (!root || !target) {
+                return {};
+            }
+            struct Segment
+            {
+                std::uint32_t childIndex{ 0 };
+                std::string_view name{};
+            };
+            std::array<Segment, 64> reverse{};
+            std::size_t count = 0;
+            auto* current = target;
+            while (current && current != root && count < reverse.size()) {
+                auto* parent = current->parent;
+                if (!parent) {
+                    return {};
+                }
+                std::uint32_t childIndex = 0;
+                bool found = false;
+                if (auto* parentNode = parent->IsNode()) {
+                    auto& children = parentNode->GetRuntimeData().children;
+                    for (std::uint16_t i = 0; i < children.size(); ++i) {
+                        if (children[i].get() == current) {
+                            childIndex = i;
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if (!found) {
+                    return {};
+                }
+                const char* name = current->name.c_str();
+                reverse[count++] = Segment{ childIndex, name ? std::string_view(name) : std::string_view{} };
+                current = parent;
+            }
+            if (current != root) {
+                return {};
+            }
+            std::string path;
+            path.reserve(count * 24);
+            for (std::size_t i = count; i > 0; --i) {
+                const auto& segment = reverse[i - 1];
+                char indexText[16]{};
+                std::snprintf(indexText, sizeof(indexText), "/[%u]", segment.childIndex);
+                path += indexText;
+                path += segment.name.empty() ? "<unnamed>" : segment.name;
+            }
+            return path.empty() ? "/" : path;
         }
 
         [[nodiscard]] bool nodeContainsNode(RE::NiAVObject* root, RE::NiAVObject* target, int maxDepth)
@@ -311,6 +384,8 @@ namespace redux
             RDX_LOG_INFO(Runtime, "ReduxRuntime active on ROCK frame callbacks (frame {})", snapshot.frameIndex);
         }
         ageDrivenPartLeases();
+        _lastRockFrameIndex = snapshot.frameIndex;
+        updateRichCaptureState(snapshot);
 
         // Keep the sweep probe's view of the INI fresh across hot reloads;
         // one uncontended lock and a small copy per frame.
@@ -341,9 +416,914 @@ namespace redux
         // observation/eligibility read the learner.
         updateMotionLibrary(weaponFormId);
         observeWeaponPartMotion(weaponNode, generationKey, weaponFormId);
+        drainRichClipCaptures(generationKey, weaponFormId, snapshot.frameIndex);
         drainWeaponClipHarvest(weaponNode, generationKey, weaponFormId);
         updateWeaponClipHarvestWalk(weaponNode, generationKey, weaponFormId);
         updateWeaponPartDriveSandbox(weaponNode, generationKey, weaponFormId, snapshot);
+    }
+
+    void ReduxRuntime::updateRichCaptureState(const rock::provider::RockProviderFrameSnapshot& snapshot)
+    {
+        const bool wanted = g_reduxConfig.motionLibrary && !g_reduxConfig.motionLibraryReadOnly &&
+            g_reduxConfig.richMotionCapture;
+        const bool recorderGenerationChanged = snapshot.weaponFormId != _recorderWeaponFormId ||
+            snapshot.weaponGenerationKey != _recorderGenerationKey;
+        if (recorderGenerationChanged) {
+            // Close the old graph attribution boundary before any part of
+            // this frame can observe/drain the new weapon. resetWalk also
+            // clears hook targets, processed binding ids, and rich activity
+            // slots under one hook lock; the serving queue is then purged of
+            // any groups an in-flight old activation completed first.
+            weapon_clip_motion_harvest::resetWalk();
+            weapon_clip_motion_harvest::clearPending();
+        }
+        if (recorderGenerationChanged && !_richCaptureActive && !wanted) {
+            // Recorder identity is generation-local even without disk
+            // capture; old/new loadouts must never coexist or group.
+            _learner.resetRecorders(rich_capture::StrokeTermination::WeaponChanged);
+        }
+        if (wanted && !_richCaptureActive) {
+            // Any recorder begun while capture was off is incomplete
+            // evidence; clear it before installing the sink.
+            _learner.resetRecorders(rich_capture::StrokeTermination::CaptureDisabled);
+            if (_richCaptureSessionId.empty()) {
+                const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                                     .count();
+                char id[64]{};
+                const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+                std::snprintf(id, sizeof(id), "%lld-%08llX",
+                    static_cast<long long>(now),
+                    static_cast<unsigned long long>(nonce) & 0xFFFF'FFFFull);
+                _richCaptureSessionId = id;
+            }
+            _richCaptureActive = true;
+            _richCaptureWeaponFormId = snapshot.weaponFormId;
+            _richCaptureGenerationKey = snapshot.weaponGenerationKey;
+            _richSnapshotGenerationKey = 0;
+            _pendingRichGeometry = {};
+            _learner.setRawCaptureSink(&ReduxRuntime::rawCaptureSink, this);
+            weapon_clip_motion_harvest::clearRichClipActivities();
+            weapon_clip_motion_harvest::setRichCaptureEnabled(true);
+            RDX_LOG_INFO(Weapon,
+                "Rich motion capture active: session '{}' (append-only per-weapon .capture.jsonl)",
+                _richCaptureSessionId);
+        } else if (!wanted && _richCaptureActive) {
+            // Drain graph-thread packets and preserve partial learned strokes
+            // before disabling their producers.
+            cancelPendingRichGeometryCapture(
+                "rich capture disabled before all deferred geometry chunks were queued",
+                snapshot.frameIndex);
+            weapon_clip_motion_harvest::setRichCaptureEnabled(false);
+            drainRichClipCaptures(
+                _richCaptureGenerationKey,
+                _richCaptureWeaponFormId,
+                snapshot.frameIndex);
+            _learner.resetRecorders(rich_capture::StrokeTermination::CaptureDisabled);
+            _learner.setRawCaptureSink(nullptr, nullptr);
+            _richCaptureActive = false;
+            _richCaptureWeaponFormId = 0;
+            _richCaptureGenerationKey = 0;
+            _richSnapshotGenerationKey = 0;
+            RDX_LOG_INFO(Weapon, "Rich motion capture disabled");
+        }
+
+        if (!_richCaptureActive) {
+            _recorderWeaponFormId = snapshot.weaponFormId;
+            _recorderGenerationKey = snapshot.weaponGenerationKey;
+            return;
+        }
+        if (snapshot.weaponFormId != _richCaptureWeaponFormId ||
+            snapshot.weaponGenerationKey != _richCaptureGenerationKey) {
+            // Packets already queued by the old graph belong to the old
+            // loadout. Drain before changing attribution.
+            weapon_clip_motion_harvest::clearRichClipActivities();
+            cancelPendingRichGeometryCapture(
+                "weapon generation changed before all deferred geometry chunks were queued",
+                snapshot.frameIndex);
+            drainRichClipCaptures(
+                _richCaptureGenerationKey,
+                _richCaptureWeaponFormId,
+                snapshot.frameIndex);
+            _learner.resetRecorders(rich_capture::StrokeTermination::WeaponChanged);
+            _richCaptureWeaponFormId = snapshot.weaponFormId;
+            _richCaptureGenerationKey = snapshot.weaponGenerationKey;
+            _richSnapshotGenerationKey = 0;
+        }
+        _recorderWeaponFormId = snapshot.weaponFormId;
+        _recorderGenerationKey = snapshot.weaponGenerationKey;
+    }
+
+    rich_capture::FormInfo ReduxRuntime::describeForm(std::uint32_t runtimeFormId)
+    {
+        rich_capture::FormInfo info{};
+        info.runtimeFormId = runtimeFormId;
+        if (runtimeFormId == 0) {
+            return info;
+        }
+        auto* form = RE::TESForm::GetFormByID(runtimeFormId);
+        if (!form) {
+            return info;
+        }
+        info.ref = motion_library::MotionLibraryStore::formRefFromRuntimeId(runtimeFormId);
+        info.formType = static_cast<std::uint32_t>(form->GetFormType());
+        if (const char* editorId = form->GetFormEditorID()) {
+            info.editorId = editorId;
+        }
+        const auto fullName = RE::TESFullName::GetFullName(*form);
+        if (!fullName.empty()) {
+            info.displayName.assign(fullName.data(), fullName.size());
+        }
+        return info;
+    }
+
+    rich_capture::CaptureSettings ReduxRuntime::captureSettings() const
+    {
+        return rich_capture::CaptureSettings{
+            .motionPathMode = motionPathModeName(g_reduxConfig.motionPathMode),
+            .fullSubtreeObservation = g_reduxConfig.fullSubtreeObservation,
+            .coTimedFollowers = g_reduxConfig.coTimedFollowers,
+            .coTimedMinOverlap = g_reduxConfig.coTimedMinOverlap,
+            .coTimedMaxArcRatio = g_reduxConfig.coTimedMaxArcRatio,
+            .rigidFollowerDistanceToleranceGameUnits =
+                weapon_clip_stroke::kRigidFollowerDistanceToleranceGameUnits,
+            .followerMinimumExcursionGameUnits = weapon_clip_stroke::kFollowerMinExcursionGameUnits,
+            .minimumOverlapSamples = WeaponPartMotionLearner::kMinimumFollowerOverlapSamples,
+            .stageTransitions = g_reduxConfig.stageTransitions,
+            .stageChainToleranceGameUnits = g_reduxConfig.stageChainToleranceGameUnits,
+            .translationStillEpsilonGameUnits = weapon_part_motion_path::kTranslationEpsilonGameUnits,
+            .rotationStillEpsilonRadians = weapon_part_motion_path::kRotationEpsilonRadians,
+            .rotationArcRadiusGameUnits = weapon_part_motion_path::kRotationArcRadiusGameUnits,
+            .minimumPathExcursionGameUnits = weapon_part_motion_path::kMinPathExcursionGameUnits,
+            .replacementRatio = weapon_part_motion_path::kReplaceExcursionRatio,
+            .restFramesToArm = weapon_part_motion_path::kRestStableFramesToArm,
+            .settleFramesToComplete = weapon_part_motion_path::kRestReturnFramesToComplete,
+            .maximumRawSamples = weapon_part_motion_path::kMaxRecordingSamples,
+            .resampledKeyCount = weapon_part_motion_path::kResampledKeyCount,
+            .maximumObservedParts = static_cast<std::uint32_t>(WeaponPartMotionLearner::kMaxActiveRecorders),
+        };
+    }
+
+    rich_capture::EventContext ReduxRuntime::makeCaptureContext(
+        std::uint32_t weaponFormId,
+        std::uint64_t generationKey,
+        std::uint64_t rockFrameIndex)
+    {
+        rich_capture::EventContext context{};
+        context.sessionId = _richCaptureSessionId;
+        context.sequence = ++_richCaptureSequence;
+        context.capturedAtUnixMs = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+        context.rockFrameIndex = rockFrameIndex;
+        context.weaponGenerationKey = generationKey;
+        context.weapon = describeForm(weaponFormId);
+        context.paperVersion = std::string(Version::NAME);
+        context.rockApiVersion = ::rock::provider::ROCK_PROVIDER_API_VERSION;
+        const auto* api = ::rock::provider::RockProviderApi::inst;
+        if (api) {
+            if (api->getVersion) {
+                context.rockApiVersion = api->getVersion();
+            }
+            if (api->getModVersion) {
+                if (const char* version = api->getModVersion()) {
+                    context.rockModVersion = version;
+                }
+            }
+            if (api->getProviderLimitsV1) {
+                ::rock::provider::RockProviderLimitsV1 limits{};
+                if (api->getProviderLimitsV1(&limits)) {
+                    context.rockFeatureBits = limits.featureBits;
+                }
+            }
+        }
+        return context;
+    }
+
+    bool ReduxRuntime::enqueueRichCapture(rich_capture::Event event)
+    {
+        const auto eventContext = rich_capture::contextOf(event);
+        const auto eventSequence = eventContext.sequence;
+        const auto recordDrop = [this](const rich_capture::EventContext& context, std::uint64_t sequence) {
+            PendingCaptureGap* freeSlot = nullptr;
+            PendingCaptureGap* target = nullptr;
+            for (auto& pending : _pendingCaptureGaps) {
+                if (!pending.used) {
+                    freeSlot = freeSlot ? freeSlot : &pending;
+                    continue;
+                }
+                if (pending.context.weapon.ref.plugin == context.weapon.ref.plugin &&
+                    pending.context.weapon.ref.localFormId == context.weapon.ref.localFormId &&
+                    pending.context.weaponGenerationKey == context.weaponGenerationKey &&
+                    pending.context.sessionId == context.sessionId) {
+                    target = &pending;
+                    break;
+                }
+            }
+            target = target ? target : freeSlot;
+            if (!target) {
+                RDX_LOG_WARN(Weapon,
+                    "Rich motion capture: pending-gap table full; drop for '{}' {:08X} cannot be represented",
+                    context.weapon.ref.plugin,
+                    context.weapon.ref.localFormId);
+                return;
+            }
+            if (!target->used) {
+                target->used = true;
+                target->context = context;
+                target->firstSequence = sequence;
+                target->count = 0;
+            }
+            target->lastSequence = sequence;
+            if (target->count < (std::numeric_limits<std::uint32_t>::max)()) {
+                ++target->count;
+            }
+            if (target->count <= 3) {
+                RDX_LOG_WARN(Weapon,
+                    "Rich motion capture writer queue full for '{}' {:08X} — {} event(s) represented by a pending gap",
+                    context.weapon.ref.plugin,
+                    context.weapon.ref.localFormId,
+                    target->count);
+            }
+        };
+
+        // Queue the normal event first. If only one slot becomes available,
+        // consuming it with an older health row would make a retried
+        // geometry chunk starve forever. Sequence ids make the later gap row
+        // unambiguous even though physical JSONL order can lag recovery.
+        if (!_libraryStore.appendCapture(std::move(event))) {
+            recordDrop(eventContext, eventSequence);
+            return false;
+        }
+
+        // Flush health records to their OWN weapon destinations after
+        // progress. A failed flush remains pending for the next event.
+        for (auto& pending : _pendingCaptureGaps) {
+            if (!pending.used) {
+                continue;
+            }
+            auto gapContext = pending.context;
+            gapContext.sequence = pending.firstSequence;
+            rich_capture::CaptureGapEvent gap{
+                .context = std::move(gapContext),
+                .firstDroppedSequence = pending.firstSequence,
+                .lastDroppedSequence = pending.lastSequence,
+                .droppedEventCount = pending.count,
+                .reason = "bounded writer queue or byte budget was full",
+            };
+            if (!_libraryStore.appendCapture(rich_capture::Event{ std::move(gap) })) {
+                break;
+            }
+            RDX_LOG_WARN(Weapon,
+                "Rich motion capture resumed for '{}' {:08X}; captureGap records {} dropped event(s)",
+                pending.context.weapon.ref.plugin,
+                pending.context.weapon.ref.localFormId,
+                pending.count);
+            pending = {};
+        }
+        return true;
+    }
+
+    void ReduxRuntime::rawCaptureSink(const WeaponPartMotionLearner::RawCaptureView& capture, void* context)
+    {
+        if (context) {
+            static_cast<ReduxRuntime*>(context)->captureRawStroke(capture);
+        }
+    }
+
+    void ReduxRuntime::captureRawStroke(const WeaponPartMotionLearner::RawCaptureView& capture)
+    {
+        if (!_richCaptureActive || capture.weaponFormId == 0 || !capture.samples || capture.sampleCount < 2) {
+            return;
+        }
+        const auto finalFrame = capture.rockFrameIndices
+            ? capture.rockFrameIndices[capture.sampleCount - 1]
+            : _lastRockFrameIndex;
+        rich_capture::RawStrokeEvent event{};
+        event.context = makeCaptureContext(capture.weaponFormId, capture.weaponGenerationKey, finalFrame);
+        event.catalogPartId = capture.catalogPartId;
+        event.bodyId = capture.bodyId;
+        event.omod = describeForm(capture.omodFormId);
+        event.sourceName.assign(capture.sourceName.data(), capture.sourceName.size());
+        event.nodePath.assign(capture.nodePath.data(), capture.nodePath.size());
+        event.nodePathTruncated = capture.nodePathTruncated;
+        event.termination = capture.termination;
+        event.servingDecision = capture.servingDecision;
+        event.learnerStartFrame = capture.learnerStartFrame;
+        event.peakSampleIndex = capture.peakSampleIndex;
+        event.peakExcursion = capture.peakExcursion;
+        event.fullRecordingArcLength = capture.fullRecordingArcLength;
+        event.candidateValid = capture.candidatePath.valid;
+        event.candidatePath = capture.candidatePath;
+        event.classifiedAsReturnStage = capture.classifiedAsReturnStage;
+        event.replacedServingPath = capture.replacedServingPath;
+        event.selectedRigidFollowerCount = capture.selectedRigidFollowerCount;
+        event.selectedCoTimedFollowerCount = capture.selectedCoTimedFollowerCount;
+        if (capture.selectedFollowers) {
+            event.selectedFollowers.reserve(capture.selectedFollowerCount);
+            for (std::uint32_t i = 0; i < capture.selectedFollowerCount; ++i) {
+                const auto& follower = capture.selectedFollowers[i];
+                event.selectedFollowers.push_back(rich_capture::SelectedFollower{
+                    .catalogPartId = follower.catalogPartId,
+                    .bodyId = follower.bodyId,
+                    .omod = describeForm(follower.omodFormId),
+                    .sourceName = std::string(follower.sourceName),
+                    .tier = follower.rigid ? "rigid" : "coTimed",
+                });
+            }
+        }
+        event.settings = captureSettings();
+        event.settings.coTimedFollowers = capture.tuning.coTimedFollowers;
+        event.settings.coTimedMinOverlap = capture.tuning.coTimedMinOverlapFraction;
+        event.settings.coTimedMaxArcRatio = capture.tuning.coTimedMaxArcRatio;
+        event.settings.stageTransitions = capture.tuning.stageCapture;
+        event.settings.stageChainToleranceGameUnits = capture.tuning.stageChainToleranceGameUnits;
+        event.clipName.assign(capture.clipName.data(), capture.clipName.size());
+        event.clipDurationSeconds = capture.clipDurationSeconds;
+        event.clipCroppedDurationSeconds = capture.clipCroppedDurationSeconds;
+        event.samples.reserve(capture.sampleCount);
+        for (std::uint32_t i = 0; i < capture.sampleCount; ++i) {
+            event.samples.push_back(rich_capture::RawSample{
+                .rockFrameIndex = capture.rockFrameIndices ? capture.rockFrameIndices[i] : 0,
+                .pose = capture.samples[i],
+                .scale = capture.scales ? capture.scales[i] : 1.0f,
+                .trusted = true,
+                .clip = rich_capture::ClipSampleContext{
+                    .activityId = capture.clipActivityIds ? capture.clipActivityIds[i] : 0,
+                    .scrubSessionId = capture.clipScrubSessionIds
+                        ? capture.clipScrubSessionIds[i]
+                        : 0,
+                    .concurrentActivityCount = capture.clipConcurrentActivityCounts
+                        ? capture.clipConcurrentActivityCounts[i]
+                        : 0,
+                    .fraction = capture.clipFractions ? capture.clipFractions[i] : 0.0f,
+                    .localTimeSeconds = capture.clipLocalTimesSeconds ? capture.clipLocalTimesSeconds[i] : 0.0f,
+                },
+            });
+        }
+        if (capture.terminalSamplePresent) {
+            event.terminalSamplePresent = true;
+            event.terminalSample = rich_capture::RawSample{
+                .rockFrameIndex = capture.terminalSample.rockFrameIndex,
+                .pose = capture.terminalSample.pose,
+                .scale = capture.terminalSample.scale,
+                .trusted = capture.terminalSample.trusted,
+                .clip = rich_capture::ClipSampleContext{
+                    .activityId = capture.terminalSample.clipActivityId,
+                    .scrubSessionId = capture.terminalSample.clipScrubSessionId,
+                    .concurrentActivityCount =
+                        capture.terminalSample.clipConcurrentActivityCount,
+                    .fraction = capture.terminalSample.clipFraction,
+                    .localTimeSeconds = capture.terminalSample.clipLocalTimeSeconds,
+                },
+            };
+        }
+        (void)enqueueRichCapture(rich_capture::Event{ std::move(event) });
+    }
+
+    void ReduxRuntime::drainRichClipCaptures(
+        std::uint64_t generationKey,
+        std::uint32_t weaponFormId,
+        std::uint64_t rockFrameIndex)
+    {
+        if (!_richCaptureActive) {
+            return;
+        }
+        const auto dropInfo = weapon_clip_motion_harvest::drainRichClipDropInfo();
+        if (dropInfo.count > 0) {
+            const auto droppedWeapon = dropInfo.weaponFormId != 0 ? dropInfo.weaponFormId : weaponFormId;
+            const auto droppedGeneration = dropInfo.weaponGenerationKey != 0
+                ? dropInfo.weaponGenerationKey
+                : generationKey;
+            if (droppedWeapon != 0) {
+                auto context = makeCaptureContext(droppedWeapon, droppedGeneration, rockFrameIndex);
+                const auto sequence = context.sequence;
+                rich_capture::CaptureGapEvent gap{
+                    .context = std::move(context),
+                    .firstDroppedSequence = sequence,
+                    .lastDroppedSequence = sequence,
+                    .droppedEventCount = static_cast<std::uint32_t>((std::min)(
+                        dropInfo.count,
+                        static_cast<std::uint64_t>((std::numeric_limits<std::uint32_t>::max)()))),
+                    .reason = "raw authored clip capture queue overflow",
+                };
+                (void)enqueueRichCapture(rich_capture::Event{ std::move(gap) });
+            }
+        }
+        const auto packetCount = weapon_clip_motion_harvest::drainRichClipCaptures(
+            _richClipDrainPackets.data(), static_cast<std::uint32_t>(_richClipDrainPackets.size()));
+        for (std::uint32_t drained = 0; drained < packetCount; ++drained) {
+            const auto& packet = _richClipDrainPackets[drained];
+            const auto packetWeaponFormId = packet.weaponFormId != 0 ? packet.weaponFormId : weaponFormId;
+            const auto packetGenerationKey = packet.weaponGenerationKey != 0
+                ? packet.weaponGenerationKey
+                : generationKey;
+            if (packetWeaponFormId == 0) {
+                RDX_LOG_WARN(Weapon,
+                    "Rich motion capture: authored clip packet had no weapon identity and was skipped");
+                continue;
+            }
+            rich_capture::AuthoredClipEvent event{};
+            event.context = makeCaptureContext(packetWeaponFormId, packetGenerationKey, rockFrameIndex);
+            event.activityId = packet.activityId;
+            event.activatedClip = packet.activatedClip;
+            event.animationName.assign(
+                providerFixedStringView(packet.animationName.data(), packet.animationName.size()));
+            event.durationSeconds = packet.durationSeconds;
+            event.rawTransformTrackCount = packet.rawTransformTrackCount;
+            event.capturedWeaponTrackCount = packet.capturedWeaponTrackCount;
+            event.weaponTracksTruncated = packet.weaponTracksTruncated;
+            event.rawAnnotationTrackCount = packet.rawAnnotationTrackCount;
+            event.rawTriggerCount = packet.rawTriggerCount;
+            event.graphEventNameCount = packet.graphEventNameCount;
+            event.annotationsTruncated = packet.annotationsTruncated;
+            event.triggersTruncated = packet.triggersTruncated;
+            event.weaponTracks.reserve(packet.capturedWeaponTrackCount);
+            for (std::uint32_t i = 0;
+                 i < packet.capturedWeaponTrackCount && i < packet.weaponTracks.size();
+                 ++i) {
+                const auto& source = packet.weaponTracks[i];
+                rich_capture::ClipTrack track{};
+                track.boneName.assign(providerFixedStringView(source.boneName.data(), source.boneName.size()));
+                const auto sampleCount = (std::min)(source.sampleCount,
+                    static_cast<std::uint32_t>(source.samples.size()));
+                track.samples.assign(source.samples.begin(), source.samples.begin() + sampleCount);
+                track.scaleSamples.reserve(sampleCount);
+                for (std::uint32_t sample = 0; sample < sampleCount; ++sample) {
+                    track.scaleSamples.push_back({
+                        source.scales[sample].x,
+                        source.scales[sample].y,
+                        source.scales[sample].z,
+                    });
+                }
+                event.weaponTracks.push_back(std::move(track));
+            }
+            event.annotations.reserve(packet.annotationCount);
+            for (std::uint32_t i = 0; i < packet.annotationCount && i < packet.annotations.size(); ++i) {
+                const auto& source = packet.annotations[i];
+                event.annotations.push_back(rich_capture::ClipAnnotation{
+                    .timeSeconds = source.timeSeconds,
+                    .trackName = std::string(providerFixedStringView(source.trackName.data(), source.trackName.size())),
+                    .text = std::string(providerFixedStringView(source.text.data(), source.text.size())),
+                });
+            }
+            event.triggers.reserve(packet.triggerCount);
+            for (std::uint32_t i = 0; i < packet.triggerCount && i < packet.triggers.size(); ++i) {
+                const auto& source = packet.triggers[i];
+                event.triggers.push_back(rich_capture::ClipTrigger{
+                    .localTimeSeconds = source.localTimeSeconds,
+                    .eventId = source.eventId,
+                    .eventName = std::string(providerFixedStringView(source.eventName.data(), source.eventName.size())),
+                });
+            }
+            (void)enqueueRichCapture(rich_capture::Event{ std::move(event) });
+        }
+    }
+
+    void ReduxRuntime::captureRichWeaponSnapshot(
+        RE::NiNode* weaponNode,
+        std::uint64_t generationKey,
+        std::uint32_t weaponFormId,
+        std::uint64_t rockFrameIndex)
+    {
+        if (!_richCaptureActive || !weaponNode || generationKey == 0 || weaponFormId == 0) {
+            return;
+        }
+        if (_richSnapshotGenerationKey == generationKey) {
+            advanceRichWeaponGeometry(generationKey, weaponFormId, rockFrameIndex);
+            return;
+        }
+        if (_pendingRichGeometry.active) {
+            cancelPendingRichGeometryCapture(
+                "a new weapon snapshot began before prior deferred geometry completed",
+                rockFrameIndex);
+        }
+        const auto* api = ::rock::provider::RockProviderApi::inst;
+        if (!api || !api->copyWeaponEvidenceDetailsV1) {
+            return;
+        }
+
+        // Event-scoped ownership, once per ROCK weapon generation. These
+        // hard ceilings protect a malformed provider/NIF from unbounded
+        // memory while every cap is serialized as explicit incompleteness.
+        constexpr std::uint32_t kMaxEvidenceRecords =
+            ::rock::provider::ROCK_PROVIDER_MAX_WEAPON_BODIES;
+        constexpr std::uint32_t kMaxSceneNodes = 2048;
+        constexpr std::uint32_t kMaxPointsPerEvidence = 100'000;
+        constexpr std::uint32_t kMaxPointsPerWeapon = 1'000'000;
+
+        std::array<RichGeometryTarget, kMaxRichGeometryTargets> geometryTargets{};
+        std::uint32_t geometryTargetCount = 0;
+
+        rich_capture::WeaponSnapshotEvent event{};
+        event.context = makeCaptureContext(weaponFormId, generationKey, rockFrameIndex);
+        event.settings = captureSettings();
+        event.observedTargetCapacity = static_cast<std::uint32_t>(_drivePartCache.entries.size());
+
+        if (api->queryEquippedWeaponClassificationV1) {
+            ::rock::provider::RockProviderWeaponClassificationV1 classification{};
+            event.classification.available = api->queryEquippedWeaponClassificationV1(&classification);
+            if (event.classification.available) {
+                event.classification.valid = classification.valid != 0;
+                event.classification.keywordFlags = classification.keywordFlags;
+                event.classification.sizeClass = static_cast<std::uint32_t>(classification.sizeClass);
+                event.classification.source = static_cast<std::uint32_t>(classification.source);
+                event.classification.runtimeFormId = classification.formId;
+            }
+        }
+
+        const auto reportedEvidence = api->getWeaponEvidenceDetailCountV1
+            ? api->getWeaponEvidenceDetailCountV1()
+            : static_cast<std::uint32_t>(_drivePartCache.count);
+        event.providerEvidenceCount = reportedEvidence;
+        const auto evidenceCapacity = (std::min)(
+            reportedEvidence > 0 ? reportedEvidence : kMaxEvidenceRecords,
+            kMaxEvidenceRecords);
+        std::vector<::rock::provider::RockProviderWeaponEvidenceDetailV1> details(evidenceCapacity);
+        const auto copiedDetails = evidenceCapacity > 0
+            ? (std::min)(api->copyWeaponEvidenceDetailsV1(details.data(), evidenceCapacity), evidenceCapacity)
+            : 0u;
+        event.evidenceTruncated = reportedEvidence > evidenceCapacity || copiedDetails < reportedEvidence;
+
+        const RE::NiTransform weaponWorldInverse = transform_math::invertTransform(weaponNode->world);
+        std::vector<RE::NiAVObject*> nodePointers;
+        nodePointers.reserve(256);
+        event.nodes.reserve(256);
+        const auto walkNodes = [&](auto&& self,
+                                   RE::NiAVObject* object,
+                                   std::int32_t parentId,
+                                   std::uint32_t childIndex,
+                                   std::uint32_t depth) -> void {
+            if (!object) {
+                return;
+            }
+            ++event.discoveredNodeCount;
+            if (depth > 64) {
+                ++event.omittedNodeCount;
+                event.nodeCatalogTruncated = true;
+                return;
+            }
+
+            std::int32_t thisId = -1;
+            if (event.nodes.size() < kMaxSceneNodes) {
+                thisId = static_cast<std::int32_t>(event.nodes.size());
+                rich_capture::NodeSnapshot node{};
+                node.id = static_cast<std::uint32_t>(thisId);
+                node.parentId = parentId;
+                node.childIndex = childIndex;
+                if (const char* name = object->name.c_str()) {
+                    node.name = name;
+                }
+                node.rootRelativePath = rootRelativeNodePath(weaponNode, object);
+                if (auto* asNode = object->IsNode()) {
+                    node.isNode = true;
+                    node.childCount = asNode->GetRuntimeData().children.size();
+                }
+                if (object != weaponNode && object->parent) {
+                    if (auto* parentNode = object->parent->IsNode()) {
+                        auto& siblings = parentNode->GetRuntimeData().children;
+                        for (std::uint16_t i = 0; i < siblings.size() && i < childIndex; ++i) {
+                            const char* siblingName = siblings[i] ? siblings[i]->name.c_str() : nullptr;
+                            if ((siblingName ? std::string_view(siblingName) : std::string_view{}) == node.name) {
+                                ++node.sameNameSiblingOrdinal;
+                            }
+                        }
+                    }
+                }
+                if (finiteNiTransform(object->local)) {
+                    node.localPoseValid = true;
+                    node.localPose = poseFromNiTransform(object->local);
+                    node.localScale = object->local.scale;
+                }
+                const auto weaponLocal = transform_math::composeTransforms(weaponWorldInverse, object->world);
+                if (finiteNiTransform(weaponLocal)) {
+                    node.weaponLocalPoseValid = true;
+                    node.weaponLocalPose = poseFromNiTransform(weaponLocal);
+                    node.weaponLocalScale = weaponLocal.scale;
+                }
+                event.nodes.push_back(std::move(node));
+                nodePointers.push_back(object);
+            } else {
+                ++event.omittedNodeCount;
+                event.nodeCatalogTruncated = true;
+            }
+
+            if (auto* asNode = object->IsNode()) {
+                auto& children = asNode->GetRuntimeData().children;
+                for (std::uint16_t i = 0; i < children.size(); ++i) {
+                    self(self, children[i].get(), thisId, i, depth + 1);
+                }
+            }
+        };
+        walkNodes(walkNodes, weaponNode, -1, 0, 0);
+
+        const auto nodeIdFor = [&nodePointers](RE::NiAVObject* object) -> std::int32_t {
+            for (std::uint32_t i = 0; i < nodePointers.size(); ++i) {
+                if (nodePointers[i] == object) {
+                    return static_cast<std::int32_t>(i);
+                }
+            }
+            return -1;
+        };
+
+        std::uint32_t totalScheduledPoints = 0;
+        event.evidence.reserve(copiedDetails);
+        std::vector<RE::NiAVObject*> evidenceSourceNodes;
+        evidenceSourceNodes.reserve(copiedDetails);
+        for (std::uint32_t i = 0; i < copiedDetails; ++i) {
+            const auto& detail = details[i];
+            if (detail.weaponGenerationKey != generationKey) {
+                continue;
+            }
+            rich_capture::EvidenceSnapshot part{};
+            part.id = i;
+            part.bodyId = detail.bodyId;
+            part.providerSourceName.assign(providerFixedStringView(
+                detail.sourceName, ::rock::provider::ROCK_PROVIDER_MAX_EVIDENCE_NAME));
+            auto* sourceNode = reinterpret_cast<RE::NiAVObject*>(detail.sourceRoot);
+            auto* interactionNode = reinterpret_cast<RE::NiAVObject*>(detail.interactionRoot);
+            part.sourceNodeId = nodeIdFor(sourceNode);
+            part.interactionNodeId = nodeIdFor(interactionNode);
+            if (part.sourceNodeId >= 0) {
+                part.sourceNodePath = event.nodes[static_cast<std::size_t>(part.sourceNodeId)].rootRelativePath;
+                evidenceSourceNodes.push_back(sourceNode);
+            }
+            if (part.interactionNodeId >= 0) {
+                part.interactionNodePath = event.nodes[static_cast<std::size_t>(part.interactionNodeId)].rootRelativePath;
+            }
+            part.partKind = detail.partKind;
+            part.reloadRole = detail.reloadRole;
+            part.supportRole = detail.supportRole;
+            part.socketRole = detail.socketRole;
+            part.actionRole = detail.actionRole;
+            part.fallbackGripPose = detail.fallbackGripPose;
+            part.classificationSource = detail.classificationSource;
+            part.omod = describeForm(detail.omodFormId);
+            part.attachPoint = describeForm(detail.attachPointFormId);
+            part.localBoundsGame.valid = detail.localBoundsGame.valid != 0;
+            part.localBoundsGame.min = {
+                detail.localBoundsGame.min.x,
+                detail.localBoundsGame.min.y,
+                detail.localBoundsGame.min.z,
+            };
+            part.localBoundsGame.max = {
+                detail.localBoundsGame.max.x,
+                detail.localBoundsGame.max.y,
+                detail.localBoundsGame.max.z,
+            };
+            part.providerPointCount = detail.pointCount;
+            // The detail row and its point count came from one provider
+            // snapshot. Calling the legacy count accessor once per body
+            // would make ROCK duplicate the complete evidence snapshot
+            // repeatedly, so this immutable generation-local count is the
+            // authoritative capture plan.
+            part.queriedPointCount = detail.pointCount;
+            const auto remainingWeaponPoints = totalScheduledPoints < kMaxPointsPerWeapon
+                ? kMaxPointsPerWeapon - totalScheduledPoints
+                : 0u;
+            const auto requestedPoints = (std::min)({
+                part.queriedPointCount,
+                kMaxPointsPerEvidence,
+                remainingWeaponPoints,
+            });
+            part.scheduledPointCount = requestedPoints;
+            part.geometryDelivery = requestedPoints > 0
+                ? rich_capture::GeometryDelivery::Chunks
+                : rich_capture::GeometryDelivery::None;
+            if (requestedPoints > 0 && geometryTargetCount < geometryTargets.size()) {
+                geometryTargets[geometryTargetCount++] = RichGeometryTarget{
+                    .evidenceId = part.id,
+                    .bodyId = part.bodyId,
+                    .providerPointCount = part.queriedPointCount,
+                    .scheduledPointCount = requestedPoints,
+                };
+                totalScheduledPoints += requestedPoints;
+            }
+            part.pointCloudTruncated = requestedPoints < part.queriedPointCount;
+            event.evidence.push_back(std::move(part));
+        }
+        event.copiedEvidenceCount = static_cast<std::uint32_t>(event.evidence.size());
+        if (event.copiedEvidenceCount != reportedEvidence) {
+            event.evidenceTruncated = true;
+        }
+
+        // Bind the runtime's bounded observation targets to the complete
+        // snapshot. Evidence ids distinguish ROCK collider clusters; node ids
+        // distinguish actual scene objects and same-name siblings.
+        event.observationTargets.reserve(_drivePartCache.count);
+        for (std::uint32_t i = 0; i < _drivePartCache.count; ++i) {
+            auto& entry = _drivePartCache.entries[i];
+            entry.catalogNodeId = nodeIdFor(entry.node);
+            std::int32_t evidenceId = -1;
+            if (!entry.observationOnly) {
+                const auto name = providerFixedStringView(entry.sourceName.data(), entry.sourceName.size());
+                for (const auto& part : event.evidence) {
+                    if (part.bodyId == entry.bodyId && part.providerSourceName == name) {
+                        evidenceId = static_cast<std::int32_t>(part.id);
+                        entry.catalogPartId = part.id;
+                        break;
+                    }
+                }
+            }
+            event.observationTargets.push_back(rich_capture::ObservationTarget{
+                .catalogPartId = entry.catalogPartId,
+                .evidenceId = evidenceId,
+                .nodeId = entry.catalogNodeId,
+                .bodyId = entry.bodyId,
+                .observationOnly = entry.observationOnly,
+                .sourceName = std::string(providerFixedStringView(entry.sourceName.data(), entry.sourceName.size())),
+                .omod = describeForm(entry.omodFormId),
+            });
+        }
+
+        std::uint32_t potentialObservationTargets = static_cast<std::uint32_t>(event.evidence.size());
+        if (g_reduxConfig.fullSubtreeObservation) {
+            for (std::size_t i = 1; i < nodePointers.size(); ++i) {
+                const char* name = nodePointers[i]->name.c_str();
+                if (!name || name[0] == '\0') {
+                    continue;
+                }
+                bool isEvidenceNode = false;
+                for (auto* evidenceNode : evidenceSourceNodes) {
+                    if (evidenceNode == nodePointers[i]) {
+                        isEvidenceNode = true;
+                        break;
+                    }
+                }
+                if (!isEvidenceNode) {
+                    ++potentialObservationTargets;
+                }
+            }
+        }
+        event.omittedObservationTargetCount = potentialObservationTargets > _drivePartCache.count
+            ? potentialObservationTargets - _drivePartCache.count
+            : 0u;
+
+        const auto evidenceCount = event.evidence.size();
+        const auto nodeCount = event.nodes.size();
+        const auto targetCount = event.observationTargets.size();
+        const auto snapshotSequence = event.context.sequence;
+        // This generation has been attempted regardless of queue outcome;
+        // rebuilding the complete scene/evidence catalog every frame under
+        // backpressure is unsafe. enqueueRichCapture preserves the failed
+        // sequence as a captureGap.
+        _richSnapshotGenerationKey = generationKey;
+        if (enqueueRichCapture(rich_capture::Event{ std::move(event) })) {
+            _pendingRichGeometry = {};
+            _pendingRichGeometry.active = geometryTargetCount > 0;
+            _pendingRichGeometry.weaponFormId = weaponFormId;
+            _pendingRichGeometry.generationKey = generationKey;
+            _pendingRichGeometry.snapshotSequence = snapshotSequence;
+            _pendingRichGeometry.targetCount = geometryTargetCount;
+            for (std::uint32_t i = 0; i < geometryTargetCount; ++i) {
+                _pendingRichGeometry.targets[i] = geometryTargets[i];
+            }
+            RDX_LOG_INFO(Weapon,
+                "Rich motion capture: weapon snapshot queued ({} evidence, {} scene nodes, {} observed targets, {} geometry points scheduled in bounded chunks)",
+                evidenceCount,
+                nodeCount,
+                targetCount,
+                totalScheduledPoints);
+        }
+    }
+
+    void ReduxRuntime::advanceRichWeaponGeometry(
+        std::uint64_t generationKey,
+        std::uint32_t weaponFormId,
+        std::uint64_t rockFrameIndex)
+    {
+        auto& pending = _pendingRichGeometry;
+        if (!pending.active) {
+            return;
+        }
+        if (!_richCaptureActive || pending.weaponFormId != weaponFormId ||
+            pending.generationKey != generationKey) {
+            cancelPendingRichGeometryCapture(
+                "deferred geometry cursor no longer matched the active weapon generation",
+                rockFrameIndex);
+            return;
+        }
+        if (pending.targetIndex >= pending.targetCount) {
+            pending = {};
+            return;
+        }
+
+        const auto* api = ::rock::provider::RockProviderApi::inst;
+        if (!api || !api->copyWeaponEvidenceDetailPointsV1) {
+            cancelPendingRichGeometryCapture(
+                "ROCK point-copy API became unavailable during deferred geometry capture",
+                rockFrameIndex);
+            return;
+        }
+
+        const auto& target = pending.targets[pending.targetIndex];
+        if (!pending.currentPointsLoaded) {
+            pending.currentProviderPoints.resize(target.scheduledPointCount);
+            const auto copied = target.scheduledPointCount > 0
+                ? (std::min)(
+                      api->copyWeaponEvidenceDetailPointsV1(
+                          target.bodyId,
+                          pending.currentProviderPoints.data(),
+                          target.scheduledPointCount),
+                      target.scheduledPointCount)
+                : 0u;
+            if (copied < target.scheduledPointCount && ++pending.shortCopyAttempts < 3) {
+                return;
+            }
+
+            pending.currentProviderPoints.resize(copied);
+            pending.currentPointsLoaded = true;
+            pending.currentSourceComplete = copied == target.providerPointCount;
+            pending.pointOffset = 0;
+            pending.chunkIndex = 0;
+        }
+
+        const auto remaining = pending.currentProviderPoints.size() > pending.pointOffset
+            ? pending.currentProviderPoints.size() - pending.pointOffset
+            : 0u;
+        const auto chunkPointCount = (std::min)(
+            remaining, static_cast<std::size_t>(kRichGeometryChunkPointCount));
+        const bool finalChunk =
+            pending.pointOffset + chunkPointCount >= pending.currentProviderPoints.size();
+        const bool lastTarget = pending.targetIndex + 1 >= pending.targetCount;
+
+        rich_capture::GeometryChunkEvent chunk{};
+        chunk.context = makeCaptureContext(weaponFormId, generationKey, rockFrameIndex);
+        chunk.snapshotSequence = pending.snapshotSequence;
+        chunk.evidenceId = target.evidenceId;
+        chunk.bodyId = target.bodyId;
+        chunk.pointOffset = pending.pointOffset;
+        chunk.totalPointCount = target.providerPointCount;
+        chunk.chunkIndex = pending.chunkIndex;
+        chunk.finalChunk = finalChunk;
+        chunk.sourceComplete = pending.currentSourceComplete;
+        chunk.snapshotComplete = finalChunk && lastTarget;
+        if (chunkPointCount > 0) {
+            chunk.pointsWeaponLocalGame.reserve(chunkPointCount);
+            for (std::size_t i = 0; i < chunkPointCount; ++i) {
+                const auto& point = pending.currentProviderPoints[pending.pointOffset + i];
+                chunk.pointsWeaponLocalGame.push_back({ point.x, point.y, point.z });
+            }
+        }
+        if (!enqueueRichCapture(rich_capture::Event{ std::move(chunk) })) {
+            // Retain the exact cursor. The rejected sequence is represented
+            // by enqueueRichCapture's gap and this same payload is retried
+            // with a fresh sequence on the next frame.
+            return;
+        }
+
+        if (!finalChunk) {
+            pending.pointOffset += static_cast<std::uint32_t>(chunkPointCount);
+            ++pending.chunkIndex;
+            return;
+        }
+
+        ++pending.targetIndex;
+        pending.pointOffset = 0;
+        pending.chunkIndex = 0;
+        pending.shortCopyAttempts = 0;
+        pending.currentPointsLoaded = false;
+        pending.currentSourceComplete = false;
+        pending.currentProviderPoints.clear();
+        if (pending.targetIndex >= pending.targetCount) {
+            RDX_LOG_INFO(Weapon,
+                "Rich motion capture: deferred geometry complete for snapshot sequence {} ({} evidence cloud(s))",
+                pending.snapshotSequence,
+                pending.targetCount);
+            pending = {};
+        }
+    }
+
+    void ReduxRuntime::cancelPendingRichGeometryCapture(const char* reason, std::uint64_t rockFrameIndex)
+    {
+        auto& pending = _pendingRichGeometry;
+        if (!pending.active) {
+            return;
+        }
+        const auto remainingTargets = pending.targetCount > pending.targetIndex
+            ? pending.targetCount - pending.targetIndex
+            : 1u;
+        auto context = makeCaptureContext(
+            pending.weaponFormId, pending.generationKey, rockFrameIndex);
+        std::string gapReason = reason ? reason : "deferred geometry capture cancelled";
+        gapReason += " (" + std::to_string(remainingTargets) +
+                     " evidence cloud(s) remained; missing chunk count is unknown)";
+        rich_capture::CaptureGapEvent gap{
+            .context = std::move(context),
+            .relatedSnapshotSequence = pending.snapshotSequence,
+            .firstDroppedSequence = 0,
+            .lastDroppedSequence = 0,
+            .droppedEventCount = 0,
+            .reason = std::move(gapReason),
+        };
+        (void)enqueueRichCapture(rich_capture::Event{ std::move(gap) });
+        RDX_LOG_WARN(Weapon,
+            "Rich motion capture: deferred geometry for snapshot sequence {} cancelled with {} evidence cloud(s) remaining ({})",
+            pending.snapshotSequence,
+            remainingTargets,
+            reason ? reason : "unspecified");
+        pending = {};
     }
 
     void ReduxRuntime::updateMotionLibrary(std::uint32_t weaponFormId)
@@ -573,9 +1553,47 @@ namespace redux
 
     void ReduxRuntime::shutdown()
     {
+        // Preserve partial raw evidence and graph-thread clip packets before
+        // the writer is drained and before any recorder/queue storage dies.
+        if (_richCaptureActive) {
+            cancelPendingRichGeometryCapture(
+                "runtime shutdown before all deferred geometry chunks were queued",
+                _lastRockFrameIndex);
+            // Disabling takes the clip-queue mutex and is a producer barrier;
+            // no graph-thread packet can appear after the following drain.
+            weapon_clip_motion_harvest::setRichCaptureEnabled(false);
+            drainRichClipCaptures(
+                _richCaptureGenerationKey,
+                _richCaptureWeaponFormId,
+                _lastRockFrameIndex);
+            _learner.resetRecorders(rich_capture::StrokeTermination::RuntimeShutdown);
+            _learner.setRawCaptureSink(nullptr, nullptr);
+        }
         // Persist before the learner is dropped; then drain the writer.
         flushMotionLibrarySave();
         _libraryStore.shutdown();
+        bool queuedShutdownGap = false;
+        for (auto& pending : _pendingCaptureGaps) {
+            if (!pending.used || pending.context.weapon.ref.empty()) {
+                continue;
+            }
+            auto context = pending.context;
+            context.sequence = pending.firstSequence;
+            rich_capture::CaptureGapEvent gap{
+                .context = std::move(context),
+                .firstDroppedSequence = pending.firstSequence,
+                .lastDroppedSequence = pending.lastSequence,
+                .droppedEventCount = pending.count,
+                .reason = "bounded writer queue or byte budget was full before shutdown",
+            };
+            // The first shutdown drained the queue, so this enqueue has
+            // capacity. A second orderly shutdown persists all health rows.
+            queuedShutdownGap |= _libraryStore.appendCapture(rich_capture::Event{ std::move(gap) });
+            pending = {};
+        }
+        if (queuedShutdownGap) {
+            _libraryStore.shutdown();
+        }
         _libraryLoaded.reset();
         _libraryWeaponFormId = 0;
         _libraryWeaponRef = {};
@@ -610,6 +1628,17 @@ namespace redux
         _clipHarvestWalkCandidateLogged = false;
         _clipHarvestRewalkActive = false;
         _clipHarvestRewalkCooldownFrames = 0;
+        _richCaptureActive = false;
+        _recorderWeaponFormId = 0;
+        _recorderGenerationKey = 0;
+        _richCaptureWeaponFormId = 0;
+        _richCaptureGenerationKey = 0;
+        _richSnapshotGenerationKey = 0;
+        _pendingRichGeometry = {};
+        _lastRockFrameIndex = 0;
+        _richCaptureSessionId.clear();
+        _richCaptureSequence = 0;
+        _pendingCaptureGaps = {};
         _active = false;
     }
 
@@ -687,11 +1716,16 @@ namespace redux
             entry.partKind = detail.partKind;
             entry.actionRole = detail.actionRole;
             entry.omodFormId = detail.omodFormId;
+            entry.catalogPartId = i;
             entry.sourceName = {};
             std::memcpy(
                 entry.sourceName.data(),
                 sourceName.data(),
                 (std::min)(sourceName.size(), entry.sourceName.size() - 1));
+            const auto path = rootRelativeNodePath(weaponNode, node);
+            entry.nodePathTruncated = path.size() >= entry.nodePath.size();
+            std::memcpy(entry.nodePath.data(), path.data(),
+                (std::min)(path.size(), entry.nodePath.size() - 1));
         }
         /*
          * Full-subtree observation (phase 3, Bruno's "no one left behind"):
@@ -701,11 +1735,9 @@ namespace redux
          * capacity left over from evidence parts bounds the walk.
          */
         if (sawCurrentGeneration && weaponNode && g_reduxConfig.fullSubtreeObservation) {
-            const auto nameTaken = [this](std::string_view name) {
+            const auto nodeTaken = [this](const RE::NiAVObject* node) {
                 for (std::uint32_t i = 0; i < _drivePartCache.count; ++i) {
-                    if (providerFixedStringView(
-                            _drivePartCache.entries[i].sourceName.data(),
-                            _drivePartCache.entries[i].sourceName.size()) == name) {
+                    if (_drivePartCache.entries[i].node == node) {
                         return true;
                     }
                 }
@@ -717,13 +1749,20 @@ namespace redux
                 }
                 const char* name = object->name.c_str();
                 const std::string_view nameView = name ? std::string_view(name) : std::string_view{};
-                if (object != weaponNode && !nameView.empty() && !nameTaken(nameView)) {
+                if (object != weaponNode && !nameView.empty() && !nodeTaken(object)) {
                     auto& entry = _drivePartCache.entries[_drivePartCache.count++];
                     entry = {};
                     entry.node = object;
                     entry.observationOnly = true;
+                    // High bit separates synthesized observation targets
+                    // from provider evidence ordinals inside one snapshot.
+                    entry.catalogPartId = 0x8000'0000u | _drivePartCache.count;
                     std::memcpy(entry.sourceName.data(), nameView.data(),
                         (std::min)(nameView.size(), entry.sourceName.size() - 1));
+                    const auto path = rootRelativeNodePath(weaponNode, object);
+                    entry.nodePathTruncated = path.size() >= entry.nodePath.size();
+                    std::memcpy(entry.nodePath.data(), path.data(),
+                        (std::min)(path.size(), entry.nodePath.size() - 1));
                 }
                 if (auto* node = object->IsNode()) {
                     auto& children = node->GetRuntimeData().children;
@@ -887,11 +1926,23 @@ namespace redux
             return;
         }
         refreshDrivePartCache(weaponNode, generationKey);
-        if (_drivePartCache.generationKey != generationKey || _drivePartCache.count == 0) {
+        if (_drivePartCache.generationKey != generationKey) {
+            return;
+        }
+        captureRichWeaponSnapshot(weaponNode, generationKey, weaponFormId, _lastRockFrameIndex);
+        if (_drivePartCache.count == 0) {
             return;
         }
 
         const RE::NiTransform weaponWorldInverse = transform_math::invertTransform(weaponNode->world);
+        const auto richClipContext = weapon_clip_motion_harvest::richClipActivityState();
+        const auto scrubClipContext = weapon_clip_motion_harvest::clipScrubSessionState();
+        const bool hasRichClipContext = richClipContext.active && richClipContext.activityId != 0 &&
+            richClipContext.weaponFormId == weaponFormId &&
+            richClipContext.weaponGenerationKey == generationKey;
+        const bool hasScrubClipContext = !hasRichClipContext && scrubClipContext.active &&
+            scrubClipContext.weaponFormId == weaponFormId &&
+            scrubClipContext.weaponGenerationKey == generationKey;
         // Hot-reloadable grouping/staging tuning; cheap by-value refresh so
         // an INI change applies to the very next completed stroke.
         _learner.setGroupingTuning(WeaponPartMotionLearner::GroupingTuning{
@@ -917,15 +1968,7 @@ namespace redux
             if (!finiteNiTransform(partWeaponLocal)) {
                 continue;
             }
-            weapon_part_motion_path::PoseSample pose{};
-            pose.translate = weapon_part_motion_path::Vec3{
-                partWeaponLocal.translate.x,
-                partWeaponLocal.translate.y,
-                partWeaponLocal.translate.z,
-            };
-            float quaternion[4]{};
-            transform_math::niRowsToHavokQuaternion(partWeaponLocal.rotate, quaternion);
-            pose.rotate = weapon_part_motion_path::Quat{ quaternion[3], quaternion[0], quaternion[1], quaternion[2] };
+            const auto pose = poseFromNiTransform(partWeaponLocal);
             _learner.observe(WeaponPartMotionLearner::Observation{
                 .weaponFormId = weaponFormId,
                 .omodFormId = entry.omodFormId,
@@ -933,6 +1976,41 @@ namespace redux
                 .pose = pose,
                 .scale = partWeaponLocal.scale,
                 .trusted = !driven,
+                .rockFrameIndex = _lastRockFrameIndex,
+                .weaponGenerationKey = generationKey,
+                .catalogPartId = entry.catalogPartId,
+                .bodyId = entry.bodyId,
+                .nodePath = providerFixedStringView(entry.nodePath.data(), entry.nodePath.size()),
+                .nodePathTruncated = entry.nodePathTruncated,
+                .clipActivityId = hasRichClipContext
+                    ? richClipContext.activityId
+                    : 0,
+                .clipScrubSessionId = hasScrubClipContext ? scrubClipContext.sessionId : 0,
+                .clipConcurrentActivityCount = hasRichClipContext
+                    ? richClipContext.concurrentActivityCount
+                    : (hasScrubClipContext ? 1u : 0u),
+                .clipFraction = hasRichClipContext
+                    ? richClipContext.fraction
+                    : (hasScrubClipContext ? scrubClipContext.fraction : 0.0f),
+                .clipLocalTimeSeconds = hasRichClipContext
+                    ? richClipContext.localTimeSeconds
+                    : (hasScrubClipContext
+                            ? scrubClipContext.cropStartSeconds +
+                                  scrubClipContext.fraction * scrubClipContext.croppedDurationSeconds
+                            : 0.0f),
+                .clipName = hasRichClipContext
+                    ? providerFixedStringView(
+                          richClipContext.animationName.data(), richClipContext.animationName.size())
+                    : (hasScrubClipContext
+                            ? providerFixedStringView(
+                                  scrubClipContext.clipName.data(), scrubClipContext.clipName.size())
+                            : std::string_view{}),
+                .clipDurationSeconds = hasRichClipContext
+                    ? richClipContext.durationSeconds
+                    : (hasScrubClipContext ? scrubClipContext.durationSeconds : 0.0f),
+                .clipCroppedDurationSeconds = hasRichClipContext
+                    ? richClipContext.croppedDurationSeconds
+                    : (hasScrubClipContext ? scrubClipContext.croppedDurationSeconds : 0.0f),
             });
 
             // Rest-pose capture for the delta-curve anchors (see the cache
@@ -1149,23 +2227,31 @@ namespace redux
                 32);
         }
 
+        // Prime/reset the walk identity before publishing the new hook
+        // targets. On a generation boundary stepHarvest clears its processed
+        // registry; doing that after target publication could erase an
+        // activation that raced through the narrow setTargets->step window.
+        weapon_clip_motion_harvest::ensureClipActivationHookInstalled();
+        const auto harvestResult = weapon_clip_motion_harvest::stepHarvest(
+            chosenManager,
+            weaponFormId,
+            generationKey,
+            allowedNodeNames.data(),
+            allowedNodeNameCount);
+
         // Streamed clips never land in the walked binding sets, so the
         // activation hook harvests them the moment their loaded binding is
         // installed on a clip generator of one of these graphs (a reload
         // performed in-hand teaches the weapon its authored curves).
-        weapon_clip_motion_harvest::ensureClipActivationHookInstalled();
         weapon_clip_motion_harvest::setClipActivationTargets(
             candidateManagers.data(),
             candidateCount,
             allowedNodeNames.data(),
-            allowedNodeNameCount);
+            allowedNodeNameCount,
+            weaponFormId,
+            generationKey);
 
-        if (weapon_clip_motion_harvest::stepHarvest(
-                chosenManager,
-                weaponFormId,
-                generationKey,
-                allowedNodeNames.data(),
-                allowedNodeNameCount) == weapon_clip_motion_harvest::StepResult::Completed) {
+        if (harvestResult == weapon_clip_motion_harvest::StepResult::Completed) {
             _clipHarvestWalkCompleted = true;
             _clipHarvestRewalkActive = false;
         }

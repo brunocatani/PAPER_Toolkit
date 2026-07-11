@@ -241,9 +241,17 @@ namespace redux::weapon_part_motion_path
         const PoseSample* samples,
         std::uint32_t sampleCount,
         MotionPath& outPath,
-        float* outKeySamplePositions = nullptr)
+        float* outKeySamplePositions = nullptr,
+        std::uint32_t* outPeakIndex = nullptr,
+        float* outPeakExcursion = nullptr)
     {
         outPath = MotionPath{};
+        if (outPeakIndex) {
+            *outPeakIndex = 0;
+        }
+        if (outPeakExcursion) {
+            *outPeakExcursion = 0.0f;
+        }
         if (!samples || sampleCount < 2) {
             return false;
         }
@@ -256,6 +264,12 @@ namespace redux::weapon_part_motion_path
                 peakExcursion = excursion;
                 peakIndex = i;
             }
+        }
+        if (outPeakIndex) {
+            *outPeakIndex = peakIndex;
+        }
+        if (outPeakExcursion) {
+            *outPeakExcursion = peakExcursion;
         }
         if (peakIndex == 0 || peakExcursion < kMinPathExcursionGameUnits) {
             return false;

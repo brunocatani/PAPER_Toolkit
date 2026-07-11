@@ -127,6 +127,14 @@ namespace redux
         bool motionLibrary = true;
         bool motionLibraryReadOnly = false;
         /*
+         * Append-only mapping evidence beside each serving JSON. Captures a
+         * complete ROCK/OMOD/node inventory, geometry clouds, every raw
+         * learned recording (including rejected/replaced/interrupted data),
+         * and raw authored clip tracks/markers. The .capture.jsonl archive
+         * is never loaded by gameplay and is not erased by re-record wipes.
+         */
+        bool richMotionCapture = true;
+        /*
          * Full-subtree observation (phase 3): the learner watches EVERY
          * named node under the weapon root, not only collider-evidence
          * parts, so purely visual movers (bullets in a mag, small linkages)

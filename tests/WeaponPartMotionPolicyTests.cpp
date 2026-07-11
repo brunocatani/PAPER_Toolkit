@@ -1,4 +1,5 @@
 #include "redux/MotionLibraryFormat.h"
+#include "redux/RichMotionCaptureFormat.h"
 #include "redux/WeaponClipStrokePolicy.h"
 #include "redux/WeaponPartEligibility.h"
 #include "redux/WeaponPartMotionLearner.h"
@@ -10,6 +11,8 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+
+#include <nlohmann/json.hpp>
 
 namespace
 {
@@ -42,6 +45,43 @@ namespace
 
         std::printf("%s expected %llu got %llu\n", label, static_cast<unsigned long long>(expected), static_cast<unsigned long long>(actual));
         return false;
+    }
+
+    struct CapturedRawSummary
+    {
+        std::uint32_t callbackCount{ 0 };
+        redux::rich_capture::StrokeTermination termination{};
+        redux::rich_capture::ServingDecision decision{};
+        std::uint32_t sampleCount{ 0 };
+        std::uint64_t firstFrame{ 0 };
+        std::uint64_t lastFrame{ 0 };
+        float firstScale{ 0.0f };
+        float lastScale{ 0.0f };
+        bool terminalPresent{ false };
+        bool terminalTrusted{ true };
+        std::uint32_t peakIndex{ 0 };
+        float peakExcursion{ 0.0f };
+        bool candidateValid{ false };
+    };
+
+    void captureRawSummary(const redux::WeaponPartMotionLearner::RawCaptureView& capture, void* context)
+    {
+        auto& summary = *static_cast<CapturedRawSummary*>(context);
+        ++summary.callbackCount;
+        summary.termination = capture.termination;
+        summary.decision = capture.servingDecision;
+        summary.sampleCount = capture.sampleCount;
+        summary.firstFrame = capture.rockFrameIndices && capture.sampleCount > 0 ? capture.rockFrameIndices[0] : 0;
+        summary.lastFrame = capture.rockFrameIndices && capture.sampleCount > 0
+            ? capture.rockFrameIndices[capture.sampleCount - 1]
+            : 0;
+        summary.firstScale = capture.scales && capture.sampleCount > 0 ? capture.scales[0] : 0.0f;
+        summary.lastScale = capture.scales && capture.sampleCount > 0 ? capture.scales[capture.sampleCount - 1] : 0.0f;
+        summary.terminalPresent = capture.terminalSamplePresent;
+        summary.terminalTrusted = capture.terminalSample.trusted;
+        summary.peakIndex = capture.peakSampleIndex;
+        summary.peakExcursion = capture.peakExcursion;
+        summary.candidateValid = capture.candidatePath.valid;
     }
 }
 
@@ -758,6 +798,337 @@ int main()
             ok &= expectFalse("import never overwrites live data",
                 destination.importRecord({ kWeapon, kOmod, kPart }, records[0]));
         }
+    }
+
+    {
+        // Rich learner capture is an evidence plane, not a winner-only view:
+        // exact frame/scale samples survive completion, untrusted discard,
+        // and a weapon-change flush.
+        using namespace redux;
+        using namespace redux::weapon_part_motion_path;
+
+        static WeaponPartMotionLearner learner{};
+        learner.reset();
+        CapturedRawSummary captured{};
+        learner.setRawCaptureSink(&captureRawSummary, &captured);
+        std::uint64_t frame = 1000;
+        const auto observe = [&](const PoseSample& pose, float scale, bool trusted) {
+            learner.beginObservationFrame();
+            learner.observe(WeaponPartMotionLearner::Observation{
+                .weaponFormId = 0x01020304,
+                .omodFormId = 0x05060708,
+                .sourceName = "WeaponBolt",
+                .pose = pose,
+                .scale = scale,
+                .trusted = trusted,
+                .rockFrameIndex = frame++,
+                .weaponGenerationKey = 0xABCDEF,
+                .catalogPartId = 7,
+                .bodyId = 12,
+                .nodePath = "/[2]WeaponBolt",
+            });
+        };
+
+        PoseSample rest{};
+        for (std::uint32_t i = 0; i <= kRestStableFramesToArm; ++i) {
+            observe(rest, 0.75f, true);
+        }
+        PoseSample moving = rest;
+        for (std::uint32_t i = 1; i <= 8; ++i) {
+            moving.translate.y = static_cast<float>(i);
+            observe(moving, 0.75f + static_cast<float>(i) * 0.01f, true);
+        }
+        for (std::uint32_t i = 0; i <= kRestReturnFramesToComplete && captured.callbackCount == 0; ++i) {
+            observe(moving, 0.83f, true);
+        }
+        ok &= expectEqual("rich capture receives completed recording", captured.callbackCount, 1u);
+        ok &= expectEqual("rich completion termination retained", captured.termination,
+            rich_capture::StrokeTermination::Settled);
+        ok &= expectEqual("rich completion serving decision retained", captured.decision,
+            rich_capture::ServingDecision::StoredPrimary);
+        ok &= expectTrue("rich completion keeps the full raw cycle", captured.sampleCount > 8);
+        ok &= expectEqual("rich completion keeps rest frame", captured.firstFrame, 1008ull);
+        ok &= expectTrue("rich completion keeps exact last frame", captured.lastFrame > captured.firstFrame);
+        ok &= expectTrue("rich completion keeps scale", std::abs(captured.firstScale - 0.75f) < 0.001f &&
+            std::abs(captured.lastScale - 0.83f) < 0.001f);
+        ok &= expectTrue("rich completion keeps derived candidate", captured.candidateValid && captured.peakExcursion > 7.5f);
+
+        // Re-arm at rest, begin another stroke, then feed an explicitly
+        // untrusted PAPER-driven sample. The preceding evidence and terminal
+        // sample must both survive even though serving stores nothing.
+        for (std::uint32_t i = 0; i <= kRestStableFramesToArm + 1; ++i) {
+            observe(rest, 1.25f, true);
+        }
+        moving = rest;
+        moving.translate.x = 2.0f;
+        observe(moving, 1.25f, true);
+        moving.translate.x = 3.0f;
+        observe(moving, 1.25f, true);
+        observe(moving, 1.25f, false);
+        ok &= expectEqual("rich capture receives untrusted discard", captured.callbackCount, 2u);
+        ok &= expectEqual("untrusted termination retained", captured.termination,
+            rich_capture::StrokeTermination::UntrustedDrive);
+        ok &= expectEqual("discard is never evaluated for serving", captured.decision,
+            rich_capture::ServingDecision::NotEvaluated);
+        ok &= expectTrue("untrusted terminal sample retained",
+            captured.terminalPresent && !captured.terminalTrusted && captured.sampleCount >= 3);
+
+        for (std::uint32_t i = 0; i <= kRestStableFramesToArm; ++i) {
+            observe(rest, 1.0f, true);
+        }
+        moving = rest;
+        moving.translate.z = 1.0f;
+        observe(moving, 1.0f, true);
+        learner.resetRecorders(rich_capture::StrokeTermination::WeaponChanged);
+        ok &= expectEqual("partial stroke is flushed on weapon change", captured.callbackCount, 3u);
+        ok &= expectEqual("weapon-change termination retained", captured.termination,
+            rich_capture::StrokeTermination::WeaponChanged);
+
+        // Capacity termination is evidence too: all 720 buffered samples
+        // survive, and the next trusted sample is retained as the terminal
+        // observation rather than silently resetting the recorder.
+        for (std::uint32_t i = 0; i <= kRestStableFramesToArm; ++i) {
+            observe(rest, 1.0f, true);
+        }
+        for (std::uint32_t i = 1; i <= kMaxRecordingSamples; ++i) {
+            moving = rest;
+            moving.translate.x = static_cast<float>(i) * 0.2f;
+            observe(moving, 1.0f, true);
+        }
+        ok &= expectEqual("capacity discard is captured", captured.callbackCount, 4u);
+        ok &= expectEqual("capacity termination retained", captured.termination,
+            rich_capture::StrokeTermination::SampleCapacity);
+        ok &= expectEqual("all bounded samples survive capacity termination",
+            captured.sampleCount, kMaxRecordingSamples);
+        ok &= expectTrue("capacity terminal observation is retained and trusted",
+            captured.terminalPresent && captured.terminalTrusted);
+        learner.setRawCaptureSink(nullptr, nullptr);
+    }
+
+    {
+        // JSONL evidence schema: 64-bit values are strings, identities are
+        // load-order independent, role names accompany raw values, and raw
+        // samples use the versioned compact layout.
+        using namespace redux;
+        using namespace redux::rich_capture;
+
+        WeaponSnapshotEvent snapshot{};
+        snapshot.context.sessionId = "session-test";
+        snapshot.context.sequence = 9'007'199'254'740'993ull;
+        snapshot.context.capturedAtUnixMs = 123456789;
+        snapshot.context.rockFrameIndex = 9'007'199'254'740'994ull;
+        snapshot.context.weaponGenerationKey = 0x123456789ABCDEF0ull;
+        snapshot.context.weapon.ref = { "ExampleWeapon.esp", 0x1234 };
+        snapshot.context.weapon.runtimeFormId = 0xFE001234;
+        snapshot.context.paperVersion = "0.1.0";
+        snapshot.context.rockApiVersion = 1;
+        snapshot.classification.available = true;
+        snapshot.classification.valid = true;
+        snapshot.classification.keywordFlags = 1ull << 2;
+        snapshot.classification.sizeClass = 2;
+        snapshot.nodes.push_back(NodeSnapshot{ .id = 0, .parentId = -1, .name = "Weapon", .rootRelativePath = "/" });
+        EvidenceSnapshot evidence{};
+        evidence.id = 4;
+        evidence.providerSourceName = "WeaponMagazine#0";
+        evidence.sourceNodeId = 0;
+        evidence.sourceNodePath = "/[4]WeaponMagazine";
+        evidence.partKind = 7;
+        evidence.reloadRole = 1;
+        evidence.omod.ref = { "ExampleParts.esp", 0x77 };
+        evidence.attachPoint.ref = { "Fallout4.esm", 0x123 };
+        evidence.providerPointCount = 5;
+        evidence.queriedPointCount = 5;
+        evidence.scheduledPointCount = 3;
+        evidence.geometryDelivery = GeometryDelivery::Chunks;
+        evidence.pointCloudTruncated = true;
+        snapshot.evidence.push_back(std::move(evidence));
+
+        const auto snapshotText = serializeLine(Event{ std::move(snapshot) });
+        const auto snapshotJson = nlohmann::json::parse(snapshotText, nullptr, false);
+        ok &= expectFalse("rich snapshot JSON parses", snapshotJson.is_discarded());
+        if (!snapshotJson.is_discarded()) {
+            ok &= expectTrue("rich schema and event are named",
+                snapshotJson["schema"] == "paper-redux-motion-capture" &&
+                    snapshotJson["event"] == "weaponSnapshot");
+            ok &= expectTrue("64-bit sequence is lossless string",
+                snapshotJson["sequence"] == "9007199254740993" &&
+                    snapshotJson["rockFrame"] == "9007199254740994");
+            ok &= expectTrue("weapon form ref is plugin-local",
+                snapshotJson["weapon"]["ref"]["plugin"] == "ExampleWeapon.esp" &&
+                    snapshotJson["weapon"]["ref"]["id"] == "0x00001234");
+            ok &= expectTrue("raw role and informative name coexist",
+                snapshotJson["evidence"][0]["partKind"] == 7 &&
+                    snapshotJson["evidence"][0]["partKindName"] == "Magazine" &&
+                    snapshotJson["evidence"][0]["reloadRoleName"] == "MagazineBody");
+            ok &= expectTrue("snapshot schedules deferred point geometry",
+                snapshotJson["evidence"][0]["scheduledPointCount"] == 3 &&
+                    snapshotJson["evidence"][0]["geometryDelivery"] == "chunks" &&
+                    snapshotJson["evidence"][0]["geometryDeferred"] == true &&
+                    snapshotJson["evidence"][0]["pointsWeaponLocalGame"].empty());
+        }
+
+        GeometryChunkEvent firstChunk{};
+        firstChunk.context.sessionId = "session-test";
+        firstChunk.context.sequence = 9'007'199'254'740'995ull;
+        firstChunk.context.weapon.ref = { "ExampleWeapon.esp", 0x1234 };
+        firstChunk.snapshotSequence = 9'007'199'254'740'993ull;
+        firstChunk.evidenceId = 4;
+        firstChunk.bodyId = 27;
+        firstChunk.pointOffset = 0;
+        firstChunk.totalPointCount = 3;
+        firstChunk.chunkIndex = 0;
+        firstChunk.pointsWeaponLocalGame = {
+            { 1.0f, 2.0f, 3.0f },
+            { 4.0f, 5.0f, 6.0f },
+        };
+        const auto firstChunkJson = nlohmann::json::parse(
+            serializeLine(Event{ std::move(firstChunk) }), nullptr, false);
+        ok &= expectFalse("first geometry chunk JSON parses", firstChunkJson.is_discarded());
+        if (!firstChunkJson.is_discarded()) {
+            ok &= expectTrue("first geometry chunk links exactly to snapshot",
+                firstChunkJson["event"] == "geometryChunk" &&
+                    firstChunkJson["snapshotSequence"] == "9007199254740993" &&
+                    firstChunkJson["evidenceId"] == 4 && firstChunkJson["bodyIdDiagnostic"] == 27);
+            ok &= expectTrue("first geometry chunk preserves range and point order",
+                firstChunkJson["pointOffset"] == 0 && firstChunkJson["totalPointCount"] == 3 &&
+                    firstChunkJson["chunkIndex"] == 0 && firstChunkJson["pointCount"] == 2 &&
+                    firstChunkJson["pointsWeaponLocalGame"][0] == nlohmann::json::array({ 1.0f, 2.0f, 3.0f }) &&
+                    firstChunkJson["pointsWeaponLocalGame"][1] == nlohmann::json::array({ 4.0f, 5.0f, 6.0f }));
+            ok &= expectTrue("non-final geometry flags stay false",
+                firstChunkJson["finalChunk"] == false && firstChunkJson["sourceComplete"] == false &&
+                    firstChunkJson["evidenceComplete"] == false && firstChunkJson["snapshotComplete"] == false);
+        }
+
+        GeometryChunkEvent finalChunk{};
+        finalChunk.context.sessionId = "session-test";
+        finalChunk.context.sequence = 9'007'199'254'740'996ull;
+        finalChunk.context.weapon.ref = { "ExampleWeapon.esp", 0x1234 };
+        finalChunk.snapshotSequence = 9'007'199'254'740'993ull;
+        finalChunk.evidenceId = 4;
+        finalChunk.bodyId = 27;
+        finalChunk.pointOffset = 2;
+        finalChunk.totalPointCount = 3;
+        finalChunk.chunkIndex = 1;
+        finalChunk.finalChunk = true;
+        // Three scheduled points were delivered, but the provider reported
+        // five. Final delivery and source fidelity must remain independent.
+        finalChunk.sourceComplete = false;
+        finalChunk.snapshotComplete = true;
+        finalChunk.pointsWeaponLocalGame = { { 7.0f, 8.0f, 9.0f } };
+        const auto finalChunkJson = nlohmann::json::parse(
+            serializeLine(Event{ std::move(finalChunk) }), nullptr, false);
+        ok &= expectFalse("final geometry chunk JSON parses", finalChunkJson.is_discarded());
+        if (!finalChunkJson.is_discarded()) {
+            ok &= expectTrue("final geometry chunk continues exact source order",
+                finalChunkJson["pointOffset"] == 2 && finalChunkJson["chunkIndex"] == 1 &&
+                    finalChunkJson["pointCount"] == 1 &&
+                    finalChunkJson["pointsWeaponLocalGame"][0] == nlohmann::json::array({ 7.0f, 8.0f, 9.0f }));
+            ok &= expectTrue("final geometry flags are independent and explicit",
+                finalChunkJson["finalChunk"] == true && finalChunkJson["sourceComplete"] == false &&
+                    finalChunkJson["evidenceComplete"] == false && finalChunkJson["snapshotComplete"] == true);
+        }
+
+        RawStrokeEvent stroke{};
+        stroke.context.sessionId = "session-test";
+        stroke.context.sequence = 2;
+        stroke.context.weapon.ref = { "ExampleWeapon.esp", 0x1234 };
+        stroke.sourceName = "WeaponBolt";
+        stroke.termination = StrokeTermination::UntrustedDrive;
+        stroke.servingDecision = ServingDecision::NotEvaluated;
+        stroke.samples.push_back(RawSample{
+            .rockFrameIndex = 42,
+            .scale = 0.5f,
+            .clip = ClipSampleContext{
+                .activityId = 77,
+                .scrubSessionId = 88,
+                .concurrentActivityCount = 2,
+                .fraction = 0.25f,
+                .localTimeSeconds = 0.5f,
+            },
+        });
+        stroke.terminalSamplePresent = true;
+        stroke.terminalSample.trusted = false;
+        const auto strokeJson = nlohmann::json::parse(serializeLine(Event{ std::move(stroke) }), nullptr, false);
+        ok &= expectFalse("rich stroke JSON parses", strokeJson.is_discarded());
+        if (!strokeJson.is_discarded()) {
+            ok &= expectTrue("raw sample layout is explicit and compact",
+                strokeJson["rawSampleLayout"].size() == 15 && strokeJson["samples"][0].size() == 15);
+            ok &= expectTrue("clip definition, scrub, and layering identities remain distinct",
+                strokeJson["samples"][0][10] == "77" && strokeJson["samples"][0][11] == "88" &&
+                    strokeJson["samples"][0][12] == 2);
+            ok &= expectTrue("termination and terminal trust survive",
+                strokeJson["termination"] == "untrustedDrive" && strokeJson["terminalSample"][9] == 0);
+        }
+
+        AuthoredClipEvent clip{};
+        clip.context.sessionId = "session-test";
+        clip.context.sequence = 7;
+        clip.context.weapon.ref = { "ExampleWeapon.esp", 0x1234 };
+        clip.activityId = 9'007'199'254'740'997ull;
+        clip.activatedClip = true;
+        clip.animationName = "ReloadMagazine";
+        clip.durationSeconds = 1.5f;
+        clip.rawTransformTrackCount = 22;
+        clip.capturedWeaponTrackCount = 1;
+        ClipTrack clipTrack{};
+        clipTrack.boneName = "WeaponMagazine";
+        weapon_part_motion_path::PoseSample clipPose{};
+        clipPose.translate = { 10.0f, 20.0f, 30.0f };
+        clipTrack.samples.push_back(clipPose);
+        clipTrack.scaleSamples.push_back({ 1.0f, 1.1f, 1.2f });
+        clip.weaponTracks.push_back(std::move(clipTrack));
+        clip.annotations.push_back({ 0.25f, "Reload", "magazine_release" });
+        clip.triggers.push_back({ 0.75f, 18, "reloadComplete" });
+        const auto clipJson = nlohmann::json::parse(serializeLine(Event{ std::move(clip) }), nullptr, false);
+        ok &= expectFalse("rich authored clip JSON parses", clipJson.is_discarded());
+        if (!clipJson.is_discarded()) {
+            ok &= expectTrue("authored clip activity correlation is lossless",
+                clipJson["event"] == "authoredClip" && clipJson["activityId"] == "9007199254740997");
+            ok &= expectTrue("authored clip track and scale survive",
+                clipJson["weaponTracks"][0]["bone"] == "WeaponMagazine" &&
+                    clipJson["weaponTracks"][0]["samples"][0] ==
+                        nlohmann::json::array({ 10.0f, 20.0f, 30.0f, 1.0f, 0.0f, 0.0f, 0.0f }) &&
+                    clipJson["weaponTracks"][0]["scaleSamples"][0] ==
+                        nlohmann::json::array({ 1.0f, 1.1f, 1.2f }));
+            ok &= expectTrue("authored clip annotations and triggers survive",
+                clipJson["annotations"][0]["track"] == "Reload" &&
+                    clipJson["annotations"][0]["text"] == "magazine_release" &&
+                    clipJson["triggers"][0]["eventId"] == 18 &&
+                    clipJson["triggers"][0]["eventName"] == "reloadComplete");
+        }
+
+        CaptureGapEvent gap{};
+        gap.context.sessionId = "session-test";
+        gap.context.sequence = 8;
+        gap.context.weapon.ref = { "ExampleWeapon.esp", 0x1234 };
+        gap.relatedSnapshotSequence = 9'007'199'254'740'997ull;
+        gap.firstDroppedSequence = 9'007'199'254'740'998ull;
+        gap.lastDroppedSequence = 9'007'199'254'740'999ull;
+        gap.droppedEventCount = 2;
+        gap.reason = "invalid ";
+        gap.reason.push_back(static_cast<char>(0xC3));
+        gap.reason.push_back('(');
+        const auto gapJson = nlohmann::json::parse(serializeLine(Event{ std::move(gap) }), nullptr, false);
+        ok &= expectFalse("capture gap with invalid UTF-8 still serializes", gapJson.is_discarded());
+        if (!gapJson.is_discarded()) {
+            const auto reason = gapJson["reason"].get<std::string>();
+            ok &= expectTrue("capture gap range remains lossless",
+                gapJson["relatedSnapshotSequence"] == "9007199254740997" &&
+                gapJson["firstDroppedSequence"] == "9007199254740998" &&
+                    gapJson["lastDroppedSequence"] == "9007199254740999" &&
+                    gapJson["droppedEventCount"] == 2);
+            ok &= expectTrue("invalid UTF-8 is replaced instead of dropping the event",
+                reason.find("\xEF\xBF\xBD") != std::string::npos && reason.back() == '(');
+        }
+
+        GeometryChunkEvent sizedChunk{};
+        sizedChunk.context.sessionId = "sized";
+        sizedChunk.pointsWeaponLocalGame.reserve(128);
+        Event emptyChunkEvent{ GeometryChunkEvent{} };
+        Event sizedChunkEvent{ std::move(sizedChunk) };
+        ok &= expectTrue("owned-byte estimate accounts for deferred geometry capacity",
+            estimateOwnedBytes(sizedChunkEvent) >=
+                estimateOwnedBytes(emptyChunkEvent) + 128 * sizeof(Point3));
     }
 
     return ok ? 0 : 1;

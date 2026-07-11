@@ -51,6 +51,10 @@ namespace redux::weapon_clip_stroke
         std::array<char, kMaxBoneName> boneName{};
         std::uint32_t sampleCount{ 0 };
         std::array<PoseSample, kClipSampleCount> samples{};
+        // Exact authored hkQs scale vector. Serving paths currently preserve
+        // scene-observed scalar rest scale, but the evidence archive retains
+        // all three clip-authored components for offline analysis.
+        std::array<weapon_part_motion_path::Vec3, kClipSampleCount> scales{};
     };
 
     struct AuthoredFollower

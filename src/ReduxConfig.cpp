@@ -120,6 +120,16 @@ namespace redux
             "bMotionLibrary = true\n"
             "bMotionLibraryReadOnly = false\n"
             "\n"
+            "; Rich mapping capture: append immutable evidence to one sibling\n"
+            "; <weapon>.capture.jsonl file in MotionLibrary. Includes the full\n"
+            "; ROCK/OMOD/node inventory and geometry, every raw learned stroke\n"
+            "; (even rejected/replaced/interrupted), and authored clip tracks plus\n"
+            "; markers. Gameplay never loads this forensic archive, so richer data\n"
+            "; cannot add weapon-equip parse hitches. Re-record wipes intentionally\n"
+            "; keep it. bMotionLibraryReadOnly disables every disk write, including\n"
+            "; capture.\n"
+            "bRichMotionCapture = true\n"
+            "\n"
             "; Full-subtree observation: the mapper watches EVERY named node under\n"
             "; the weapon root, not only parts with colliders — bullets riding a mag,\n"
             "; small linkages — so the full animation gets mapped and persisted.\n"
@@ -249,6 +259,7 @@ namespace redux
         const bool previousResetLearned = resetLearnedPaths;
         const bool previousMotionLibrary = motionLibrary;
         const bool previousLibraryReadOnly = motionLibraryReadOnly;
+        const bool previousRichCapture = richMotionCapture;
         const bool previousFullSubtree = fullSubtreeObservation;
 
         const bool previousRequireTriggerUnlock = requireTriggerUnlock;
@@ -299,6 +310,7 @@ namespace redux
         resetLearnedPaths = ini.GetBoolValue(kSection, "bResetLearnedPaths", resetLearnedPaths);
         motionLibrary = ini.GetBoolValue(kSection, "bMotionLibrary", motionLibrary);
         motionLibraryReadOnly = ini.GetBoolValue(kSection, "bMotionLibraryReadOnly", motionLibraryReadOnly);
+        richMotionCapture = ini.GetBoolValue(kSection, "bRichMotionCapture", richMotionCapture);
         fullSubtreeObservation = ini.GetBoolValue(kSection, "bFullSubtreeObservation", fullSubtreeObservation);
 
         // AttachOnly allowlist booleans, composed into the class masks.
@@ -364,6 +376,12 @@ namespace redux
                     motionLibrary,
                     motionLibraryReadOnly);
             }
+            if (richMotionCapture != previousRichCapture) {
+                RDX_LOG_INFO(Config,
+                    "bRichMotionCapture: {} -> {} (append-only per-weapon evidence archive)",
+                    previousRichCapture,
+                    richMotionCapture);
+            }
             if (fullSubtreeObservation != previousFullSubtree) {
                 RDX_LOG_INFO(Config,
                     "bFullSubtreeObservation: {} -> {} (applies on the next weapon generation)",
@@ -399,7 +417,7 @@ namespace redux
                 requireTriggerUnlock == previousRequireTriggerUnlock && !allowListChangedKeys && !groupingChanged &&
                 shellEjectOnMaxTravel == previousShellEject && !sweepChanged && resetLearnedPaths == previousResetLearned &&
                 motionLibrary == previousMotionLibrary && motionLibraryReadOnly == previousLibraryReadOnly &&
-                fullSubtreeObservation == previousFullSubtree) {
+                richMotionCapture == previousRichCapture && fullSubtreeObservation == previousFullSubtree) {
                 RDX_LOG_INFO(Config, "Reload applied, no value changes (enabled={} mode={} logLevel={})",
                     enabled,
                     motionPathModeName(motionPathMode),

@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 #include <mutex>
+#include <type_traits>
 
 namespace redux::weapon_clip_motion_harvest
 {
@@ -62,6 +63,7 @@ namespace redux::weapon_clip_motion_harvest
         constexpr std::uintptr_t kBindingSetDataOffset = 0x10;
         constexpr std::uintptr_t kBindingSetCountOffset = 0x18;
         constexpr std::int32_t kMaxPlausibleBindingCount = 4096;
+        constexpr std::uint32_t kMaxWalkGraphs = 8;
 
         // hkbAnimationBindingWithTriggers (0x30-byte hkReferencedObject):
         // +0x8 is the memSizeAndFlags/refCount header — the binding pointer
@@ -302,6 +304,32 @@ namespace redux::weapon_clip_motion_harvest
         std::array<weapon_clip_stroke::AuthoredStrokeGroup, kQueueCapacity> s_queue{};
         std::uint32_t s_queueCount = 0;
 
+        constexpr std::size_t kRichClipQueueCapacity = 8;
+        std::atomic<bool> s_richCaptureEnabled{ false };
+        std::atomic<std::uint64_t> s_richClipCapturesDropped{ 0 };
+        std::uint32_t s_richClipDropWeaponFormId = 0;
+        std::uint64_t s_richClipDropWeaponGenerationKey = 0;
+        std::mutex s_richClipQueueMutex;
+        std::array<RichClipCapturePacket, kRichClipQueueCapacity> s_richClipQueue{};
+        std::uint32_t s_richClipQueueCount = 0;
+
+        struct MarkerCaptureScratch
+        {
+            float durationSeconds{ 0.0f };
+            std::int32_t rawAnnotationTrackCount{ 0 };
+            std::int32_t rawTriggerCount{ 0 };
+            std::int32_t graphEventNameCount{ 0 };
+            std::uint32_t annotationCount{ 0 };
+            std::uint32_t triggerCount{ 0 };
+            bool annotationsTruncated{ false };
+            bool triggersTruncated{ false };
+            std::array<CapturedClipAnnotation, kMaxCapturedClipAnnotations> annotations{};
+            std::array<CapturedClipTrigger, kMaxCapturedClipTriggers> triggers{};
+        };
+        // Activation hook already holds s_hookMutex while this is populated
+        // and consumed. The walk path has no marker source and passes null.
+        MarkerCaptureScratch s_markerCaptureScratch{};
+
         /*
          * Harvest scratch: at 32 tracks / 16 groups per clip these buffers
          * are far too large for engine-thread stacks (the hook fires on the
@@ -350,7 +378,7 @@ namespace redux::weapon_clip_motion_harvest
          * are sparse).
          */
         constexpr std::size_t kMaxHookCharacters = 8;
-        constexpr std::size_t kMaxHookNodeNames = 64;
+        constexpr std::size_t kMaxHookNodeNames = 128;
         constexpr std::size_t kMaxHookNodeNameLength = 64;
         std::mutex s_hookMutex;
         std::array<std::uintptr_t, kMaxHookCharacters> s_hookCharacters{};
@@ -358,6 +386,8 @@ namespace redux::weapon_clip_motion_harvest
         std::array<std::array<char, kMaxHookNodeNameLength>, kMaxHookNodeNames> s_hookNodeNames{};
         std::array<const char*, kMaxHookNodeNames> s_hookNodeNamePointers{};
         std::uint32_t s_hookNodeNameCount = 0;
+        std::uint32_t s_hookWeaponFormId = 0;
+        std::uint64_t s_hookWeaponGenerationKey = 0;
 
         /*
          * Bindings terminally processed this weapon generation (harvested or
@@ -377,10 +407,24 @@ namespace redux::weapon_clip_motion_harvest
         struct ProcessedBinding
         {
             std::uintptr_t binding{ 0 };
+            // Stable authored-definition id for this binding/generation.
+            // Repeat activations reuse it, so learner samples never point at
+            // an activity id absent from the per-weapon archive.
+            std::uint64_t richActivityId{ 0 };
+            std::uint32_t epoch{ 0 };
             bool activated{ false };
+            bool weaponTracks{ false };
         };
-        std::array<ProcessedBinding, 128> s_processedBindings{};
-        std::uint32_t s_processedBindingCount = 0;
+        // Up to eight accepted graph slots x 4096 accepted bindings. A
+        // power-of-two table at <= 0.5 load preserves O(1) lookup without
+        // heap allocation or silently losing stable authored ids. Epochs
+        // make generation reset O(1), avoiding a 1.5 MiB table clear.
+        constexpr std::size_t kProcessedBindingCapacity =
+            static_cast<std::size_t>(kMaxPlausibleBindingCount) * kMaxWalkGraphs * 2;
+        static_assert((kProcessedBindingCapacity & (kProcessedBindingCapacity - 1)) == 0);
+        std::array<ProcessedBinding, kProcessedBindingCapacity> s_processedBindings{};
+        std::uint32_t s_processedBindingEpoch = 1;
+        std::uint32_t s_processedBindingOverflowLogs = 0;
         // Guarded by s_hookMutex like the registry above.
         std::uint32_t s_stageMarkerLogBudget = kStageMarkerLogBudgetPerGeneration;
 
@@ -449,35 +493,153 @@ namespace redux::weapon_clip_motion_harvest
         float s_scrubCropStart = 0.0f;
         float s_scrubCroppedDuration = 0.0f;
         float s_scrubClipDuration = 0.0f;
+        std::uint32_t s_scrubWeaponFormId = 0;
+        std::uint64_t s_scrubWeaponGenerationKey = 0;
         std::array<char, 64> s_scrubClipName{};
+
+        // Active weapon-track clips can overlap in a layered behavior graph.
+        // Each slot's metadata is seeded under s_hookMutex before the clip
+        // pointer is release-published; update shims touch only the atomic
+        // time fields. Main-thread selection is deterministic: newest active
+        // activation wins, and removing it reveals the still-active prior
+        // layer instead of dropping all clip context.
+        constexpr std::size_t kMaxRichActiveClips = 8;
+        struct RichActiveClip
+        {
+            std::atomic<std::uintptr_t> clip{ 0 };
+            std::uintptr_t binding{ 0 };
+            std::uint64_t activityId{ 0 };
+            std::uint64_t activationOrder{ 0 };
+            std::uint32_t weaponFormId{ 0 };
+            std::uint64_t weaponGenerationKey{ 0 };
+            std::array<char, weapon_clip_stroke::kMaxBoneName> name{};
+            float duration{ 0.0f };
+            std::atomic<float> cropStart{ 0.0f };
+            std::atomic<float> croppedDuration{ 0.0f };
+            std::atomic<float> localTime{ 0.0f };
+            std::atomic<float> fraction{ 0.0f };
+        };
+        std::array<RichActiveClip, kMaxRichActiveClips> s_richActiveClips{};
+        std::atomic<std::uint32_t> s_richActiveClipCount{ 0 };
+        std::atomic<std::uint64_t> s_nextRichActivityId{ 1 };
+        std::atomic<std::uint64_t> s_nextRichActivationOrder{ 1 };
+        std::atomic<std::uint32_t> s_richActiveClipOverflowLogs{ 0 };
+
+        void clearRichClipActivitiesLocked()
+        {
+            for (auto& slot : s_richActiveClips) {
+                slot.clip.store(0, std::memory_order_release);
+            }
+            s_richActiveClipCount.store(0, std::memory_order_relaxed);
+        }
+
+        [[nodiscard]] std::size_t processedBindingHash(std::uintptr_t binding)
+        {
+            std::uint64_t value = static_cast<std::uint64_t>(binding >> 4);
+            value ^= value >> 33;
+            value *= 0xff51afd7ed558ccdull;
+            value ^= value >> 33;
+            return static_cast<std::size_t>(value) & (kProcessedBindingCapacity - 1);
+        }
+
+        [[nodiscard]] ProcessedBinding* findProcessedBindingLocked(std::uintptr_t binding)
+        {
+            const auto first = processedBindingHash(binding);
+            for (std::size_t probe = 0; probe < kProcessedBindingCapacity; ++probe) {
+                auto& entry = s_processedBindings[(first + probe) & (kProcessedBindingCapacity - 1)];
+                if (entry.epoch != s_processedBindingEpoch) {
+                    return nullptr;
+                }
+                if (entry.binding == binding) {
+                    return &entry;
+                }
+            }
+            return nullptr;
+        }
+
+        void advanceProcessedBindingEpochLocked()
+        {
+            ++s_processedBindingEpoch;
+            if (s_processedBindingEpoch == 0) {
+                // Practically unreachable; preserve sentinel semantics on a
+                // 2^32 generation wrap without a large stack temporary.
+                for (auto& entry : s_processedBindings) {
+                    entry.epoch = 0;
+                }
+                s_processedBindingEpoch = 1;
+            }
+            s_processedBindingOverflowLogs = 0;
+        }
 
         [[nodiscard]] bool bindingProcessedLocked(std::uintptr_t binding, bool fromActivation)
         {
-            for (std::uint32_t i = 0; i < s_processedBindingCount; ++i) {
-                if (s_processedBindings[i].binding == binding) {
-                    return fromActivation ? s_processedBindings[i].activated : true;
+            const auto* entry = findProcessedBindingLocked(binding);
+            return entry ? (fromActivation ? entry->activated : true) : false;
+        }
+
+        [[nodiscard]] bool bindingHasWeaponTracksLocked(std::uintptr_t binding, bool fromActivation)
+        {
+            const auto* entry = findProcessedBindingLocked(binding);
+            return entry && (!fromActivation || entry->activated) ? entry->weaponTracks : false;
+        }
+
+        [[nodiscard]] std::uint64_t bindingRichActivityIdLocked(
+            std::uintptr_t binding, bool fromActivation)
+        {
+            const auto* entry = findProcessedBindingLocked(binding);
+            return entry && (!fromActivation || entry->activated) ? entry->richActivityId : 0;
+        }
+
+        void markBindingProcessedLocked(
+            std::uintptr_t binding,
+            bool fromActivation,
+            bool weaponTracks,
+            std::uint64_t richActivityId)
+        {
+            const auto first = processedBindingHash(binding);
+            for (std::size_t probe = 0; probe < kProcessedBindingCapacity; ++probe) {
+                auto& entry = s_processedBindings[(first + probe) & (kProcessedBindingCapacity - 1)];
+                if (entry.epoch == s_processedBindingEpoch && entry.binding == binding) {
+                    entry.activated |= fromActivation;
+                    entry.weaponTracks |= weaponTracks;
+                    if (richActivityId != 0) {
+                        entry.richActivityId = richActivityId;
+                    }
+                    return;
+                }
+                if (entry.epoch != s_processedBindingEpoch) {
+                    entry.binding = binding;
+                    entry.richActivityId = richActivityId;
+                    entry.activated = fromActivation;
+                    entry.weaponTracks = weaponTracks;
+                    entry.epoch = s_processedBindingEpoch;
+                    return;
+                }
+            }
+            if (s_processedBindingOverflowLogs++ < 3) {
+                RDX_LOG_WARN(Weapon,
+                    "WeaponClipMotionHarvest: processed-binding table exhausted; binding {:#x} cannot retain a stable authored id",
+                    binding);
+            }
+        }
+
+        // Detailed bail dumps are claimed by both the main-thread walk and
+        // graph-thread activation harvest, then reset at a generation
+        // boundary. Atomic claim keeps the cap race-free without a hot lock.
+        constexpr std::uint32_t kMaxBindingDetailLogsPerWalk = 8;
+        std::atomic<std::uint32_t> s_bindingDetailLogs{ 0 };
+
+        [[nodiscard]] bool claimBindingDetailLog()
+        {
+            auto current = s_bindingDetailLogs.load(std::memory_order_relaxed);
+            while (current < kMaxBindingDetailLogsPerWalk) {
+                if (s_bindingDetailLogs.compare_exchange_weak(
+                        current, current + 1, std::memory_order_relaxed)) {
+                    return true;
                 }
             }
             return false;
         }
-
-        void markBindingProcessedLocked(std::uintptr_t binding, bool fromActivation)
-        {
-            for (std::uint32_t i = 0; i < s_processedBindingCount; ++i) {
-                if (s_processedBindings[i].binding == binding) {
-                    s_processedBindings[i].activated |= fromActivation;
-                    return;
-                }
-            }
-            if (s_processedBindingCount < s_processedBindings.size()) {
-                s_processedBindings[s_processedBindingCount++] = ProcessedBinding{ binding, fromActivation };
-            }
-        }
-
-        // Detailed bail dumps per walk (main thread; reset with the cursor)
-        // so a failing binding is identifiable without flooding the log.
-        constexpr std::uint32_t kMaxBindingDetailLogsPerWalk = 8;
-        std::uint32_t s_bindingDetailLogs = 0;
 
         // Walk cursor (main thread only). No engine pointers are stored —
         // the chain is re-resolved from the holder on every step.
@@ -535,10 +697,9 @@ namespace redux::weapon_clip_motion_harvest
             std::int32_t trackToBoneCount,
             std::int32_t boneCount)
         {
-            if (s_bindingDetailLogs >= kMaxBindingDetailLogsPerWalk) {
+            if (!claimBindingDetailLog()) {
                 return;
             }
-            ++s_bindingDetailLogs;
             RDX_LOG_WARN(Weapon,
                 "WeaponClipMotionHarvest: binding bail [{}] binding={:#x}(vt+{:#x}) anim={:#x}(vt+{:#x}) duration={} trackCount={} trackToBone={} bones={}",
                 reason,
@@ -728,30 +889,45 @@ namespace redux::weapon_clip_motion_harvest
             std::uintptr_t clipGenerator,
             std::uintptr_t binding,
             const char* clipName,
-            std::uintptr_t behaviorGraph)
+            std::uintptr_t behaviorGraph,
+            MarkerCaptureScratch* capture)
         {
-            if (s_stageMarkerLogBudget == 0) {
+            if (capture) {
+                static_assert(std::is_trivially_copyable_v<MarkerCaptureScratch>);
+                std::memset(capture, 0, sizeof(*capture));
+            }
+            if (s_stageMarkerLogBudget == 0 && !capture) {
                 return;
             }
             const auto animation = *reinterpret_cast<std::uintptr_t*>(binding + kBindingAnimationOffset);
             if (!plausiblePointer(animation)) {
-                --s_stageMarkerLogBudget;
-                RDX_LOG_INFO(Weapon,
-                    "STAGE-MARKER summary clip='{}': skipped, animation pointer implausible", clipName);
+                if (s_stageMarkerLogBudget > 0) {
+                    --s_stageMarkerLogBudget;
+                    RDX_LOG_INFO(Weapon,
+                        "STAGE-MARKER summary clip='{}': skipped, animation pointer implausible", clipName);
+                }
                 return;
             }
             const float duration = *reinterpret_cast<float*>(animation + kAnimationDurationOffset);
             if (!std::isfinite(duration) || duration <= 0.0f || duration > kMaxClipDurationSeconds) {
-                --s_stageMarkerLogBudget;
-                RDX_LOG_INFO(Weapon,
-                    "STAGE-MARKER summary clip='{}': skipped, duration {:.3f} implausible", clipName, duration);
+                if (s_stageMarkerLogBudget > 0) {
+                    --s_stageMarkerLogBudget;
+                    RDX_LOG_INFO(Weapon,
+                        "STAGE-MARKER summary clip='{}': skipped, duration {:.3f} implausible", clipName, duration);
+                }
                 return;
+            }
+            if (capture) {
+                capture->durationSeconds = duration;
             }
 
             const auto trackCount =
                 *reinterpret_cast<std::int32_t*>(animation + kAnimationAnnotationTracksCountOffset);
             const auto trackData =
                 *reinterpret_cast<std::uintptr_t*>(animation + kAnimationAnnotationTracksDataOffset);
+            if (capture) {
+                capture->rawAnnotationTrackCount = trackCount;
+            }
             std::uint32_t annotationLines = 0;
             /*
              * Per-track names for filter-matching clips (sweep filter,
@@ -825,6 +1001,19 @@ namespace redux::weapon_clip_motion_harvest
                             continue;
                         }
                         ++annotationLines;
+                        if (capture) {
+                            if (capture->annotationCount < capture->annotations.size()) {
+                                auto& saved = capture->annotations[capture->annotationCount++];
+                                saved = {};
+                                saved.timeSeconds = time;
+                                std::memcpy(saved.trackName.data(), trackName,
+                                    (std::min)(std::strlen(trackName), saved.trackName.size() - 1));
+                                std::memcpy(saved.text.data(), text,
+                                    (std::min)(std::strlen(text), saved.text.size() - 1));
+                            } else {
+                                capture->annotationsTruncated = true;
+                            }
+                        }
                         if (s_stageMarkerLogBudget > 1) {
                             --s_stageMarkerLogBudget;
                             RDX_LOG_INFO(Weapon,
@@ -870,10 +1059,22 @@ namespace redux::weapon_clip_motion_harvest
                         const auto eventId =
                             *reinterpret_cast<std::int32_t*>(trigger + kTriggerEventIdOffset);
                         ++triggerLines;
+                        char eventName[96]{};
+                        resolveGraphEventName(behaviorGraph, eventId, eventName, sizeof(eventName));
+                        if (capture) {
+                            if (capture->triggerCount < capture->triggers.size()) {
+                                auto& saved = capture->triggers[capture->triggerCount++];
+                                saved = {};
+                                saved.localTimeSeconds = localTime;
+                                saved.eventId = eventId;
+                                std::memcpy(saved.eventName.data(), eventName,
+                                    (std::min)(std::strlen(eventName), saved.eventName.size() - 1));
+                            } else {
+                                capture->triggersTruncated = true;
+                            }
+                        }
                         if (s_stageMarkerLogBudget > 1) {
                             --s_stageMarkerLogBudget;
-                            char eventName[96];
-                            resolveGraphEventName(behaviorGraph, eventId, eventName, sizeof(eventName));
                             RDX_LOG_INFO(Weapon,
                                 "STAGE-MARKER [trigger] clip='{}' t={:.3f}/{:.3f}s eventId={} name='{}'",
                                 clipName,
@@ -885,6 +1086,10 @@ namespace redux::weapon_clip_motion_harvest
                     }
                 }
             }
+            if (capture) {
+                capture->rawTriggerCount = triggerCountRaw;
+                capture->graphEventNameCount = behaviorGraphEventNameCount(behaviorGraph);
+            }
             /*
              * Always exactly one summary per dumped clip, raw structure
              * counts included, so "VR clips carry no markers" and "a
@@ -893,17 +1098,19 @@ namespace redux::weapon_clip_motion_harvest
              * marker lines and the old silent bails/DEBUG-only empty case
              * could not say which).
              */
-            --s_stageMarkerLogBudget;
-            RDX_LOG_INFO(Weapon,
-                "STAGE-MARKER summary clip='{}' duration={:.2f}s annotationTracksRaw={} annotationsLogged={} triggersObject={} triggersRaw={} triggersLogged={} graphEventNames={}",
-                clipName,
-                duration,
-                trackCount,
-                annotationLines,
-                plausiblePointer(triggersObject) ? "set" : "null",
-                triggerCountRaw,
-                triggerLines,
-                behaviorGraphEventNameCount(behaviorGraph));
+            if (s_stageMarkerLogBudget > 0) {
+                --s_stageMarkerLogBudget;
+                RDX_LOG_INFO(Weapon,
+                    "STAGE-MARKER summary clip='{}' duration={:.2f}s annotationTracksRaw={} annotationsLogged={} triggersObject={} triggersRaw={} triggersLogged={} graphEventNames={}",
+                    clipName,
+                    duration,
+                    trackCount,
+                    annotationLines,
+                    plausiblePointer(triggersObject) ? "set" : "null",
+                    triggerCountRaw,
+                    triggerLines,
+                    behaviorGraphEventNameCount(behaviorGraph));
+            }
         }
 
         // Returns true when the binding reached a terminal outcome (harvested
@@ -915,8 +1122,20 @@ namespace redux::weapon_clip_motion_harvest
             const char* const* allowedNodeNames,
             std::uint32_t allowedNodeNameCount,
             bool fromActivation,
-            const char* clipAnimationName)
+            const char* clipAnimationName,
+            std::uint32_t captureWeaponFormId,
+            std::uint64_t captureWeaponGenerationKey,
+            std::uint64_t captureActivityId,
+            bool* outHadWeaponTracks,
+            bool* outRichPacketQueued,
+            const MarkerCaptureScratch* markers = nullptr)
         {
+            if (outHadWeaponTracks) {
+                *outHadWeaponTracks = false;
+            }
+            if (outRichPacketQueued) {
+                *outRichPacketQueued = false;
+            }
             const auto animation = *reinterpret_cast<std::uintptr_t*>(binding + kBindingAnimationOffset);
             if (!plausiblePointer(animation)) {
                 s_bailAnimationPtr.fetch_add(1, std::memory_order_relaxed);
@@ -961,8 +1180,7 @@ namespace redux::weapon_clip_motion_harvest
                 !plausiblePointer(splineFloatBlockOffsets) || splineFloatBlockOffsetsCount < splineNumBlocks ||
                 !plausiblePointer(splineDataBase) || splineDataSize < animationTrackCount) {
                 s_bailSplineData.fetch_add(1, std::memory_order_relaxed);
-                if (s_bindingDetailLogs < kMaxBindingDetailLogsPerWalk) {
-                    ++s_bindingDetailLogs;
+                if (claimBindingDetailLog()) {
                     RDX_LOG_WARN(Weapon,
                         "WeaponClipMotionHarvest: binding bail [spline-data] anim={:#x} duration={} tracks={} blocks={} maxFrames={} blockOffsets={:#x}({}) floatBlockOffsets={:#x}({}) data={:#x}({})",
                         animation,
@@ -1066,15 +1284,20 @@ namespace redux::weapon_clip_motion_harvest
             auto& trackIndices = s_scratchTrackIndices;
             auto& tracks = s_scratchTracks;
             std::uint32_t targetCount = 0;
+            std::uint32_t matchingTargetCount = 0;
             std::int32_t maxTargetTrack = 0;
             const auto usableTrackCount = (std::min)(mappedTrackCount, animationTrackCount);
-            for (std::int32_t track = 0; track < usableTrackCount && targetCount < tracks.size(); ++track) {
+            for (std::int32_t track = 0; track < usableTrackCount; ++track) {
                 const auto boneIndex = trackBones[static_cast<std::size_t>(track)];
                 if (boneIndex < 0 || boneIndex >= boneCount) {
                     continue;
                 }
                 const char* name = skeletonBoneName(skeleton, boneIndex);
                 if (!isHarvestTargetBone(name, allowedNodeNames, allowedNodeNameCount)) {
+                    continue;
+                }
+                ++matchingTargetCount;
+                if (targetCount >= tracks.size()) {
                     continue;
                 }
                 trackIndices[targetCount] = static_cast<std::int16_t>(track);
@@ -1091,6 +1314,9 @@ namespace redux::weapon_clip_motion_harvest
             if (targetCount == 0) {
                 s_bindingsNoTargets.fetch_add(1, std::memory_order_relaxed);
                 return true;
+            }
+            if (outHadWeaponTracks) {
+                *outHadWeaponTracks = true;
             }
 
             const auto sampler = reinterpret_cast<SampleTracks_t>(
@@ -1124,10 +1350,69 @@ namespace redux::weapon_clip_motion_harvest
                         decoded.rotate[1],
                         decoded.rotate[2],
                     });
+                    tracks[i].scales[step] = weapon_part_motion_path::Vec3{
+                        decoded.scale[0],
+                        decoded.scale[1],
+                        decoded.scale[2],
+                    };
                 }
             }
             for (std::uint32_t i = 0; i < targetCount; ++i) {
                 tracks[i].sampleCount = weapon_clip_stroke::kClipSampleCount;
+            }
+
+            if (s_richCaptureEnabled.load(std::memory_order_relaxed)) {
+                std::scoped_lock captureLock(s_richClipQueueMutex);
+                if (s_richCaptureEnabled.load(std::memory_order_relaxed)) {
+                    RichClipCapturePacket* packet = nullptr;
+                    if (s_richClipQueueCount < s_richClipQueue.size()) {
+                        packet = &s_richClipQueue[s_richClipQueueCount++];
+                    }
+                    if (packet) {
+                        if (outRichPacketQueued) {
+                            *outRichPacketQueued = true;
+                        }
+                        static_assert(std::is_trivially_copyable_v<RichClipCapturePacket>);
+                        std::memset(packet, 0, sizeof(*packet));
+                        packet->weaponFormId = captureWeaponFormId;
+                        packet->weaponGenerationKey = captureWeaponGenerationKey;
+                        packet->activityId = captureActivityId;
+                        packet->activatedClip = fromActivation;
+                        packet->durationSeconds = duration;
+                        packet->rawTransformTrackCount = static_cast<std::uint32_t>(animationTrackCount);
+                        packet->capturedWeaponTrackCount = targetCount;
+                        packet->weaponTracksTruncated = matchingTargetCount > targetCount;
+                        if (clipAnimationName) {
+                            std::memcpy(packet->animationName.data(), clipAnimationName,
+                                (std::min)(std::strlen(clipAnimationName), packet->animationName.size() - 1));
+                        }
+                        for (std::uint32_t i = 0; i < targetCount; ++i) {
+                            packet->weaponTracks[i] = tracks[i];
+                        }
+                        if (markers) {
+                            packet->rawAnnotationTrackCount = markers->rawAnnotationTrackCount;
+                            packet->rawTriggerCount = markers->rawTriggerCount;
+                            packet->graphEventNameCount = markers->graphEventNameCount;
+                            packet->annotationCount = markers->annotationCount;
+                            packet->triggerCount = markers->triggerCount;
+                            packet->annotationsTruncated = markers->annotationsTruncated;
+                            packet->triggersTruncated = markers->triggersTruncated;
+                            packet->annotations = markers->annotations;
+                            packet->triggers = markers->triggers;
+                        }
+                    } else {
+                        if (s_richClipCapturesDropped.load(std::memory_order_relaxed) == 0) {
+                            s_richClipDropWeaponFormId = captureWeaponFormId;
+                            s_richClipDropWeaponGenerationKey = captureWeaponGenerationKey;
+                        }
+                        const auto dropped = s_richClipCapturesDropped.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (dropped <= 3) {
+                            RDX_LOG_WARN(Weapon,
+                                "WeaponClipMotionHarvest: rich clip capture queue full — raw authored clip evidence dropped ({})",
+                                dropped);
+                        }
+                    }
+                }
             }
 
             auto& groups = s_scratchGroups;
@@ -1145,8 +1430,7 @@ namespace redux::weapon_clip_motion_harvest
             // lead target's raw sample endpoints. Compared against the
             // learned-path endpoints for the same part, this pins down any
             // frame mismatch between rig-derived and scene-observed motion.
-            if (s_bindingDetailLogs < kMaxBindingDetailLogsPerWalk) {
-                ++s_bindingDetailLogs;
+            if (claimBindingDetailLog()) {
                 const auto parentIndicesData = *reinterpret_cast<std::uintptr_t*>(skeleton + kSkeletonParentIndicesOffset);
                 const auto parentIndicesCount = *reinterpret_cast<std::int32_t*>(skeleton + kSkeletonParentIndicesCountOffset);
                 const auto parentNameOf = [&](std::uint32_t target) -> const char* {
@@ -1253,7 +1537,6 @@ namespace redux::weapon_clip_motion_harvest
         // rig — so every entry is visited, gated per slot by the
         // BShkbAnimationGraph vtable (in-game confirmed module offset) so a
         // stale capacity slot degrades into a skip.
-        constexpr std::uint32_t kMaxWalkGraphs = 8;
         constexpr std::uintptr_t kGraphVtableModuleOffset = 0x2E00A48;
 
         bool resolveGraphArray(std::uintptr_t manager, GraphArrayView& out)
@@ -1456,6 +1739,8 @@ namespace redux::weapon_clip_motion_harvest
             s_scrubCropStart = effectiveCropStart;
             s_scrubCroppedDuration = croppedDuration;
             s_scrubClipDuration = duration;
+            s_scrubWeaponFormId = s_hookWeaponFormId;
+            s_scrubWeaponGenerationKey = s_hookWeaponGenerationKey;
             s_scrubClipName = {};
             if (clipName) {
                 std::size_t length = 0;
@@ -1475,6 +1760,111 @@ namespace redux::weapon_clip_motion_harvest
                 duration,
                 croppedDuration,
                 seedFraction);
+        }
+
+        void beginRichClipActivityLocked(
+            std::uintptr_t clipGenerator,
+            std::uintptr_t binding,
+            const char* clipName,
+            std::uint64_t activityId)
+        {
+            if (activityId == 0 || !plausiblePointer(clipGenerator) || !plausiblePointer(binding)) {
+                return;
+            }
+            const auto animation = *reinterpret_cast<std::uintptr_t*>(binding + kBindingAnimationOffset);
+            if (!plausiblePointer(animation)) {
+                return;
+            }
+            const float duration = *reinterpret_cast<float*>(animation + kAnimationDurationOffset);
+            if (!std::isfinite(duration) || duration < kMinClipDurationSeconds || duration > kMaxClipDurationSeconds) {
+                return;
+            }
+            const float cropStart = *reinterpret_cast<float*>(clipGenerator + kClipGeneratorCropStartOffset);
+            const float cropEnd = *reinterpret_cast<float*>(clipGenerator + kClipGeneratorCropEndOffset);
+            float effectiveCropStart = 0.0f;
+            float croppedDuration = duration;
+            if (std::isfinite(cropStart) && std::isfinite(cropEnd) && cropStart >= 0.0f && cropEnd >= 0.0f &&
+                cropStart + cropEnd < duration) {
+                effectiveCropStart = cropStart;
+                croppedDuration = duration - cropStart - cropEnd;
+            }
+
+            RichActiveClip* slot = nullptr;
+            for (auto& candidate : s_richActiveClips) {
+                const auto active = candidate.clip.load(std::memory_order_acquire);
+                if (active == clipGenerator) {
+                    slot = &candidate;
+                    break;
+                }
+                if (active == 0 && !slot) {
+                    slot = &candidate;
+                }
+            }
+            if (!slot) {
+                if (s_richActiveClipOverflowLogs.fetch_add(1, std::memory_order_relaxed) < 3) {
+                    RDX_LOG_WARN(Weapon,
+                        "WeaponClipMotionHarvest: active rich clip registry full; clip {:#x} has no learner correlation slot",
+                        clipGenerator);
+                }
+                return;
+            }
+
+            const bool slotWasActive = slot->clip.load(std::memory_order_acquire) != 0;
+            slot->clip.store(0, std::memory_order_release);
+            slot->binding = binding;
+            slot->activityId = activityId;
+            slot->activationOrder = s_nextRichActivationOrder.fetch_add(1, std::memory_order_relaxed);
+            slot->weaponFormId = s_hookWeaponFormId;
+            slot->weaponGenerationKey = s_hookWeaponGenerationKey;
+            slot->name = {};
+            if (clipName) {
+                std::memcpy(slot->name.data(), clipName,
+                    (std::min)(std::strlen(clipName), slot->name.size() - 1));
+            }
+            slot->duration = duration;
+            slot->cropStart.store(effectiveCropStart, std::memory_order_relaxed);
+            slot->croppedDuration.store(croppedDuration, std::memory_order_relaxed);
+            const float localTime = *reinterpret_cast<float*>(clipGenerator + kClipGeneratorLocalTimeOffset);
+            const float validLocalTime = std::isfinite(localTime) ? localTime : effectiveCropStart;
+            float fraction = croppedDuration > kMinClipDurationSeconds
+                ? (validLocalTime - effectiveCropStart) / croppedDuration
+                : 0.0f;
+            fraction = (std::min)(1.0f, (std::max)(0.0f, fraction));
+            slot->localTime.store(validLocalTime, std::memory_order_relaxed);
+            slot->fraction.store(fraction, std::memory_order_relaxed);
+            slot->clip.store(clipGenerator, std::memory_order_release);
+            if (!slotWasActive) {
+                s_richActiveClipCount.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+
+        void publishRichClipActivityTime(std::uintptr_t clipGenerator)
+        {
+            if (s_richActiveClipCount.load(std::memory_order_relaxed) == 0) {
+                return;
+            }
+            for (auto& slot : s_richActiveClips) {
+                if (slot.clip.load(std::memory_order_acquire) != clipGenerator) {
+                    continue;
+                }
+                const float localTime = *reinterpret_cast<float*>(
+                    clipGenerator + kClipGeneratorLocalTimeOffset);
+                if (!std::isfinite(localTime)) {
+                    return;
+                }
+                const float cropStart = slot.cropStart.load(std::memory_order_relaxed);
+                const float croppedDuration = slot.croppedDuration.load(std::memory_order_relaxed);
+                float fraction = croppedDuration > kMinClipDurationSeconds
+                    ? (localTime - cropStart) / croppedDuration
+                    : 0.0f;
+                fraction = (std::min)(1.0f, (std::max)(0.0f, fraction));
+                if (slot.clip.load(std::memory_order_acquire) != clipGenerator) {
+                    return;
+                }
+                slot.localTime.store(localTime, std::memory_order_relaxed);
+                slot.fraction.store(fraction, std::memory_order_relaxed);
+                return;
+            }
         }
 
         /*
@@ -1580,8 +1970,32 @@ namespace redux::weapon_clip_motion_harvest
             }
             maybeBeginScrubSweepLocked(clipGenerator, binding, animationName.data());
             maybeBeginClipScrubSessionLocked(clipGenerator, binding, animationName.data());
-            if (bindingProcessedLocked(binding, /*fromActivation=*/true)) {
+            const bool richCaptureEnabled = s_richCaptureEnabled.load(std::memory_order_relaxed);
+            const bool alreadyProcessed = bindingProcessedLocked(binding, /*fromActivation=*/true);
+            std::uint64_t activityId = alreadyProcessed
+                ? bindingRichActivityIdLocked(binding, /*fromActivation=*/true)
+                : 0;
+            if (alreadyProcessed && activityId != 0) {
+                if (richCaptureEnabled &&
+                    bindingHasWeaponTracksLocked(binding, /*fromActivation=*/true)) {
+                    beginRichClipActivityLocked(
+                        clipGenerator, binding, animationName.data(), activityId);
+                }
                 return;
+            }
+            if (alreadyProcessed &&
+                (!richCaptureEnabled ||
+                    !bindingHasWeaponTracksLocked(binding, /*fromActivation=*/true))) {
+                return;
+            }
+            if (richCaptureEnabled) {
+                activityId = s_nextRichActivityId.fetch_add(1, std::memory_order_relaxed);
+                // Zero is the explicit "no clip activity" sentinel. A wrap
+                // is practically unreachable, but do not publish an
+                // ambiguous id if it ever occurs.
+                if (activityId == 0) {
+                    activityId = s_nextRichActivityId.fetch_add(1, std::memory_order_relaxed);
+                }
             }
             s_bindingsSeen.fetch_add(1, std::memory_order_relaxed);
             /*
@@ -1598,15 +2012,36 @@ namespace redux::weapon_clip_motion_harvest
             }
             // Stage markers dump BEFORE the harvest so the names/times land
             // in the log even when the stroke harvest itself bails.
-            dumpClipStageMarkers(clipGenerator, binding, animationName.data(), behaviorGraph);
-            if (harvestBinding(
+            auto* markerCapture = s_richCaptureEnabled.load(std::memory_order_relaxed)
+                ? &s_markerCaptureScratch
+                : nullptr;
+            dumpClipStageMarkers(clipGenerator, binding, animationName.data(), behaviorGraph, markerCapture);
+            bool hadWeaponTracks = false;
+            bool richPacketQueued = false;
+            const bool terminal = harvestBinding(
                     binding,
                     skeleton,
                     s_hookNodeNamePointers.data(),
                     s_hookNodeNameCount,
                     /*fromActivation=*/true,
-                    animationName.data())) {
-                markBindingProcessedLocked(binding, /*fromActivation=*/true);
+                    animationName.data(),
+                    s_hookWeaponFormId,
+                    s_hookWeaponGenerationKey,
+                    activityId,
+                    &hadWeaponTracks,
+                    &richPacketQueued,
+                    markerCapture);
+            if (activityId != 0 && hadWeaponTracks && richPacketQueued &&
+                s_richCaptureEnabled.load(std::memory_order_relaxed)) {
+                beginRichClipActivityLocked(
+                    clipGenerator, binding, animationName.data(), activityId);
+            }
+            if (terminal) {
+                markBindingProcessedLocked(
+                    binding,
+                    /*fromActivation=*/true,
+                    hadWeaponTracks,
+                    richPacketQueued ? activityId : 0);
             }
         }
 
@@ -1650,6 +2085,7 @@ namespace redux::weapon_clip_motion_harvest
                     if (s_originalClipUpdate) {
                         s_originalClipUpdate(clipGeneratorRaw, context, timestep);
                     }
+                    publishRichClipActivityTime(clipGenerator);
                     return;
                 }
                 float desired = s_scrubDesiredFraction.load(std::memory_order_relaxed);
@@ -1658,6 +2094,7 @@ namespace redux::weapon_clip_motion_harvest
                 if (s_originalClipUpdate) {
                     s_originalClipUpdate(clipGeneratorRaw, context, timestep);
                 }
+                publishRichClipActivityTime(clipGenerator);
                 if (s_scrubCroppedDuration > kMinClipDurationSeconds) {
                     const float localTime =
                         *reinterpret_cast<float*>(clipGenerator + kClipGeneratorLocalTimeOffset);
@@ -1673,6 +2110,7 @@ namespace redux::weapon_clip_motion_harvest
                 if (s_originalClipUpdate) {
                     s_originalClipUpdate(clipGeneratorRaw, context, timestep);
                 }
+                publishRichClipActivityTime(clipGenerator);
                 return;
             }
             if (std::isfinite(timestep) && timestep > 0.0f && timestep < 1.0f) {
@@ -1684,6 +2122,7 @@ namespace redux::weapon_clip_motion_harvest
             if (s_originalClipUpdate) {
                 s_originalClipUpdate(clipGeneratorRaw, context, timestep);
             }
+            publishRichClipActivityTime(clipGenerator);
             const auto decile = static_cast<std::uint32_t>(fraction * 10.0f);
             if (decile >= s_sweepNextLogDecile) {
                 s_sweepNextLogDecile = decile + 1;
@@ -1713,6 +2152,17 @@ namespace redux::weapon_clip_motion_harvest
         void clipGeneratorDeactivateShim(void* clipGeneratorRaw, void* context)
         {
             const auto clipGenerator = reinterpret_cast<std::uintptr_t>(clipGeneratorRaw);
+            {
+                std::scoped_lock lock(s_hookMutex);
+                for (auto& slot : s_richActiveClips) {
+                    if (slot.clip.load(std::memory_order_acquire) == clipGenerator) {
+                        if (slot.clip.exchange(0, std::memory_order_acq_rel) != 0) {
+                            s_richActiveClipCount.fetch_sub(1, std::memory_order_relaxed);
+                        }
+                        break;
+                    }
+                }
+            }
             if (s_scrubClip.load(std::memory_order_acquire) == clipGenerator) {
                 *reinterpret_cast<std::uint8_t*>(clipGenerator + kClipGeneratorModeOffset) = s_scrubSavedMode;
                 s_scrubClip.store(0, std::memory_order_release);
@@ -1827,8 +2277,12 @@ namespace redux::weapon_clip_motion_harvest
         state.sessionId = s_scrubSessionId.load(std::memory_order_relaxed);
         state.fraction = s_scrubObservedFraction.load(std::memory_order_relaxed);
         if (state.active) {
+            state.weaponFormId = s_scrubWeaponFormId;
+            state.weaponGenerationKey = s_scrubWeaponGenerationKey;
             state.durationSeconds = s_scrubClipDuration;
+            state.cropStartSeconds = s_scrubCropStart;
             state.croppedDurationSeconds = s_scrubCroppedDuration;
+            state.clipName = s_scrubClipName;
         }
         return state;
     }
@@ -1855,9 +2309,13 @@ namespace redux::weapon_clip_motion_harvest
         const void* const* graphManagers,
         std::uint32_t managerCount,
         const char* const* allowedNodeNames,
-        std::uint32_t allowedNodeNameCount)
+        std::uint32_t allowedNodeNameCount,
+        std::uint32_t weaponFormId,
+        std::uint64_t weaponGenerationKey)
     {
         std::scoped_lock lock(s_hookMutex);
+        s_hookWeaponFormId = weaponFormId;
+        s_hookWeaponGenerationKey = weaponGenerationKey;
         s_hookCharacterCount = 0;
         for (std::uint32_t m = 0; m < managerCount; ++m) {
             GraphArrayView graphs{};
@@ -1894,6 +2352,9 @@ namespace redux::weapon_clip_motion_harvest
         std::scoped_lock lock(s_hookMutex);
         s_hookCharacterCount = 0;
         s_hookNodeNameCount = 0;
+        s_hookWeaponFormId = 0;
+        s_hookWeaponGenerationKey = 0;
+        clearRichClipActivitiesLocked();
     }
 
     bool probeBindings(const void* graphManager)
@@ -2025,11 +2486,11 @@ namespace redux::weapon_clip_motion_harvest
             s_walkBindingsData = 0;
             s_walkBindingsVisited = 0;
             s_walkDone = false;
-            s_bindingDetailLogs = 0;
+            s_bindingDetailLogs.store(0, std::memory_order_relaxed);
             s_walkPassIndex = 0;
             s_walkPassStartHarvested = s_bindingsHarvested.load(std::memory_order_relaxed);
             std::scoped_lock lock(s_hookMutex);
-            s_processedBindingCount = 0;
+            advanceProcessedBindingEpochLocked();
             s_stageMarkerLogBudget = kStageMarkerLogBudgetPerGeneration;
         }
         if (s_walkDone) {
@@ -2116,15 +2577,22 @@ namespace redux::weapon_clip_motion_harvest
             // Walk strokes come from the merely-LOADED binding set — fallback
             // provenance; the clip name lives on the hkbClipGenerator, which
             // only the activation hook sees.
+            bool hadWeaponTracks = false;
             if (harvestBinding(
                     binding,
                     resolved.skeleton,
                     allowedNodeNames,
                     allowedNodeNameCount,
                     /*fromActivation=*/false,
+                    nullptr,
+                    weaponFormId,
+                    weaponGenerationKey,
+                    0,
+                    &hadWeaponTracks,
                     nullptr)) {
                 std::scoped_lock lock(s_hookMutex);
-                markBindingProcessedLocked(binding, /*fromActivation=*/false);
+                markBindingProcessedLocked(
+                    binding, /*fromActivation=*/false, hadWeaponTracks, 0);
             }
         }
         return StepResult::Pending;
@@ -2139,12 +2607,17 @@ namespace redux::weapon_clip_motion_harvest
         s_walkBindingsData = 0;
         s_walkBindingsVisited = 0;
         s_walkDone = false;
-        s_bindingDetailLogs = 0;
+        s_bindingDetailLogs.store(0, std::memory_order_relaxed);
         s_walkPassIndex = 0;
         s_walkPassStartHarvested = s_bindingsHarvested.load(std::memory_order_relaxed);
         std::scoped_lock lock(s_hookMutex);
-        s_processedBindingCount = 0;
+        advanceProcessedBindingEpochLocked();
         s_stageMarkerLogBudget = kStageMarkerLogBudgetPerGeneration;
+        s_hookCharacterCount = 0;
+        s_hookNodeNameCount = 0;
+        s_hookWeaponFormId = 0;
+        s_hookWeaponGenerationKey = 0;
+        clearRichClipActivitiesLocked();
     }
 
     void restartWalkPass()
@@ -2157,6 +2630,94 @@ namespace redux::weapon_clip_motion_harvest
         s_walkPassStartHarvested = s_bindingsHarvested.load(std::memory_order_relaxed);
         // The detail-log budget is intentionally NOT reset: bail dumps stay
         // capped per weapon generation so periodic re-walks cannot spam.
+    }
+
+    void setRichCaptureEnabled(bool enabled)
+    {
+        // The queue lock is the producer barrier: after disabling returns,
+        // every producer that passed the fast pre-check has either committed
+        // its packet or observed disabled under this same lock.
+        {
+            std::scoped_lock lock(s_richClipQueueMutex);
+            s_richCaptureEnabled.store(enabled, std::memory_order_relaxed);
+        }
+        if (!enabled) {
+            // Activation owns the hook lock while publishing an activity.
+            // Taking it after the queue barrier guarantees no late activity
+            // can reappear after this function returns.
+            std::scoped_lock lock(s_hookMutex);
+            clearRichClipActivitiesLocked();
+        }
+    }
+
+    void clearRichClipActivities()
+    {
+        std::scoped_lock lock(s_hookMutex);
+        clearRichClipActivitiesLocked();
+    }
+
+    RichClipActivityState richClipActivityState()
+    {
+        RichClipActivityState state{};
+        std::scoped_lock lock(s_hookMutex);
+        RichActiveClip* selected = nullptr;
+        for (auto& slot : s_richActiveClips) {
+            if (slot.clip.load(std::memory_order_acquire) == 0) {
+                continue;
+            }
+            ++state.concurrentActivityCount;
+            if (!selected || slot.activationOrder > selected->activationOrder) {
+                selected = &slot;
+            }
+        }
+        if (!selected) {
+            return state;
+        }
+        state.active = true;
+        state.activityId = selected->activityId;
+        state.weaponFormId = selected->weaponFormId;
+        state.weaponGenerationKey = selected->weaponGenerationKey;
+        state.animationName = selected->name;
+        state.durationSeconds = selected->duration;
+        state.cropStartSeconds = selected->cropStart.load(std::memory_order_relaxed);
+        state.croppedDurationSeconds = selected->croppedDuration.load(std::memory_order_relaxed);
+        state.localTimeSeconds = selected->localTime.load(std::memory_order_relaxed);
+        state.fraction = selected->fraction.load(std::memory_order_relaxed);
+        return state;
+    }
+
+    std::uint32_t drainRichClipCaptures(RichClipCapturePacket* outPackets, std::uint32_t maxPackets)
+    {
+        if (!outPackets || maxPackets == 0) {
+            return 0;
+        }
+        std::scoped_lock lock(s_richClipQueueMutex);
+        const auto count = (std::min)(maxPackets, s_richClipQueueCount);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            outPackets[i] = s_richClipQueue[i];
+        }
+        if (count < s_richClipQueueCount) {
+            static_assert(std::is_trivially_copyable_v<RichClipCapturePacket>);
+            std::memmove(
+                s_richClipQueue.data(),
+                s_richClipQueue.data() + count,
+                sizeof(RichClipCapturePacket) * (s_richClipQueueCount - count));
+        }
+        s_richClipQueueCount -= count;
+        return count;
+    }
+
+    RichClipDropInfo drainRichClipDropInfo()
+    {
+        std::scoped_lock lock(s_richClipQueueMutex);
+        RichClipDropInfo info{
+            .count = s_richClipCapturesDropped.exchange(0, std::memory_order_relaxed),
+            .weaponFormId = s_richClipDropWeaponFormId,
+            .weaponGenerationKey = s_richClipDropWeaponGenerationKey,
+        };
+        s_richClipDropWeaponFormId = 0;
+        s_richClipDropWeaponGenerationKey = 0;
+        return info;
     }
 
     std::uint32_t drainGroups(weapon_clip_stroke::AuthoredStrokeGroup* outGroups, std::uint32_t maxGroups)

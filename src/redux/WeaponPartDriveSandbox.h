@@ -135,7 +135,10 @@ namespace redux
             std::array<char, kMaxSourceName> name{};
             std::array<char, kMaxSourceName> parentName{};
         };
-        static constexpr std::size_t kMaxChainLinks = 48;
+        // Must cover the complete observation cache: a follower beyond the
+        // grip-eligible prefix can still share an ancestor with a driven
+        // leader and needs the same double-transform protection.
+        static constexpr std::size_t kMaxChainLinks = 128;
 
         struct FrameInput
         {

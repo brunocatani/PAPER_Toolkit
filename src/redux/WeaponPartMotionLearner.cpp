@@ -9,7 +9,8 @@ namespace redux
 {
     namespace
     {
-        std::string_view slotName(const std::array<char, WeaponPartMotionLearner::kMaxSourceName>& name)
+        template <std::size_t N>
+        std::string_view fixedStringView(const std::array<char, N>& name)
         {
             std::size_t length = 0;
             while (length < name.size() && name[length] != '\0') {
@@ -18,11 +19,22 @@ namespace redux
             return std::string_view(name.data(), length);
         }
 
-        void copySlotName(std::array<char, WeaponPartMotionLearner::kMaxSourceName>& target, std::string_view source)
+        std::string_view slotName(const std::array<char, WeaponPartMotionLearner::kMaxSourceName>& name)
+        {
+            return fixedStringView(name);
+        }
+
+        template <std::size_t N>
+        void copyFixedString(std::array<char, N>& target, std::string_view source)
         {
             target = {};
             const auto count = (std::min)(source.size(), target.size() - 1);
             std::memcpy(target.data(), source.data(), count);
+        }
+
+        void copySlotName(std::array<char, WeaponPartMotionLearner::kMaxSourceName>& target, std::string_view source)
+        {
+            copyFixedString(target, source);
         }
 
         bool slotMatches(
@@ -53,14 +65,29 @@ namespace redux
         ++_observationCounter;
 
         auto* recorder = acquireRecorderSlot(
-            PartKey{ observation.weaponFormId, observation.omodFormId, observation.sourceName });
+            PartKey{ observation.weaponFormId, observation.omodFormId, observation.sourceName },
+            observation.weaponGenerationKey,
+            observation.catalogPartId);
         if (!recorder) {
             return;
         }
         recorder->lastSeenCounter = _observationCounter;
-        recorder->lastScale = observation.scale;
+        recorder->weaponGenerationKey = observation.weaponGenerationKey;
+        recorder->catalogPartId = observation.catalogPartId;
+        recorder->bodyId = observation.bodyId;
+        copyFixedString(recorder->nodePath, observation.nodePath);
+        recorder->nodePathTruncated = observation.nodePathTruncated;
 
-        const bool wasRecording = recorder->state.phase == weapon_part_motion_path::RecorderPhase::Recording;
+        const auto previousPhase = recorder->state.phase;
+        const auto previousSampleCount = recorder->state.sampleCount;
+        const auto previousScale = recorder->lastScale;
+        const auto previousRockFrame = recorder->lastRockFrameIndex;
+        const auto previousClipActivity = recorder->lastClipActivityId;
+        const auto previousClipScrubSession = recorder->lastClipScrubSessionId;
+        const auto previousConcurrentClipCount = recorder->lastClipConcurrentActivityCount;
+        const auto previousClipFraction = recorder->lastClipFraction;
+        const auto previousClipTime = recorder->lastClipLocalTimeSeconds;
+        const bool wasRecording = previousPhase == weapon_part_motion_path::RecorderPhase::Recording;
         const auto result = weapon_part_motion_path::step(
             recorder->state,
             recorder->buffer.data(),
@@ -70,10 +97,62 @@ namespace redux
             // buffer[1] was written this frame; buffer[0] is the pre-motion
             // rest pose.
             recorder->startFrame = _frameCounter;
+            recorder->rockFrameIndices[0] = previousRockFrame;
+            recorder->rockFrameIndices[1] = observation.rockFrameIndex;
+            recorder->scales[0] = previousScale;
+            recorder->scales[1] = observation.scale;
+            recorder->clipActivityIds[0] = previousClipActivity;
+            recorder->clipActivityIds[1] = observation.clipActivityId;
+            recorder->clipScrubSessionIds[0] = previousClipScrubSession;
+            recorder->clipScrubSessionIds[1] = observation.clipScrubSessionId;
+            recorder->clipConcurrentActivityCounts[0] = previousConcurrentClipCount;
+            recorder->clipConcurrentActivityCounts[1] = observation.clipConcurrentActivityCount;
+            recorder->clipFractions[0] = previousClipFraction;
+            recorder->clipFractions[1] = observation.clipFraction;
+            recorder->clipLocalTimesSeconds[0] = previousClipTime;
+            recorder->clipLocalTimesSeconds[1] = observation.clipLocalTimeSeconds;
+            copyFixedString(recorder->clipName, observation.clipName);
+            recorder->clipDurationSeconds = observation.clipDurationSeconds;
+            recorder->clipCroppedDurationSeconds = observation.clipCroppedDurationSeconds;
+        } else if (wasRecording &&
+                   (result == weapon_part_motion_path::StepResult::RecordingActive ||
+                       result == weapon_part_motion_path::StepResult::RecordingComplete) &&
+                   previousSampleCount < weapon_part_motion_path::kMaxRecordingSamples) {
+            // step() appended the current observation at the old count.
+            recorder->rockFrameIndices[previousSampleCount] = observation.rockFrameIndex;
+            recorder->scales[previousSampleCount] = observation.scale;
+            recorder->clipActivityIds[previousSampleCount] = observation.clipActivityId;
+            recorder->clipScrubSessionIds[previousSampleCount] = observation.clipScrubSessionId;
+            recorder->clipConcurrentActivityCounts[previousSampleCount] =
+                observation.clipConcurrentActivityCount;
+            recorder->clipFractions[previousSampleCount] = observation.clipFraction;
+            recorder->clipLocalTimesSeconds[previousSampleCount] = observation.clipLocalTimeSeconds;
         }
         if (result == weapon_part_motion_path::StepResult::RecordingComplete) {
-            storeCompletedPath(*recorder);
+            const auto storeResult = storeCompletedPath(*recorder);
+            emitRawCapture(
+                *recorder,
+                recorder->state.sampleCount,
+                rich_capture::StrokeTermination::Settled,
+                &storeResult,
+                nullptr);
+        } else if (result == weapon_part_motion_path::StepResult::RecordingDiscarded && wasRecording) {
+            emitRawCapture(
+                *recorder,
+                previousSampleCount,
+                observation.trusted ? rich_capture::StrokeTermination::SampleCapacity :
+                                      rich_capture::StrokeTermination::UntrustedDrive,
+                nullptr,
+                &observation);
         }
+
+        recorder->lastScale = observation.scale;
+        recorder->lastRockFrameIndex = observation.rockFrameIndex;
+        recorder->lastClipActivityId = observation.clipActivityId;
+        recorder->lastClipScrubSessionId = observation.clipScrubSessionId;
+        recorder->lastClipConcurrentActivityCount = observation.clipConcurrentActivityCount;
+        recorder->lastClipFraction = observation.clipFraction;
+        recorder->lastClipLocalTimeSeconds = observation.clipLocalTimeSeconds;
     }
 
     const WeaponPartMotionLearner::StrokeGroup* WeaponPartMotionLearner::selectPrimary(
@@ -351,22 +430,37 @@ namespace redux
          * EXCEPTION_STACK_OVERFLOW in __chkstk). Per-slot temporaries keep
          * the frame at one slot.
          */
+        resetRecorders(rich_capture::StrokeTermination::RuntimeReset);
         for (auto& slot : _paths) {
-            slot = {};
-        }
-        for (auto& slot : _recorders) {
             slot = {};
         }
         _observationCounter = 0;
         ++_revision;
     }
 
-    WeaponPartMotionLearner::RecorderSlot* WeaponPartMotionLearner::acquireRecorderSlot(const PartKey& key)
+    void WeaponPartMotionLearner::resetRecorders(rich_capture::StrokeTermination termination)
+    {
+        for (auto& slot : _recorders) {
+            if (slot.used && slot.state.phase == weapon_part_motion_path::RecorderPhase::Recording &&
+                slot.state.sampleCount >= 2) {
+                emitRawCapture(slot, slot.state.sampleCount, termination, nullptr, nullptr);
+            }
+            // Slot-by-slot: RecorderSlot is several dozen KiB and an array
+            // temporary would overflow the game thread's stack.
+            slot = {};
+        }
+    }
+
+    WeaponPartMotionLearner::RecorderSlot* WeaponPartMotionLearner::acquireRecorderSlot(
+        const PartKey& key,
+        std::uint64_t weaponGenerationKey,
+        std::uint32_t catalogPartId)
     {
         RecorderSlot* freeSlot = nullptr;
         RecorderSlot* staleSlot = nullptr;
         for (auto& slot : _recorders) {
-            if (slot.used && slotMatches(slot.weaponFormId, slot.omodFormId, slot.sourceName, key)) {
+            if (slot.used && slotMatches(slot.weaponFormId, slot.omodFormId, slot.sourceName, key) &&
+                slot.weaponGenerationKey == weaponGenerationKey && slot.catalogPartId == catalogPartId) {
                 return &slot;
             }
             if (!slot.used) {
@@ -381,23 +475,45 @@ namespace redux
         if (!claimed) {
             return nullptr;
         }
+        if (claimed->used && claimed->state.phase == weapon_part_motion_path::RecorderPhase::Recording &&
+            claimed->state.sampleCount >= 2) {
+            emitRawCapture(
+                *claimed,
+                claimed->state.sampleCount,
+                rich_capture::StrokeTermination::RecorderReclaimed,
+                nullptr,
+                nullptr);
+        }
+        *claimed = {};
         claimed->used = true;
         claimed->weaponFormId = key.weaponFormId;
         claimed->omodFormId = key.omodFormId;
+        claimed->weaponGenerationKey = weaponGenerationKey;
+        claimed->catalogPartId = catalogPartId;
         copySlotName(claimed->sourceName, key.sourceName);
         claimed->lastSeenCounter = _observationCounter;
-        claimed->state = {};
         return claimed;
     }
 
-    void WeaponPartMotionLearner::storeCompletedPath(const RecorderSlot& recorder)
+    WeaponPartMotionLearner::StoreCompletedResult WeaponPartMotionLearner::storeCompletedPath(
+        const RecorderSlot& recorder)
     {
+        StoreCompletedResult result{};
         weapon_part_motion_path::MotionPath candidate{};
         std::array<float, weapon_part_motion_path::kResampledKeyCount> keyPositions{};
         if (!weapon_part_motion_path::buildPathFromRecording(
-                recorder.buffer.data(), recorder.state.sampleCount, candidate, keyPositions.data())) {
-            return;
+                recorder.buffer.data(),
+                recorder.state.sampleCount,
+                candidate,
+                keyPositions.data(),
+                &result.peakSampleIndex,
+                &result.peakExcursion)) {
+            result.decision = result.peakExcursion < weapon_part_motion_path::kMinPathExcursionGameUnits
+                ? rich_capture::ServingDecision::RejectedBelowNoise
+                : rich_capture::ServingDecision::RejectedInvalidPath;
+            return result;
         }
+        result.candidate = candidate;
 
         /*
          * Stage assignment (Bruno, 2026-07-05): a stroke whose START pose
@@ -410,7 +526,8 @@ namespace redux
         auto* target = findOrClaimSlot(
             PartKey{ recorder.weaponFormId, recorder.omodFormId, slotName(recorder.sourceName) }, false);
         if (!target) {
-            return;
+            result.decision = rich_capture::ServingDecision::NoServingSlot;
+            return result;
         }
         bool isReturnStage = false;
         if (_tuning.stageCapture && target->learnedPrimary.used) {
@@ -424,11 +541,14 @@ namespace redux
             isReturnStage = startToPrimaryEnd <= _tuning.stageChainToleranceGameUnits &&
                 startToPrimaryEnd < startToPrimaryStart;
         }
+        result.isReturnStage = isReturnStage;
         auto& record = isReturnStage ? target->learnedReturn : target->learnedPrimary;
         // Within a stage the larger stroke wins; the other stage and the
         // authored record are untouched either way (dual storage).
         if (record.used && !weapon_part_motion_path::shouldReplacePath(record.path, candidate)) {
-            return;
+            result.decision = isReturnStage ? rich_capture::ServingDecision::RejectedSmallerReturn :
+                                              rich_capture::ServingDecision::RejectedSmallerPrimary;
+            return result;
         }
 
         /*
@@ -453,9 +573,10 @@ namespace redux
         std::uint32_t coTimedCount = 0;
         constexpr float kRigidDistanceToleranceGameUnits =
             weapon_clip_stroke::kRigidFollowerDistanceToleranceGameUnits;
-        constexpr std::int64_t kMinOverlapSamples = 8;
+        constexpr std::int64_t kMinOverlapSamples = kMinimumFollowerOverlapSamples;
         for (const auto& other : _recorders) {
             if (&other == &recorder || !other.used || other.weaponFormId != recorder.weaponFormId ||
+                other.weaponGenerationKey != recorder.weaponGenerationKey ||
                 other.state.sampleCount < 2 ||
                 followerCandidateCount >= followerCandidates.size()) {
                 continue;
@@ -524,6 +645,7 @@ namespace redux
         }
 
         const bool replaced = record.used;
+        result.replaced = replaced;
         record.used = true;
         record.path = candidate;
         target->lastUseCounter = _observationCounter;
@@ -560,6 +682,15 @@ namespace redux
                         followerRecorder.buffer[next],
                         t);
                 }
+                if (result.selectedFollowerCount < result.selectedFollowers.size()) {
+                    result.selectedFollowers[result.selectedFollowerCount++] = RawCaptureView::SelectedFollowerView{
+                        .omodFormId = followerRecorder.omodFormId,
+                        .catalogPartId = followerRecorder.catalogPartId,
+                        .bodyId = followerRecorder.bodyId,
+                        .sourceName = slotName(followerRecorder.sourceName),
+                        .rigid = followerCandidates[c].rigid,
+                    };
+                }
                 ++record.followerCount;
                 if (followerCandidates[c].rigid) {
                     ++rigidCount;
@@ -568,6 +699,8 @@ namespace redux
                 }
             }
         }
+        result.rigidFollowerCount = rigidCount;
+        result.coTimedFollowerCount = coTimedCount;
 
         /*
          * A replaced PRIMARY may break the chain to the stored return stage
@@ -588,6 +721,9 @@ namespace redux
             }
         }
         ++_revision;
+        result.decision = isReturnStage
+            ? (replaced ? rich_capture::ServingDecision::ReplacedReturn : rich_capture::ServingDecision::StoredReturn)
+            : (replaced ? rich_capture::ServingDecision::ReplacedPrimary : rich_capture::ServingDecision::StoredPrimary);
 
         // Once per completed stroke, never per frame. Path endpoints in the
         // stored frame — the learned counterpart of the AUTHORED endpoint
@@ -612,5 +748,80 @@ namespace redux
             lastKey.translate.x,
             lastKey.translate.y,
             lastKey.translate.z);
+        return result;
+    }
+
+    void WeaponPartMotionLearner::emitRawCapture(
+        const RecorderSlot& recorder,
+        std::uint32_t sampleCount,
+        rich_capture::StrokeTermination termination,
+        const StoreCompletedResult* storeResult,
+        const Observation* terminalSample)
+    {
+        if (!_rawCaptureSink || sampleCount < 2) {
+            return;
+        }
+        sampleCount = (std::min)(
+            sampleCount, static_cast<std::uint32_t>(weapon_part_motion_path::kMaxRecordingSamples));
+
+        StoreCompletedResult analysis{};
+        if (storeResult) {
+            analysis = *storeResult;
+        } else {
+            std::array<float, weapon_part_motion_path::kResampledKeyCount> unusedPositions{};
+            (void)weapon_part_motion_path::buildPathFromRecording(
+                recorder.buffer.data(),
+                sampleCount,
+                analysis.candidate,
+                unusedPositions.data(),
+                &analysis.peakSampleIndex,
+                &analysis.peakExcursion);
+            analysis.decision = rich_capture::ServingDecision::NotEvaluated;
+        }
+
+        float fullArc = 0.0f;
+        for (std::uint32_t i = 1; i < sampleCount; ++i) {
+            fullArc += weapon_part_motion_path::poseDistance(recorder.buffer[i], recorder.buffer[i - 1]);
+        }
+
+        RawCaptureView view{
+            .weaponFormId = recorder.weaponFormId,
+            .omodFormId = recorder.omodFormId,
+            .sourceName = slotName(recorder.sourceName),
+            .weaponGenerationKey = recorder.weaponGenerationKey,
+            .catalogPartId = recorder.catalogPartId,
+            .bodyId = recorder.bodyId,
+            .nodePath = fixedStringView(recorder.nodePath),
+            .nodePathTruncated = recorder.nodePathTruncated,
+            .termination = termination,
+            .servingDecision = analysis.decision,
+            .learnerStartFrame = recorder.startFrame,
+            .samples = recorder.buffer.data(),
+            .rockFrameIndices = recorder.rockFrameIndices.data(),
+            .scales = recorder.scales.data(),
+            .clipActivityIds = recorder.clipActivityIds.data(),
+            .clipScrubSessionIds = recorder.clipScrubSessionIds.data(),
+            .clipConcurrentActivityCounts = recorder.clipConcurrentActivityCounts.data(),
+            .clipFractions = recorder.clipFractions.data(),
+            .clipLocalTimesSeconds = recorder.clipLocalTimesSeconds.data(),
+            .sampleCount = sampleCount,
+            .terminalSamplePresent = terminalSample != nullptr,
+            .terminalSample = terminalSample ? *terminalSample : Observation{},
+            .peakSampleIndex = analysis.peakSampleIndex,
+            .peakExcursion = analysis.peakExcursion,
+            .fullRecordingArcLength = fullArc,
+            .candidatePath = analysis.candidate,
+            .classifiedAsReturnStage = analysis.isReturnStage,
+            .replacedServingPath = analysis.replaced,
+            .selectedRigidFollowerCount = analysis.rigidFollowerCount,
+            .selectedCoTimedFollowerCount = analysis.coTimedFollowerCount,
+            .selectedFollowers = analysis.selectedFollowers.data(),
+            .selectedFollowerCount = analysis.selectedFollowerCount,
+            .tuning = _tuning,
+            .clipName = fixedStringView(recorder.clipName),
+            .clipDurationSeconds = recorder.clipDurationSeconds,
+            .clipCroppedDurationSeconds = recorder.clipCroppedDurationSeconds,
+        };
+        _rawCaptureSink(view, _rawCaptureContext);
     }
 }

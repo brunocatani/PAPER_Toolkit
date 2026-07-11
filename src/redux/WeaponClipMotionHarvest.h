@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 
 #include "redux/WeaponClipStrokePolicy.h"
@@ -75,7 +76,8 @@ namespace redux::weapon_clip_motion_harvest
         const char* const* allowedNodeNames,
         std::uint32_t allowedNodeNameCount);
 
-    // Forget the walk cursor (weapon changed / sandbox disabled).
+    // Full weapon-generation boundary: forget the walk cursor, processed
+    // bindings, hook targets/identity, and live rich clip activities.
     void resetWalk();
 
     /*
@@ -125,7 +127,9 @@ namespace redux::weapon_clip_motion_harvest
         const void* const* graphManagers,
         std::uint32_t managerCount,
         const char* const* allowedNodeNames,
-        std::uint32_t allowedNodeNameCount);
+        std::uint32_t allowedNodeNameCount,
+        std::uint32_t weaponFormId,
+        std::uint64_t weaponGenerationKey);
     void clearClipActivationTargets();
 
     /*
@@ -165,16 +169,101 @@ namespace redux::weapon_clip_motion_harvest
         bool active{ false };
         // Increments per capture; detects session turnover across frames.
         std::uint64_t sessionId{ 0 };
+        std::uint32_t weaponFormId{ 0 };
+        std::uint64_t weaponGenerationKey{ 0 };
         float durationSeconds{ 0.0f };
+        float cropStartSeconds{ 0.0f };
         float croppedDurationSeconds{ 0.0f };
         // Engine-observed fraction (feedback for the pursuit controller).
         float fraction{ 0.0f };
+        std::array<char, weapon_clip_stroke::kMaxBoneName> clipName{};
     };
     void setClipScrubCaptureConfig(bool armed, const char* clipNameFilter);
     [[nodiscard]] ClipScrubSessionState clipScrubSessionState();
     void setClipScrubDesiredFraction(float fraction);
     // Request release-to-native; applied by the graph thread next update.
     void endClipScrubSession();
+
+    /*
+     * Raw authored-clip evidence for the append-only mapper archive. The
+     * activation/walk code already owns the exact 64-sample weapon tracks;
+     * this queue preserves them before buildAuthoredGroups reduces them to
+     * selected 24-key serving paths. Annotation/trigger arrays are bounded
+     * and carry explicit truncation flags. Graph thread produces, main
+     * thread drains; all storage is fixed-capacity.
+     */
+    inline constexpr std::size_t kMaxCapturedClipAnnotations = 128;
+    inline constexpr std::size_t kMaxCapturedClipTriggers = 128;
+    inline constexpr std::size_t kMaxCapturedMarkerText = 96;
+
+    struct CapturedClipAnnotation
+    {
+        float timeSeconds{ 0.0f };
+        std::array<char, weapon_clip_stroke::kMaxBoneName> trackName{};
+        std::array<char, kMaxCapturedMarkerText> text{};
+    };
+
+    struct CapturedClipTrigger
+    {
+        float localTimeSeconds{ 0.0f };
+        std::int32_t eventId{ -1 };
+        std::array<char, kMaxCapturedMarkerText> eventName{};
+    };
+
+    struct RichClipCapturePacket
+    {
+        std::uint32_t weaponFormId{ 0 };
+        std::uint64_t weaponGenerationKey{ 0 };
+        std::uint64_t activityId{ 0 };
+        bool activatedClip{ false };
+        std::array<char, weapon_clip_stroke::kMaxBoneName> animationName{};
+        float durationSeconds{ 0.0f };
+        std::uint32_t rawTransformTrackCount{ 0 };
+        std::uint32_t capturedWeaponTrackCount{ 0 };
+        bool weaponTracksTruncated{ false };
+        std::array<weapon_clip_stroke::TrackSamples, weapon_clip_stroke::kMaxTracksPerClip> weaponTracks{};
+        std::int32_t rawAnnotationTrackCount{ 0 };
+        std::int32_t rawTriggerCount{ 0 };
+        std::int32_t graphEventNameCount{ 0 };
+        std::uint32_t annotationCount{ 0 };
+        std::uint32_t triggerCount{ 0 };
+        bool annotationsTruncated{ false };
+        bool triggersTruncated{ false };
+        std::array<CapturedClipAnnotation, kMaxCapturedClipAnnotations> annotations{};
+        std::array<CapturedClipTrigger, kMaxCapturedClipTriggers> triggers{};
+    };
+
+    void setRichCaptureEnabled(bool enabled);
+    // Generation transition barrier: discard only live clip-activity
+    // telemetry. Authored capture packets remain queued with their own
+    // stamped weapon provenance.
+    void clearRichClipActivities();
+    std::uint32_t drainRichClipCaptures(RichClipCapturePacket* outPackets, std::uint32_t maxPackets);
+    struct RichClipDropInfo
+    {
+        std::uint64_t count{ 0 };
+        std::uint32_t weaponFormId{ 0 };
+        std::uint64_t weaponGenerationKey{ 0 };
+    };
+    [[nodiscard]] RichClipDropInfo drainRichClipDropInfo();
+
+    struct RichClipActivityState
+    {
+        bool active{ false };
+        // Multiple behavior-graph layers can drive weapon tracks at once;
+        // the remaining fields describe the newest active layer.
+        std::uint32_t concurrentActivityCount{ 0 };
+        std::uint64_t activityId{ 0 };
+        std::uint32_t weaponFormId{ 0 };
+        std::uint64_t weaponGenerationKey{ 0 };
+        std::array<char, weapon_clip_stroke::kMaxBoneName> animationName{};
+        float durationSeconds{ 0.0f };
+        float cropStartSeconds{ 0.0f };
+        float croppedDurationSeconds{ 0.0f };
+        float localTimeSeconds{ 0.0f };
+        float fraction{ 0.0f };
+    };
+    [[nodiscard]] RichClipActivityState richClipActivityState();
 
     /*
      * One-shot dump of the manager→bindings chain: raw pointer of every hop,

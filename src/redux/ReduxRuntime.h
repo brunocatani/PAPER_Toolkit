@@ -3,9 +3,12 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "api/ROCKProviderApi.h"
 #include "redux/MotionLibraryStore.h"
+#include "redux/WeaponClipMotionHarvest.h"
 #include "redux/WeaponClipStrokePolicy.h"
 #include "redux/WeaponPartDriveSandbox.h"
 #include "redux/WeaponPartMotionLearner.h"
@@ -75,6 +78,12 @@ namespace redux
             // identity ROCK). Part of the learner key, so a workbench part
             // swap can never serve a lookalike's motion data.
             std::uint32_t omodFormId{ 0 };
+            // Rich-capture snapshot-local identities. They never participate
+            // in serving lookup; node path distinguishes duplicate names.
+            std::uint32_t catalogPartId{ 0 };
+            std::int32_t catalogNodeId{ -1 };
+            std::array<char, WeaponPartMotionLearner::kMaxCaptureNodePath> nodePath{};
+            bool nodePathTruncated{ false };
             /*
              * Full-subtree observation (phase 3): named weapon nodes with no
              * collider evidence — bullets riding a mag, small linkages. They
@@ -155,6 +164,32 @@ namespace redux
         void loadMotionLibraryForWeapon(std::uint32_t weaponFormId);
         void flushMotionLibrarySave();
 
+        // Append-only rich evidence plane (one .capture.jsonl per weapon).
+        void updateRichCaptureState(const rock::provider::RockProviderFrameSnapshot& snapshot);
+        void captureRichWeaponSnapshot(
+            RE::NiNode* weaponNode,
+            std::uint64_t generationKey,
+            std::uint32_t weaponFormId,
+            std::uint64_t rockFrameIndex);
+        void advanceRichWeaponGeometry(
+            std::uint64_t generationKey,
+            std::uint32_t weaponFormId,
+            std::uint64_t rockFrameIndex);
+        void cancelPendingRichGeometryCapture(const char* reason, std::uint64_t rockFrameIndex);
+        void drainRichClipCaptures(
+            std::uint64_t generationKey,
+            std::uint32_t weaponFormId,
+            std::uint64_t rockFrameIndex);
+        static void rawCaptureSink(const WeaponPartMotionLearner::RawCaptureView& capture, void* context);
+        void captureRawStroke(const WeaponPartMotionLearner::RawCaptureView& capture);
+        [[nodiscard]] rich_capture::EventContext makeCaptureContext(
+            std::uint32_t weaponFormId,
+            std::uint64_t generationKey,
+            std::uint64_t rockFrameIndex);
+        [[nodiscard]] rich_capture::CaptureSettings captureSettings() const;
+        [[nodiscard]] static rich_capture::FormInfo describeForm(std::uint32_t runtimeFormId);
+        bool enqueueRichCapture(rich_capture::Event event);
+
         WeaponPartMotionLearner _learner{};
         WeaponPartDriveSandbox _sandbox{};
         DrivePartCache _drivePartCache{};
@@ -200,6 +235,57 @@ namespace redux
         // Scratch for the per-frame harvest drain; member storage because one
         // full batch of stroke groups is far too large for the stack.
         std::array<weapon_clip_stroke::AuthoredStrokeGroup, weapon_clip_stroke::kMaxGroupsPerClip> _clipHarvestDrainGroups{};
+        // One packet is ~100 KiB; member storage avoids the main-thread stack.
+        std::array<weapon_clip_motion_harvest::RichClipCapturePacket, 8> _richClipDrainPackets{};
+
+        bool _richCaptureActive{ false };
+        std::uint32_t _recorderWeaponFormId{ 0 };
+        std::uint64_t _recorderGenerationKey{ 0 };
+        std::uint32_t _richCaptureWeaponFormId{ 0 };
+        std::uint64_t _richCaptureGenerationKey{ 0 };
+        std::uint64_t _richSnapshotGenerationKey{ 0 };
+        static constexpr std::uint32_t kMaxRichGeometryTargets =
+            ::rock::provider::ROCK_PROVIDER_MAX_WEAPON_BODIES;
+        static constexpr std::uint32_t kRichGeometryChunkPointCount = 4096;
+        struct RichGeometryTarget
+        {
+            std::uint32_t evidenceId{ 0 };
+            std::uint32_t bodyId{ 0x7FFF'FFFFu };
+            std::uint32_t providerPointCount{ 0 };
+            std::uint32_t scheduledPointCount{ 0 };
+        };
+        struct PendingRichGeometryCapture
+        {
+            bool active{ false };
+            std::uint32_t weaponFormId{ 0 };
+            std::uint64_t generationKey{ 0 };
+            std::uint64_t snapshotSequence{ 0 };
+            std::array<RichGeometryTarget, kMaxRichGeometryTargets> targets{};
+            std::uint32_t targetCount{ 0 };
+            std::uint32_t targetIndex{ 0 };
+            std::uint32_t pointOffset{ 0 };
+            std::uint32_t chunkIndex{ 0 };
+            std::uint32_t shortCopyAttempts{ 0 };
+            bool currentPointsLoaded{ false };
+            bool currentSourceComplete{ false };
+            // Legacy ROCK V1 can only copy a cloud prefix in one call. Keep
+            // that bounded provider buffer and convert only one JSON chunk
+            // per later frame, avoiding a second full-cloud copy in PAPER.
+            std::vector<::rock::provider::RockProviderPoint3> currentProviderPoints;
+        };
+        PendingRichGeometryCapture _pendingRichGeometry{};
+        std::uint64_t _lastRockFrameIndex{ 0 };
+        std::string _richCaptureSessionId;
+        std::uint64_t _richCaptureSequence{ 0 };
+        struct PendingCaptureGap
+        {
+            bool used{ false };
+            rich_capture::EventContext context{};
+            std::uint64_t firstSequence{ 0 };
+            std::uint64_t lastSequence{ 0 };
+            std::uint32_t count{ 0 };
+        };
+        std::array<PendingCaptureGap, 16> _pendingCaptureGaps{};
 
         bool _active{ false };
         std::uint32_t _lastClipHarvestWeaponFormId{ 0 };
