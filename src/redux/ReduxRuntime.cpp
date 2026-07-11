@@ -105,6 +105,27 @@ namespace redux
             return std::string_view(value, capacity);
         }
 
+        [[nodiscard]] bool stripPrefixIgnoreCase(
+            std::string_view value,
+            std::string_view prefix,
+            std::string_view& outSuffix)
+        {
+            if (value.size() <= prefix.size() ||
+                !std::equal(
+                    prefix.begin(),
+                    prefix.end(),
+                    value.begin(),
+                    [](char left, char right) {
+                        return std::tolower(static_cast<unsigned char>(left)) ==
+                            std::tolower(static_cast<unsigned char>(right));
+                    })) {
+                outSuffix = {};
+                return false;
+            }
+            outSuffix = value.substr(prefix.size());
+            return !outSuffix.empty();
+        }
+
         [[nodiscard]] bool finiteNiTransform(const RE::NiTransform& transform)
         {
             for (int row = 0; row < 3; ++row) {
@@ -1364,6 +1385,7 @@ namespace redux
             _libraryLoaded.reset();
             _spatialReloadBinding = {};
             _spatialPreviewSoundFailureLogged = {};
+            _spatialPreviewVisibilityFailureLogged = {};
             _spatialReloadController.reset();
             _libraryStableFrames = 0;
             _librarySyncedRevision = _learner.revision();
@@ -1417,6 +1439,7 @@ namespace redux
             _drivePartCache.generationKey != generationKey) {
             _spatialReloadBinding = {};
             _spatialPreviewSoundFailureLogged = {};
+            _spatialPreviewVisibilityFailureLogged = {};
             return;
         }
         if (_spatialReloadBinding.attempted &&
@@ -1426,6 +1449,7 @@ namespace redux
 
         _spatialReloadBinding = {};
         _spatialPreviewSoundFailureLogged = {};
+        _spatialPreviewVisibilityFailureLogged = {};
         _spatialReloadBinding.attempted = true;
         _spatialReloadBinding.generationKey = generationKey;
         _spatialReloadBinding.groupCount = static_cast<std::uint32_t>((std::min)(
@@ -1669,6 +1693,174 @@ namespace redux
         }
     }
 
+    RE::NiAVObject* ReduxRuntime::findUniqueDrivePartNode(
+        std::uint64_t generationKey,
+        std::string_view sourceName) const
+    {
+        if (_drivePartCache.generationKey != generationKey || sourceName.empty()) {
+            return nullptr;
+        }
+        RE::NiAVObject* match = nullptr;
+        for (std::uint32_t index = 0; index < _drivePartCache.count; ++index) {
+            const auto& entry = _drivePartCache.entries[index];
+            const auto entryName = providerFixedStringView(
+                entry.sourceName.data(), entry.sourceName.size());
+            if (entryName != sourceName) {
+                continue;
+            }
+            if (match) {
+                return nullptr;  // Ambiguous names fail closed.
+            }
+            match = entry.node;
+        }
+        // Equip-scoped non-owning pointer; callers use it immediately on the
+        // ROCK main-thread frame and never retain it.
+        return match;
+    }
+
+    void ReduxRuntime::restoreSpatialPreviewVisibility(
+        std::uint64_t generationKey)
+    {
+
+        for (auto& lease : _spatialPreviewVisibilityLeases) {
+            if (!lease.used) {
+                continue;
+            }
+            const auto name = providerFixedStringView(
+                lease.sourceName.data(), lease.sourceName.size());
+            if (lease.generationKey == generationKey) {
+                if (auto* node = findUniqueDrivePartNode(generationKey, name)) {
+                    if (node->GetAppCulled() != lease.originalCulled) {
+                        node->SetAppCulled(lease.originalCulled);
+                    }
+                    RDX_LOG_INFO(Weapon,
+                        "Spatial preview visibility restored node='{}' culled={}",
+                        name,
+                        lease.originalCulled);
+                }
+            }
+            // On a generation change the old weapon graph is no longer a
+            // safe dereference target. Dropping the name-only lease is the
+            // deterministic cleanup; the discarded graph dies with its node.
+            lease = {};
+        }
+    }
+
+    void ReduxRuntime::applySpatialPreviewVisibility(
+        const motion_library::SpatialReloadProfile& profile,
+        const spatial_reload::Controller::FrameOutput& output,
+        std::uint64_t generationKey)
+    {
+        if (!output.active || output.groupIndex >= profile.groups.size() ||
+            _drivePartCache.generationKey != generationKey) {
+            restoreSpatialPreviewVisibility(generationKey);
+            return;
+        }
+
+        bool leaseFromOtherGroup = false;
+        for (const auto& lease : _spatialPreviewVisibilityLeases) {
+            leaseFromOtherGroup |= lease.used &&
+                (lease.generationKey != generationKey ||
+                    lease.groupIndex != output.groupIndex);
+        }
+        if (leaseFromOtherGroup) {
+            restoreSpatialPreviewVisibility(generationKey);
+        }
+
+        constexpr std::string_view kCullPrefix = "CullBone.";
+        constexpr std::string_view kUnCullPrefix = "UnCullBone.";
+        for (std::uint32_t outputIndex = 0;
+             outputIndex < output.visibilityEventCount;
+             ++outputIndex) {
+            const auto eventIndex = output.visibilityEventIndices[outputIndex];
+            if (eventIndex >= profile.mappedEvents.size() ||
+                eventIndex >= _spatialPreviewVisibilityFailureLogged.size()) {
+                continue;
+            }
+            const auto& event = profile.mappedEvents[eventIndex];
+            if (event.kind !=
+                motion_library::SpatialReloadMappedEventKind::Visibility) {
+                continue;
+            }
+            std::string_view nodeName;
+            bool desiredCulled = false;
+            if (stripPrefixIgnoreCase(
+                    event.sourceEvent, kUnCullPrefix, nodeName)) {
+                desiredCulled = false;
+            } else if (stripPrefixIgnoreCase(
+                           event.sourceEvent, kCullPrefix, nodeName)) {
+                desiredCulled = true;
+            } else {
+                continue;  // Parser rejects this; defensive fail-closed gate.
+            }
+
+            auto* node = findUniqueDrivePartNode(generationKey, nodeName);
+            if (!node) {
+                if (!_spatialPreviewVisibilityFailureLogged[eventIndex]) {
+                    _spatialPreviewVisibilityFailureLogged[eventIndex] = true;
+                    RDX_LOG_WARN(Weapon,
+                        "Spatial preview visibility id='{}' could not resolve unique node '{}'",
+                        event.id,
+                        nodeName);
+                }
+                continue;
+            }
+
+            SpatialPreviewVisibilityLease* slot = nullptr;
+            for (auto& lease : _spatialPreviewVisibilityLeases) {
+                const auto leaseName = providerFixedStringView(
+                    lease.sourceName.data(), lease.sourceName.size());
+                if (lease.used && lease.generationKey == generationKey &&
+                    lease.groupIndex == output.groupIndex &&
+                    leaseName == nodeName) {
+                    slot = &lease;
+                    break;
+                }
+            }
+            if (!slot) {
+                for (auto& lease : _spatialPreviewVisibilityLeases) {
+                    if (!lease.used) {
+                        slot = &lease;
+                        break;
+                    }
+                }
+            }
+            if (!slot) {
+                if (!_spatialPreviewVisibilityFailureLogged[eventIndex]) {
+                    _spatialPreviewVisibilityFailureLogged[eventIndex] = true;
+                    RDX_LOG_WARN(Weapon,
+                        "Spatial preview visibility lease capacity exhausted for '{}'",
+                        nodeName);
+                }
+                continue;
+            }
+
+            if (!slot->used) {
+                *slot = {};
+                slot->used = true;
+                slot->generationKey = generationKey;
+                slot->groupIndex = output.groupIndex;
+                std::memcpy(
+                    slot->sourceName.data(),
+                    nodeName.data(),
+                    (std::min)(nodeName.size(), slot->sourceName.size() - 1));
+                slot->originalCulled = node->GetAppCulled();
+                slot->appliedCulled = slot->originalCulled;
+            }
+            if (node->GetAppCulled() != desiredCulled) {
+                node->SetAppCulled(desiredCulled);
+            }
+            if (slot->appliedCulled != desiredCulled) {
+                RDX_LOG_INFO(Weapon,
+                    "Spatial preview visibility node='{}' stage='{}' culled={}",
+                    nodeName,
+                    event.stageId,
+                    desiredCulled);
+                slot->appliedCulled = desiredCulled;
+            }
+        }
+    }
+
     void ReduxRuntime::loadMotionLibraryForWeapon(std::uint32_t weaponFormId)
     {
         _libraryWeaponRef = motion_library::MotionLibraryStore::formRefFromRuntimeId(weaponFormId);
@@ -1853,6 +2045,8 @@ namespace redux
         _libraryStableFrames = 0;
         _spatialReloadBinding = {};
         _spatialPreviewSoundFailureLogged = {};
+        _spatialPreviewVisibilityFailureLogged = {};
+        restoreSpatialPreviewVisibility(_drivePartCache.generationKey);
         _spatialReloadController.reset();
         RDX_LOG_INFO(Weapon,
             "Learned motion data WIPED (bResetLearnedPaths) — {} library file(s) deleted (curated kept); reloads re-record from scratch, authored strokes re-harvest on the next equip/clip playback",
@@ -1902,6 +2096,7 @@ namespace redux
         if (queuedShutdownGap) {
             _libraryStore.shutdown();
         }
+        restoreSpatialPreviewVisibility(_drivePartCache.generationKey);
         _libraryLoaded.reset();
         _libraryWeaponFormId = 0;
         _libraryWeaponRef = {};
@@ -1910,6 +2105,7 @@ namespace redux
         _libraryStableFrames = 0;
         _spatialReloadBinding = {};
         _spatialPreviewSoundFailureLogged = {};
+        _spatialPreviewVisibilityFailureLogged = {};
         _spatialReloadController.reset();
 
         _sandbox.shutdown();
@@ -3349,6 +3545,13 @@ namespace redux
             // prior preview/learner drive without installing attach targets.
             _spatialReloadController.reset();
             input.spatialPreviewActive = true;
+        }
+
+        if (profileReady) {
+            applySpatialPreviewVisibility(
+                *profile, profileOutput, generationKey);
+        } else {
+            restoreSpatialPreviewVisibility(generationKey);
         }
 
         std::array<WeaponPartDriveSandbox::SentDrive, WeaponPartDriveSandbox::kMaxSentDrives> sentDrives{};

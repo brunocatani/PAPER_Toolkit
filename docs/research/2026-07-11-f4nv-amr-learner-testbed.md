@@ -83,16 +83,22 @@ The curated interaction uses removal `0.00 -> 0.20`, then insertion `0.80 -> 1.0
 | `SoundPlay.WPN1AMRboltopen` | direct sound at bolt-open endpoint |
 | `SoundPlay.WPN1AMRmagrel` | direct sound at magazine removal path position `0.05` |
 | `SoundPlay.WPN1AMRmagout` | direct sound at magazine exchange position `0.20` |
-| `SoundPlay.WPN1AMRmagin` | direct sound when insertion enters at `0.80` |
-| `SoundPlay.WPN1AMRboltclose` | direct sound when bolt closing begins |
+| `SoundPlay.WPN1AMRmagin` | direct sound at insertion position `0.90`, separated from the exchange sound |
+| `SoundPlay.WPN1AMRboltclose` | direct sound halfway through bolt closing |
 | `SoundPlay.WPN1AMRend` | direct sound at bolt-closed endpoint |
-| `CullBone.WeaponMagazineChild1` | inert visibility evidence |
-| `UnCullBone.WeaponMagazineChild1` | inert visibility evidence |
+| `CullBone.WeaponMagazineChild1` | preview-only outgoing mesh state; original cull value is leased and restored |
+| `UnCullBone.WeaponMagazineChild1` | preview-only incoming mesh state |
 | `reloadComplete` | inert gameplay evidence |
 | `initiateStart` | inert graph evidence |
 | `reloadEnd` | inert graph-exit evidence |
 
 Sound command spelling is normalized to `Soundplay.<descriptor>` in the profile. PAPER strips that prefix and requests the descriptor directly. No captured marker is sent to the animation graph.
+
+## First live-test correction
+
+The 18:44 runtime log proved that bolt sounds were re-arming: `reload_start`, `bolt_open`, `bolt_close`, and `reload_end` all played successfully across repeated cycles. The audible loss came from placement, not a one-shot latch. `bolt_open`/`bolt_close` and `mag_out`/`mag_in` had been assigned to the same transition frames, allowing one descriptor to mask the other.
+
+Return sounds are now spatially separated: bolt-close at closing position `0.50`, end at the closed endpoint, mag-out at the `0.20` exchange, and mag-in at insertion position `0.90`. The same test also showed that magazine visibility never changed because Cull/UnCull was metadata-only. The captured `WeaponMagazineChild1` pair is now a reversible preview-state lease and still never touches the animation graph.
 
 ## Test checklist
 
@@ -103,6 +109,9 @@ Sound command spelling is normalized to `Soundplay.<descriptor>` in the profile.
 5. Open/close continuously and confirm all three top-level bolt drivers move once, with no doubled descendant travel.
 6. Release and re-grip; confirm the cycle resets cleanly.
 7. Grip the magazine and confirm `WeaponMagazine` carries the complete subtree while `P-Mag` is never independently driven.
-8. Cross removal positions `0.05` and `0.20`; verify release/out sounds fire once.
-9. Confirm the `0.20 -> 0.80` transition has no visible teleport and insertion reaches the exact seated endpoint.
-10. Start and finish a normal native reload separately; confirm PAPER neither holds nor completes it.
+8. Cross removal positions `0.05` and `0.20`; verify release/out sounds fire once and `WeaponMagazineChild1` selects the outgoing appearance.
+9. Continue through insertion position `0.90`; verify the incoming appearance replaces the outgoing one and the mag-in sound is audible separately from mag-out.
+10. Confirm the `0.20 -> 0.80` transition has no visible teleport, insertion reaches the exact seated endpoint, and returning to removal selects the outgoing appearance again.
+11. Open and close the bolt for at least two continuous cycles; verify bolt-open, bolt-close, and end each remain separately audible on every cycle.
+12. Release the magazine during both stages and confirm its original visibility is restored.
+13. Start and finish a normal native reload separately; confirm PAPER neither holds nor completes it.

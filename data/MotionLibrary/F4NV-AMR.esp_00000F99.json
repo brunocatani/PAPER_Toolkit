@@ -91198,7 +91198,7 @@
     "sourceCapture": "F4NV-AMR.esp_00000F99.capture.jsonl",
     "sourceActivityId": "23",
     "sourceClip": "Animations\\44Pistol\\WPNReload.hkt",
-    "notes": "Movement-only testbed built from the exact known-good learner paths. It never owns a reload clip, ammo, visibility, or gameplay.",
+    "notes": "Movement-only testbed built from the exact known-good learner paths. It never owns a reload clip, ammo, or gameplay; magazine visibility is a reversible preview-only node state.",
     "groups": [
       {
         "id": "bolt_group",
@@ -94612,18 +94612,38 @@
       {
         "id": "mag_in",
         "stage": "magazine_insert",
-        "trigger": "stageEnter",
+        "trigger": "pathPosition",
         "kind": "sound",
         "sourceEvent": "Soundplay.WPN1AMRmagin",
-        "notes": "Plays when the continuous grip changes to the 80 percent insertion segment."
+        "notes": "Plays at insertion position 0.90, spatially separated from the mag-out exchange sound.",
+        "pathFraction": 0.9,
+        "targetPose": [
+          -13.877921624481678,
+          20.58301492072642,
+          -11.674947512149812,
+          0.6440162698542119,
+          -0.7085679570511465,
+          -0.0659635413037077,
+          0.28075488530407716
+        ]
       },
       {
         "id": "bolt_close",
         "stage": "bolt_close",
-        "trigger": "stageEnter",
+        "trigger": "pathPosition",
         "kind": "sound",
         "sourceEvent": "Soundplay.WPN1AMRboltclose",
-        "notes": "Plays when the continuous bolt grip changes to its recorded closing path."
+        "notes": "Plays halfway along the recorded closing path, spatially separated from bolt-open and end.",
+        "pathFraction": 0.5,
+        "targetPose": [
+          -2.5033950805664062e-06,
+          6.509187936782837,
+          0.012049198150634766,
+          0.9999999999691136,
+          -4.564368055861159e-06,
+          5.826094829457159e-06,
+          2.6450135652783296e-06
+        ]
       },
       {
         "id": "reload_end",
@@ -94639,7 +94659,7 @@
         "trigger": "stageEnter",
         "kind": "visibility",
         "sourceEvent": "CullBone.WeaponMagazineChild1",
-        "notes": "Captured visibility evidence only; never dispatched or applied."
+        "notes": "Preview-only outgoing magazine mesh selection; applied directly as reversible node cull state and never graph-dispatched."
       },
       {
         "id": "magazine_child_uncull",
@@ -94647,7 +94667,7 @@
         "trigger": "stageEnter",
         "kind": "visibility",
         "sourceEvent": "UnCullBone.WeaponMagazineChild1",
-        "notes": "Captured visibility evidence only; never dispatched or applied."
+        "notes": "Preview-only incoming magazine mesh selection; applied directly as reversible node cull state and never graph-dispatched."
       },
       {
         "id": "reload_complete",

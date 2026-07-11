@@ -14,6 +14,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <set>
 #include <sstream>
 
@@ -962,7 +963,7 @@ int main()
             return track.keys.back().pose;
         };
 
-        std::set<std::string> emittedSoundIds;
+        std::map<std::string, std::uint32_t> emittedSoundCounts;
         const auto collectSounds = [&](const Controller::FrameOutput& output) {
             for (std::uint32_t i = 0; i < output.soundEventCount; ++i) {
                 const auto index = output.soundEventIndices[i];
@@ -972,7 +973,7 @@ int main()
                     ok &= expectEqual("controller emits only sound findings",
                         profile.mappedEvents[index].kind,
                         SpatialReloadMappedEventKind::Sound);
-                    emittedSoundIds.insert(profile.mappedEvents[index].id);
+                    ++emittedSoundCounts[profile.mappedEvents[index].id];
                 }
             }
         };
@@ -1014,7 +1015,8 @@ int main()
         collectSounds(output);
         ok &= expectTrue("bolt preview begins from a physical grip without a clip",
             output.newGrip && output.active && output.groupIndex == 0 &&
-                output.stageIndex == boltOpenIndex && output.driverCount == 3);
+                output.stageIndex == boltOpenIndex && output.driverCount == 3 &&
+                output.visibilityEventCount == 0);
 
         PoseSample rotationOnlyHand{};
         rotationOnlyHand.rotate = redux::weapon_part_motion_path::Quat{
@@ -1061,17 +1063,48 @@ int main()
                 std::abs(output.pathFraction) < 0.0001f &&
                 std::abs(output.outwardFraction) < 0.0001f);
 
+        // A second full cycle under the same pinned grip must re-arm every
+        // stage-local sound. This guards against one-shot-per-session latches.
+        const auto secondBoltOpenGate = anchoredTarget(
+            profile.stages[boltOpenIndex], 0.0f, boltCloseGate, 1.0f);
+        changed = false;
+        for (std::uint32_t step = 0; step < 128 && !changed; ++step) {
+            output = controller.update(
+                &profile, makeInput(true, 0, 1, secondBoltOpenGate, false));
+            collectSounds(output);
+            changed = output.stageChanged;
+        }
+        const auto secondBoltCloseGate = anchoredTarget(
+            profile.stages[boltCloseIndex], 0.0f, secondBoltOpenGate, 1.0f);
+        changed = false;
+        for (std::uint32_t step = 0; step < 128 && !changed; ++step) {
+            output = controller.update(
+                &profile, makeInput(true, 0, 1, secondBoltCloseGate, false));
+            collectSounds(output);
+            changed = output.stageChanged;
+        }
+        ok &= expectTrue("reverse/end sounds re-arm on a continuous second cycle",
+            changed && output.stageIndex == boltOpenIndex &&
+                emittedSoundCounts["bolt_open"] >= 2 &&
+                emittedSoundCounts["bolt_close"] >= 2 &&
+                emittedSoundCounts["reload_end"] >= 2);
+
         output = controller.update(
             &profile, makeInput(false, Controller::kInvalidIndex, 0, {}));
         ok &= expectTrue("release ends preview drives without gameplay completion",
-            !output.active && output.driverCount == 0 && output.soundEventCount == 0);
+            !output.active && output.driverCount == 0 &&
+                output.soundEventCount == 0 &&
+                output.visibilityEventCount == 0);
 
         output = controller.update(
             &profile, makeInput(true, 1, 2, {}));
         collectSounds(output);
         ok &= expectTrue("magazine preview begins on outgoing group stage",
             output.newGrip && output.active && output.groupIndex == 1 &&
-                output.stageIndex == magRemoveIndex && output.driverCount == 1);
+                output.stageIndex == magRemoveIndex && output.driverCount == 1 &&
+                output.visibilityEventCount == 1 &&
+                profile.mappedEvents[output.visibilityEventIndices[0]].sourceEvent ==
+                    "CullBone.WeaponMagazineChild1");
 
         const auto& magRemove = profile.stages[magRemoveIndex];
         const auto magExchangePose = anchoredTarget(
@@ -1086,7 +1119,10 @@ int main()
         ok &= expectTrue("magazine exchanges at 20 percent of outward travel",
             changed && output.stageIndex == magInsertIndex &&
                 std::abs(output.pathFraction - 0.80f) < 0.0002f &&
-                std::abs(output.outwardFraction - 0.20f) < 0.0002f);
+                std::abs(output.outwardFraction - 0.20f) < 0.0002f &&
+                output.visibilityEventCount == 1 &&
+                profile.mappedEvents[output.visibilityEventIndices[0]].sourceEvent ==
+                    "UnCullBone.WeaponMagazineChild1");
         expectTransitionContinuity(
             "20-percent magazine handoff has no driver teleport",
             magRemove, output);
@@ -1107,7 +1143,10 @@ int main()
         ok &= expectTrue("seated magazine resets to outgoing stage at outward zero",
             changed && output.stageIndex == magRemoveIndex &&
                 std::abs(output.pathFraction) < 0.0001f &&
-                std::abs(output.outwardFraction) < 0.0001f);
+                std::abs(output.outwardFraction) < 0.0001f &&
+                output.visibilityEventCount == 1 &&
+                profile.mappedEvents[output.visibilityEventIndices[0]].sourceEvent ==
+                    "CullBone.WeaponMagazineChild1");
 
         output = controller.update(
             &profile, makeInput(false, Controller::kInvalidIndex, 0, {}));
@@ -1122,7 +1161,7 @@ int main()
                  "reload_start", "bolt_open", "bolt_close", "reload_end",
                  "mag_release", "mag_out", "mag_in" }) {
             ok &= expectTrue("reachable preview sound emitted",
-                emittedSoundIds.contains(expected));
+                emittedSoundCounts[expected] > 0);
         }
 
         WeaponLibrary invalidProfile;
@@ -1176,6 +1215,17 @@ int main()
         removedExecutableEvents["spatialReload"]["events"] = nlohmann::json::array();
         ok &= expectFalse("removed executable event surface is rejected",
             parse(removedExecutableEvents.dump(), invalidProfile, nullptr));
+
+        auto invalidVisibilityCommand = nlohmann::json::parse(roundTripText);
+        for (auto& encodedEvent :
+             invalidVisibilityCommand["spatialReload"]["mappedEvents"]) {
+            if (encodedEvent["kind"] == "visibility") {
+                encodedEvent["sourceEvent"] = "HideSomething.WeaponMagazineChild1";
+                break;
+            }
+        }
+        ok &= expectFalse("visibility preview state accepts only CullBone/UnCullBone",
+            parse(invalidVisibilityCommand.dump(), invalidProfile, nullptr));
 
         auto brokenCycle = nlohmann::json::parse(roundTripText);
         brokenCycle["spatialReload"]["stages"][1]["nextStage"] = "bolt_close";
