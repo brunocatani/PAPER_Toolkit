@@ -102,6 +102,7 @@ namespace redux::rich_capture
                 "Receiver", "Barrel", "Handguard", "Foregrip", "Pump", "Stock", "Grip", "Magazine",
                 "Magwell", "Bolt", "Slide", "ChargingHandle", "BreakAction", "Cylinder", "Chamber", "Shell",
                 "Round", "LaserCell", "Lever", "Sight", "Accessory", "CosmeticAmmo", "Other",
+                "LaserSight", "Flashlight", "LaserFlashlightCombo", "Scope",
             };
             return enumName(value, names);
         }
