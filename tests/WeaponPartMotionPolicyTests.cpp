@@ -670,11 +670,13 @@ int main()
             defaults.allows(ActionRole::None, PartKind::Magazine));
         ok &= expectFalse("default allowlist rejects stock",
             defaults.allows(ActionRole::None, PartKind::Stock));
-        ok &= expectFalse("default allowlist rejects static laser/flashlight/scope accessories",
+        ok &= expectFalse("default allowlist rejects static weapon accessories",
             defaults.allows(ActionRole::None, PartKind::LaserSight) ||
             defaults.allows(ActionRole::None, PartKind::Flashlight) ||
             defaults.allows(ActionRole::None, PartKind::LaserFlashlightCombo) ||
-            defaults.allows(ActionRole::None, PartKind::Scope));
+            defaults.allows(ActionRole::None, PartKind::Scope) ||
+            defaults.allows(ActionRole::None, PartKind::MuzzleDevice) ||
+            defaults.allows(ActionRole::None, PartKind::Bipod));
         ok &= expectFalse("default allowlist rejects latch+receiver",
             defaults.allows(ActionRole::Latch, PartKind::Receiver));
 
