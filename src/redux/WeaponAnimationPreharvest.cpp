@@ -15,6 +15,7 @@
 #include <Windows.h>
 
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -207,10 +208,15 @@ namespace redux::weapon_animation_preharvest
             Stats stats{};
             alignas(16) std::array<HkQsTransform, kMaxBonesAndTracks> sampledTracks{};
             std::array<RE::NiTransform, kMaxBonesAndTracks> sampledLocals{};
-            DWORD ownerThreadId{ 0 };
+            std::atomic<DWORD> ownerThreadId{ 0 };
+            // F4SE session messages can request teardown off the ROCK frame
+            // thread. Only the established owner may touch retained Bethesda
+            // graph/resource state; other callers publish a bounded request
+            // that the owner consumes before its next job step.
+            std::atomic_bool resetRequested{ false };
             bool nativeValidationAttempted{ false };
             bool nativeValidated{ false };
-            bool threadMismatchLogged{ false };
+            std::atomic_bool threadMismatchLogged{ false };
         };
 
         [[nodiscard]] Runtime& runtime()
@@ -225,19 +231,28 @@ namespace redux::weapon_animation_preharvest
         [[nodiscard]] bool claimOrValidateThread(Runtime& state)
         {
             const DWORD currentThreadId = GetCurrentThreadId();
-            if (state.ownerThreadId == 0) {
-                state.ownerThreadId = currentThreadId;
+            DWORD ownerThreadId = state.ownerThreadId.load(
+                std::memory_order_acquire);
+            if (ownerThreadId == 0) {
+                DWORD expected = 0;
+                if (state.ownerThreadId.compare_exchange_strong(
+                        expected,
+                        currentThreadId,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    return true;
+                }
+                ownerThreadId = expected;
+            }
+            if (ownerThreadId == currentThreadId) {
                 return true;
             }
-            if (state.ownerThreadId == currentThreadId) {
-                return true;
-            }
-            if (!state.threadMismatchLogged) {
+            if (!state.threadMismatchLogged.exchange(
+                    true, std::memory_order_relaxed)) {
                 RDX_LOG_ERROR(Animation,
                     "Authored animation preharvest rejected non-owner thread owner={} caller={}",
-                    state.ownerThreadId,
+                    ownerThreadId,
                     currentThreadId);
-                state.threadMismatchLogged = true;
             }
             return false;
         }
@@ -1674,6 +1689,10 @@ namespace redux::weapon_animation_preharvest
         if (!claimOrValidateThread(state)) {
             return StepResult{ .state = State::Failed };
         }
+        if (state.resetRequested.exchange(
+                false, std::memory_order_acq_rel)) {
+            resetRuntimeJob(state);
+        }
         if (weaponFormId == 0 || weaponGenerationKey == 0) {
             resetRuntimeJob(state);
             return {};
@@ -1711,9 +1730,16 @@ namespace redux::weapon_animation_preharvest
     void reset() noexcept
     {
         auto& state = runtime();
-        if (!claimOrValidateThread(state)) {
+        state.resetRequested.store(true, std::memory_order_release);
+        const DWORD ownerThreadId = state.ownerThreadId.load(
+            std::memory_order_acquire);
+        if (ownerThreadId == 0 || ownerThreadId != GetCurrentThreadId()) {
+            // An inactive pre-frame reset must not claim ownership from the
+            // future ROCK callback. An active cross-thread reset is consumed
+            // by that established owner before its next native operation.
             return;
         }
+        state.resetRequested.store(false, std::memory_order_release);
         resetRuntimeJob(state);
     }
 
