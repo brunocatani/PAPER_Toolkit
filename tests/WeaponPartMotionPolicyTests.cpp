@@ -167,6 +167,60 @@ int main()
             chainCount == 2 && chain[0] == 4 && chain[1] == 5);
         ok &= expectEqual("unrelated bone is rejected",
             buildBoneChainBelowAncestor(0, 1, parents, chain), 0u);
+        auto partWeaponLocal =
+            transform_math::makeIdentityTransform<TestTransform>();
+        partWeaponLocal.translate = { 2.0f, -3.0f, 4.0f };
+        partWeaponLocal.scale = 0.8f;
+        auto weaponModelA =
+            transform_math::makeIdentityTransform<TestTransform>();
+        weaponModelA.translate = { 50.0f, -20.0f, 100.0f };
+        weaponModelA.scale = 1.75f;
+        weaponModelA.rotate.entry[0][0] = 0.0f;
+        weaponModelA.rotate.entry[0][1] = 1.0f;
+        weaponModelA.rotate.entry[1][0] = -1.0f;
+        weaponModelA.rotate.entry[1][1] = 0.0f;
+        const auto partModelA = transform_math::composeTransforms(
+            weaponModelA, partWeaponLocal);
+        const auto recoveredA = transform_math::relativeTransform(
+            weaponModelA, partModelA);
+
+        auto weaponModelB =
+            transform_math::makeIdentityTransform<TestTransform>();
+        weaponModelB.translate = { -300.0f, 75.0f, -40.0f };
+        weaponModelB.scale = 0.65f;
+        weaponModelB.rotate.entry[0][0] = 0.0f;
+        weaponModelB.rotate.entry[0][1] = -1.0f;
+        weaponModelB.rotate.entry[1][0] = 1.0f;
+        weaponModelB.rotate.entry[1][1] = 0.0f;
+        const auto partModelB = transform_math::composeTransforms(
+            weaponModelB, partWeaponLocal);
+        const auto recoveredB = transform_math::relativeTransform(
+            weaponModelB, partModelB);
+        const auto rotationMatches = [](
+                                         const TestTransform& lhs,
+                                         const TestTransform& rhs) {
+            for (std::uint32_t row = 0; row < 3; ++row) {
+                for (std::uint32_t column = 0; column < 3; ++column) {
+                    if (std::abs(
+                            lhs.rotate.entry[row][column] -
+                            rhs.rotate.entry[row][column]) >= 0.0001f) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        };
+        ok &= expectTrue("weapon-relative math cancels whole-weapon translation rotation and scale",
+            std::abs(recoveredA.translate.x - partWeaponLocal.translate.x) < 0.0001f &&
+                std::abs(recoveredA.translate.y - partWeaponLocal.translate.y) < 0.0001f &&
+                std::abs(recoveredA.translate.z - partWeaponLocal.translate.z) < 0.0001f &&
+                std::abs(recoveredA.scale - partWeaponLocal.scale) < 0.0001f &&
+                rotationMatches(recoveredA, partWeaponLocal) &&
+                std::abs(recoveredB.translate.x - partWeaponLocal.translate.x) < 0.0001f &&
+                std::abs(recoveredB.translate.y - partWeaponLocal.translate.y) < 0.0001f &&
+                std::abs(recoveredB.translate.z - partWeaponLocal.translate.z) < 0.0001f &&
+                std::abs(recoveredB.scale - partWeaponLocal.scale) < 0.0001f &&
+                rotationMatches(recoveredB, partWeaponLocal));
 
         auto sourceFirst =
             transform_math::makeIdentityTransform<TestTransform>();
@@ -413,6 +467,104 @@ int main()
             ok &= expectTrue("follower tracks leader progress at mid-stroke",
                 std::abs(midPose.translate.y - 2.5f) < 0.25f);
         }
+    }
+
+    {
+        using namespace redux::weapon_clip_stroke;
+
+        // A full automatic-fire clip contains several complete bolt cycles.
+        // Authored serving needs one rest->extreme stage, never the sum of all
+        // reciprocations in the baked clip.
+        ExactTrackSamples automaticBolt{};
+        std::memcpy(
+            automaticBolt.boneName.data(),
+            "WeaponBolt",
+            std::strlen("WeaponBolt"));
+        automaticBolt.sampleCount = 100;
+        for (std::uint32_t sample = 0;
+             sample < automaticBolt.sampleCount;
+             ++sample) {
+            const auto cycleSample = sample % 20;
+            const float phase = cycleSample <= 10
+                ? static_cast<float>(cycleSample) / 10.0f
+                : static_cast<float>(20 - cycleSample) / 10.0f;
+            automaticBolt.samples[sample].translate.y = -8.0f * phase;
+        }
+        redux::weapon_part_motion_path::MotionPath automaticPath{};
+        std::array<float, redux::weapon_part_motion_path::kResampledKeyCount>
+            automaticKeyPositions{};
+        StrokeSampleWindow automaticWindow{};
+        std::uint32_t automaticPeak = 0;
+        ok &= expectTrue("automatic clip yields a bounded authored bolt stage",
+            buildLeaderPath(
+                automaticBolt,
+                automaticPath,
+                automaticKeyPositions,
+                &automaticWindow,
+                &automaticPeak));
+        ok &= expectTrue("automatic stage stops at the first bolt extreme",
+            automaticWindow.valid && automaticWindow.lastSample == 10 &&
+                automaticPeak == 10 &&
+                automaticPath.totalArcLength > 7.9f &&
+                automaticPath.totalArcLength < 8.1f &&
+                std::abs(automaticPath.keys.back().translate.y + 8.0f) < 0.05f);
+
+        // A reload can extract a magazine, dwell at the socket limit, then
+        // carry it around with the animated hand. Only the first bounded
+        // extraction stage is a physical weapon-part guide.
+        ExactTrackSamples compoundMagazine{};
+        std::memcpy(
+            compoundMagazine.boneName.data(),
+            "WeaponMagazine",
+            std::strlen("WeaponMagazine"));
+        compoundMagazine.sampleCount = 96;
+        for (std::uint32_t sample = 0;
+             sample < compoundMagazine.sampleCount;
+             ++sample) {
+            if (sample >= 8 && sample <= 24) {
+                const float phase = static_cast<float>(sample - 8) / 16.0f;
+                compoundMagazine.samples[sample].translate.z = -10.0f * phase;
+            } else if (sample > 24) {
+                compoundMagazine.samples[sample].translate.z = -10.0f;
+            }
+            if (sample > 32) {
+                const float carried = static_cast<float>(sample - 32);
+                compoundMagazine.samples[sample].translate.x = carried * 2.0f;
+                compoundMagazine.samples[sample].translate.y = carried;
+            }
+        }
+        redux::weapon_part_motion_path::MotionPath magazinePath{};
+        std::array<float, redux::weapon_part_motion_path::kResampledKeyCount>
+            magazineKeyPositions{};
+        StrokeSampleWindow magazineWindow{};
+        std::uint32_t magazinePeak = 0;
+        ok &= expectTrue("compound reload yields a bounded magazine stage",
+            buildLeaderPath(
+                compoundMagazine,
+                magazinePath,
+                magazineKeyPositions,
+                &magazineWindow,
+                &magazinePeak));
+        ok &= expectTrue("magazine stage ends before later hand-carried motion",
+            magazineWindow.valid && magazineWindow.lastSample == 24 &&
+                magazinePeak == 24 &&
+                magazinePath.totalArcLength > 9.9f &&
+                magazinePath.totalArcLength < 10.1f &&
+                std::abs(magazinePath.keys.back().translate.x) < 0.05f &&
+                std::abs(magazinePath.keys.back().translate.z + 10.0f) < 0.05f);
+
+        ExactTrackSamples slowContinuous{};
+        slowContinuous.sampleCount = 100;
+        for (std::uint32_t sample = 0;
+             sample < slowContinuous.sampleCount;
+             ++sample) {
+            slowContinuous.samples[sample].translate.x =
+                0.04f * static_cast<float>(sample);
+        }
+        const auto slowWindow = findFirstMotionStage(slowContinuous);
+        ok &= expectTrue("slow continuous motion is not mistaken for a stable dwell",
+            slowWindow.valid &&
+                slowWindow.lastSample == slowContinuous.sampleCount - 1);
     }
 
     {

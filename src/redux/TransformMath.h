@@ -207,6 +207,21 @@ namespace redux::transform_math
     }
 
     /*
+     * Express `childModel` in `referenceModel` space. Both inputs must be
+     * model/world transforms sampled at the same instant. Using the inverse
+     * reference explicitly cancels all translation, rotation, and uniform
+     * scale authored on the reference itself; only motion of the child
+     * relative to that reference survives.
+     */
+    template <class Transform>
+    inline Transform relativeTransform(
+        const Transform& referenceModel,
+        const Transform& childModel)
+    {
+        return composeTransforms(invertTransform(referenceModel), childModel);
+    }
+
+    /*
      * Rebase a sampled parent-space transform curve onto a concrete live
      * anchor. The left/parent-frame delta preserves translation, rotation,
      * and lever-arm motion even when the animation skeleton's reference pose

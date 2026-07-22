@@ -50,6 +50,19 @@ namespace redux::weapon_clip_stroke
     // learner's observed co-movement grouping so authored and learned
     // groups mean the same thing by "follower".
     inline constexpr float kRigidFollowerDistanceToleranceGameUnits = 0.6f;
+    // Offline exact clips must be reduced to the same unit of evidence the
+    // learner records: one stable pose -> motion -> first stable pose (or the
+    // first unambiguous reversal). This prevents later reload carry motion and
+    // repeated automatic-fire cycles from becoming one enormous guide.
+    // Eight transitions at the exact sampler's 120 Hz is the learner's
+    // roughly 67 ms stable-pose interval. Compare the whole window against a
+    // tight exact-data radius; adjacent-frame stillness would misclassify a
+    // slow but continuous authored motion as a dwell.
+    inline constexpr std::uint32_t kStageStableTransitions = 8;
+    inline constexpr float kStageDwellPoseDistanceGameUnits = 0.05f;
+    inline constexpr std::uint32_t kStageRetreatConfirmSamples = 2;
+    inline constexpr float kStageRetreatMinimumGameUnits = 0.15f;
+    inline constexpr float kStageRetreatFraction = 0.08f;
 
     template <std::uint32_t SampleCapacity>
     struct BasicTrackSamples
@@ -115,10 +128,124 @@ namespace redux::weapon_clip_stroke
         // Animation name from the activating hkbClipGenerator (empty on
         // the walk path or when the read fails); diagnostics/provenance.
         std::array<char, kMaxBoneName> clipAnimationName{};
+        std::uint32_t sourceSampleStart{ 0 };
+        std::uint32_t sourceSamplePeak{ 0 };
+        std::uint32_t sourceSampleEnd{ 0 };
         MotionPath leaderPath{};
         std::uint32_t followerCount{ 0 };
         std::array<AuthoredFollower, kMaxFollowers> followers{};
     };
+
+    struct StrokeSampleWindow
+    {
+        bool valid{ false };
+        std::uint32_t firstSample{ 0 };
+        std::uint32_t lastSample{ 0 };
+    };
+
+    template <std::uint32_t SampleCapacity>
+    [[nodiscard]] inline bool stageWindowIsStill(
+        const BasicTrackSamples<SampleCapacity>& track,
+        const std::uint32_t firstSample,
+        const std::uint32_t lastSample)
+    {
+        if (firstSample >= track.sampleCount ||
+            lastSample >= track.sampleCount ||
+            firstSample > lastSample) {
+            return false;
+        }
+        const auto& anchor = track.samples[firstSample];
+        for (std::uint32_t sample = firstSample + 1;
+             sample <= lastSample;
+             ++sample) {
+            if (poseDistance(track.samples[sample], anchor) >
+                kStageDwellPoseDistanceGameUnits) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /*
+     * Find the first bounded manipulation stage in a uniformly sampled part
+     * track. Sample zero is the clip's authored rest/reference. Once the part
+     * leaves that pose, the stage ends at the first stable dwell or at the
+     * first confirmed retreat from an excursion peak. The latter is what
+     * turns an automatic-fire clip into one bolt stroke even when the bolt has
+     * no long dwell between cycles.
+     */
+    template <std::uint32_t SampleCapacity>
+    [[nodiscard]] inline StrokeSampleWindow findFirstMotionStage(
+        const BasicTrackSamples<SampleCapacity>& track)
+    {
+        if (track.sampleCount < 2 || track.sampleCount > SampleCapacity) {
+            return {};
+        }
+
+        const auto& rest = track.samples[0];
+        std::uint32_t motionStart = 0;
+        for (std::uint32_t sample = 1; sample < track.sampleCount; ++sample) {
+            if (poseDistance(track.samples[sample], rest) >=
+                kMinPathExcursionGameUnits) {
+                motionStart = sample;
+                break;
+            }
+        }
+        if (motionStart == 0) {
+            return {};
+        }
+
+        float peakExcursion = 0.0f;
+        std::uint32_t peakSample = motionStart;
+        std::uint32_t retreatSamples = 0;
+        for (std::uint32_t sample = motionStart;
+             sample < track.sampleCount;
+             ++sample) {
+            const float excursion = poseDistance(track.samples[sample], rest);
+            if (excursion > peakExcursion) {
+                peakExcursion = excursion;
+                peakSample = sample;
+                retreatSamples = 0;
+            }
+
+            if (peakExcursion >= kMinPathExcursionGameUnits &&
+                sample >= motionStart + kStageStableTransitions) {
+                const auto stableStart = sample - kStageStableTransitions;
+                if (stageWindowIsStill(track, stableStart, sample)) {
+                    return StrokeSampleWindow{
+                        .valid = true,
+                        .firstSample = 0,
+                        .lastSample = stableStart,
+                    };
+                }
+            }
+
+            const float retreatThreshold = (std::max)(
+                kStageRetreatMinimumGameUnits,
+                peakExcursion * kStageRetreatFraction);
+            if (peakExcursion >= kMinPathExcursionGameUnits &&
+                excursion <= peakExcursion - retreatThreshold) {
+                ++retreatSamples;
+                if (retreatSamples >= kStageRetreatConfirmSamples) {
+                    return StrokeSampleWindow{
+                        .valid = true,
+                        .firstSample = 0,
+                        .lastSample = peakSample,
+                    };
+                }
+            } else if (sample != peakSample) {
+                retreatSamples = 0;
+            }
+        }
+
+        return peakExcursion >= kMinPathExcursionGameUnits
+            ? StrokeSampleWindow{
+                  .valid = true,
+                  .firstSample = 0,
+                  .lastSample = track.sampleCount - 1,
+              }
+            : StrokeSampleWindow{};
+    }
 
     template <std::uint32_t SampleCapacity>
     inline float trackExcursion(const BasicTrackSamples<SampleCapacity>& track)
@@ -162,55 +289,48 @@ namespace redux::weapon_clip_stroke
     inline bool buildLeaderPath(
         const BasicTrackSamples<SampleCapacity>& track,
         MotionPath& outPath,
-        std::array<float, kResampledKeyCount>& outKeySamplePositions)
+        std::array<float, kResampledKeyCount>& outKeySamplePositions,
+        StrokeSampleWindow* outWindow = nullptr,
+        std::uint32_t* outPeakSample = nullptr)
     {
         outPath = MotionPath{};
         outKeySamplePositions = {};
-        if (track.sampleCount < 2) {
+        if (outWindow) {
+            *outWindow = {};
+        }
+        if (outPeakSample) {
+            *outPeakSample = 0;
+        }
+
+        const auto window = findFirstMotionStage(track);
+        if (!window.valid || window.lastSample <= window.firstSample) {
             return false;
         }
 
-        std::uint32_t peakIndex = 0;
-        float peakExcursion = 0.0f;
-        for (std::uint32_t i = 1; i < track.sampleCount; ++i) {
-            const float excursion = poseDistance(track.samples[i], track.samples[0]);
-            if (excursion > peakExcursion) {
-                peakExcursion = excursion;
-                peakIndex = i;
-            }
-        }
-        if (peakIndex == 0 || peakExcursion < kMinPathExcursionGameUnits) {
+        std::array<float, kResampledKeyCount> windowKeyPositions{};
+        std::uint32_t windowPeak = 0;
+        const auto windowSampleCount =
+            window.lastSample - window.firstSample + 1;
+        if (!weapon_part_motion_path::buildPathFromRecording(
+                track.samples.data() + window.firstSample,
+                windowSampleCount,
+                outPath,
+                windowKeyPositions.data(),
+                &windowPeak)) {
             return false;
         }
 
-        float totalArc = 0.0f;
-        for (std::uint32_t i = 1; i <= peakIndex; ++i) {
-            totalArc += poseDistance(track.samples[i], track.samples[i - 1]);
+        for (std::uint32_t key = 0; key < kResampledKeyCount; ++key) {
+            outKeySamplePositions[key] =
+                static_cast<float>(window.firstSample) +
+                windowKeyPositions[key];
         }
-        if (!(totalArc > 0.0f)) {
-            return false;
+        if (outWindow) {
+            *outWindow = window;
         }
-
-        outPath.keys[0] = track.samples[0];
-        outKeySamplePositions[0] = 0.0f;
-        std::uint32_t segment = 1;
-        float arcAtSegmentStart = 0.0f;
-        float segmentLength = poseDistance(track.samples[1], track.samples[0]);
-        for (std::uint32_t key = 1; key < kResampledKeyCount; ++key) {
-            const float targetArc = totalArc * static_cast<float>(key) / static_cast<float>(kResampledKeyCount - 1);
-            while (segment < peakIndex && arcAtSegmentStart + segmentLength < targetArc) {
-                arcAtSegmentStart += segmentLength;
-                ++segment;
-                segmentLength = poseDistance(track.samples[segment], track.samples[segment - 1]);
-            }
-            const float t = segmentLength > 1.0e-6f
-                ? (std::min)(1.0f, (std::max)(0.0f, (targetArc - arcAtSegmentStart) / segmentLength))
-                : 1.0f;
-            outPath.keys[key] = lerpPose(track.samples[segment - 1], track.samples[segment], t);
-            outKeySamplePositions[key] = static_cast<float>(segment - 1) + t;
+        if (outPeakSample) {
+            *outPeakSample = window.firstSample + windowPeak;
         }
-        outPath.totalArcLength = totalArc;
-        outPath.valid = true;
         return true;
     }
 
@@ -249,10 +369,18 @@ namespace redux::weapon_clip_stroke
             }
             AuthoredStrokeGroup group{};
             std::array<float, kResampledKeyCount> keyPositions{};
-            if (!buildLeaderPath(tracks[leader], group.leaderPath, keyPositions)) {
+            StrokeSampleWindow stageWindow{};
+            if (!buildLeaderPath(
+                    tracks[leader],
+                    group.leaderPath,
+                    keyPositions,
+                    &stageWindow,
+                    &group.sourceSamplePeak)) {
                 continue;
             }
             group.leaderBoneName = tracks[leader].boneName;
+            group.sourceSampleStart = stageWindow.firstSample;
+            group.sourceSampleEnd = stageWindow.lastSample;
 
             for (std::uint32_t follower = 0; follower < boundedTrackCount && group.followerCount < kMaxFollowers; ++follower) {
                 if (follower == leader || excursions[follower] < kFollowerMinExcursionGameUnits) {

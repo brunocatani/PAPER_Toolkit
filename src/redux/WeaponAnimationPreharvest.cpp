@@ -1070,8 +1070,13 @@ namespace redux::weapon_animation_preharvest
             // The first-person graph skeleton contains body/arm bones that
             // are irrelevant to weapon-part reconstruction and may use
             // transforms NiTransform cannot represent. Validate only the
-            // exact Weapon-descendant chains we will compose; sampled tracks
-            // overwrite their corresponding reference locals each step.
+            // sampled Weapon transform and exact descendant chains we will
+            // compose; sampled tracks overwrite their corresponding
+            // reference locals each step. Ancestors above Weapon are not
+            // needed: Weapon and every target are reconstructed in Weapon's
+            // parent frame, so those ancestors cancel by construction.
+            prepared.requiredBones[static_cast<std::size_t>(
+                prepared.weaponBoneIndex)] = 1;
             for (std::uint32_t targetIndex = 0;
                  targetIndex < prepared.targetCount;
                  ++targetIndex) {
@@ -1181,12 +1186,17 @@ namespace redux::weapon_animation_preharvest
                     }
                 }
 
+                const auto& weaponInParent = state.sampledLocals[
+                    static_cast<std::size_t>(clip.weaponBoneIndex)];
+                if (!isFiniteTransform(weaponInParent)) {
+                    return false;
+                }
+
                 for (std::uint32_t targetIndex = 0;
                      targetIndex < clip.targetCount;
                      ++targetIndex) {
                     const auto& target = clip.targets[targetIndex];
-                    RE::NiTransform weaponLocal =
-                        transform_math::makeIdentityTransform<RE::NiTransform>();
+                    RE::NiTransform partInWeaponParent = weaponInParent;
                     for (std::uint16_t chainIndex = 0;
                          chainIndex < target.chainCount;
                          ++chainIndex) {
@@ -1194,10 +1204,12 @@ namespace redux::weapon_animation_preharvest
                         if (bone < 0 || bone >= clip.boneCount) {
                             return false;
                         }
-                        weaponLocal = transform_math::composeTransforms(
-                            weaponLocal,
+                        partInWeaponParent = transform_math::composeTransforms(
+                            partInWeaponParent,
                             state.sampledLocals[static_cast<std::size_t>(bone)]);
                     }
+                    const auto weaponLocal = transform_math::relativeTransform(
+                        weaponInParent, partInWeaponParent);
                     if (!isFiniteTransform(weaponLocal)) {
                         return false;
                     }
@@ -1244,12 +1256,15 @@ namespace redux::weapon_animation_preharvest
                     fileName.size(), group.clipAnimationName.size() - 1);
                 std::memcpy(
                     group.clipAnimationName.data(), fileName.data(), copyCount);
-                RDX_LOG_DEBUG(Animation,
-                    "Authored preharvest extrema weapon={:08X} clip='{}' part='{}' samples={} minT=({:.3f},{:.3f},{:.3f}) maxT=({:.3f},{:.3f},{:.3f}) arc={:.3f}",
+                RDX_LOG_INFO(Animation,
+                    "Authored preharvest stage weapon={:08X} clip='{}' part='{}' samples={} window={}->{} peak={} restT=({:.3f},{:.3f},{:.3f}) extremeT=({:.3f},{:.3f},{:.3f}) arc={:.3f}",
                     state.job.weaponFormId,
                     fileName,
                     group.leaderBoneName.data(),
                     clip.sampleCount,
+                    group.sourceSampleStart,
+                    group.sourceSampleEnd,
+                    group.sourceSamplePeak,
                     group.leaderPath.keys.front().translate.x,
                     group.leaderPath.keys.front().translate.y,
                     group.leaderPath.keys.front().translate.z,

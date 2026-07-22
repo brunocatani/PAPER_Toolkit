@@ -2858,6 +2858,9 @@ namespace redux
             converted.trackSpace =
                 weapon_clip_stroke::AuthoredTrackSpace::WeaponRootLocal;
             converted.clipAnimationName = group.clipAnimationName;
+            converted.sourceSampleStart = group.sourceSampleStart;
+            converted.sourceSamplePeak = group.sourceSamplePeak;
+            converted.sourceSampleEnd = group.sourceSampleEnd;
             for (std::uint32_t follower = 0; follower < group.followerCount && follower < group.followers.size(); ++follower) {
                 const auto followerName = providerFixedStringView(
                     group.followers[follower].boneName.data(),

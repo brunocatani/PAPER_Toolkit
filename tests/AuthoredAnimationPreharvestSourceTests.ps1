@@ -36,6 +36,7 @@ Assert-Contains 'direct HKX resource load' $preharvest 'kLoadAnimationResource\s
 Assert-Contains 'native hka sampler slot' $preharvest 'kSampleTracksVtableSlot\s*=\s*5'
 Assert-Contains 'first-person exact subgraph selection' $preharvest 'selectFirstPersonGraph'
 Assert-Contains 'weapon hierarchy reconstruction' $preharvest 'buildBoneChainBelowAncestor'
+Assert-Contains 'per-sample Weapon-relative conversion' $preharvest 'relativeTransform\(\s*weaponInParent,\s*partInWeaponParent\s*\)'
 Assert-Contains 'incremental full-clip sampling' $preharvest 'kSamplesPerFrame\s*=\s*24'
 Assert-Contains 'exact source authority stamp' $preharvest 'AuthoredClipSource::ExactWeaponPreharvest'
 Assert-Contains 'weapon-root-local source stamp' $preharvest 'AuthoredTrackSpace::WeaponRootLocal'
