@@ -34,7 +34,7 @@ namespace redux
     struct ReduxConfig
     {
         bool enabled = true;
-        MotionPathMode motionPathMode = MotionPathMode::Hybrid;
+        MotionPathMode motionPathMode = MotionPathMode::AuthoredOnly;
         /*
          * Trigger selects the grip type on eligible parts, PER HAND: grab
          * alone is a normal ROCK authority/carry grab; that hand's trigger

@@ -8,6 +8,7 @@
 
 #include "api/ROCKProviderApi.h"
 #include "redux/MotionLibraryStore.h"
+#include "redux/WeaponAnimationPreharvest.h"
 #include "redux/WeaponClipMotionHarvest.h"
 #include "redux/WeaponClipStrokePolicy.h"
 #include "redux/WeaponPartDriveSandbox.h"
@@ -31,14 +32,13 @@ namespace redux
      *    weapon generation (unfiltered — the learner observes everything;
      *    grabbing alone is gated by the grip filter and the provider
      *    whitelist installed by the sandbox);
-     *  - motion observation: samples every cached part's weapon-root-local
-     *    pose each frame and feeds the learner; parts this runtime drove
-     *    within the last drive lease arrive untrusted so the learner never
-     *    records our own authority as animation evidence;
-     *  - clip harvest walk + drain: walks the weapon's animation graph
-     *    bindings, keeps the clip-activation hook targeted, and converts
-     *    drained rig-space stroke groups into weapon-root-local paths
-     *    (basis rotation, rotation-delta conjugation, provenance tiers);
+     *  - independent authored lane: loads the equipped instance's exact
+     *    first-person AnimationFileData off-screen, samples full clips, and
+     *    reconstructs Weapon-relative part paths without playback or hooks;
+     *  - learned lane: when selected, samples every cached part's live
+     *    weapon-root-local pose; our own recent drives arrive untrusted;
+     *  - legacy live clip harvest/scrub remains isolated to its explicit
+     *    non-authored modes and can never serve AuthoredOnly;
      *  - drive sandbox input: assembles grip/hand/part state from ROCK's
      *    grip-state API for the scrub-and-drive loop.
      *
@@ -60,7 +60,7 @@ namespace redux
         void shutdown();
 
         // Re-record mode (bResetLearnedPaths): wipe all learner-held motion
-        // data so reloads re-record under the current grouping settings.
+        // data; exact authored preharvest restarts for the equipped weapon.
         // Frame thread only; the revision bump re-resolves eligible parts.
         void wipeLearnedPaths();
 
@@ -109,6 +109,13 @@ namespace redux
              */
             bool restPoseValid{ false };
             weapon_part_motion_path::PoseSample restPose{};
+            float restScale{ 1.0f };
+            // Deterministic once-per-generation fallback captured when ROCK
+            // commits the assembled part set. A later stationary rest pose
+            // supersedes it; clip completion time never becomes the anchor.
+            bool generationAnchorValid{ false };
+            weapon_part_motion_path::PoseSample generationAnchorPose{};
+            float generationAnchorScale{ 1.0f };
             bool hasLastObserved{ false };
             weapon_part_motion_path::PoseSample lastObserved{};
             std::uint32_t stationaryFrames{ 0 };
@@ -142,10 +149,19 @@ namespace redux
          */
         void refreshEligibleParts(std::uint32_t weaponFormId);
         void observeWeaponPartMotion(RE::NiNode* weaponNode, std::uint64_t generationKey, std::uint32_t weaponFormId);
+        void updateAuthoredAnimationPreharvest(
+            RE::NiNode* weaponNode,
+            std::uint64_t generationKey,
+            std::uint32_t weaponFormId);
         void updateWeaponClipHarvestWalk(RE::NiNode* weaponNode, std::uint64_t generationKey, std::uint32_t weaponFormId);
         void drainWeaponClipHarvest(RE::NiNode* weaponNode, std::uint64_t generationKey, std::uint32_t weaponFormId);
         // Returns true when the drained batch filled the buffer (more queued).
         bool drainWeaponClipHarvestBatch(RE::NiNode* weaponNode, std::uint64_t generationKey, std::uint32_t weaponFormId);
+        void adoptWeaponClipHarvestBatch(
+            RE::NiNode* weaponNode,
+            std::uint64_t generationKey,
+            std::uint32_t weaponFormId,
+            std::uint32_t groupCount);
         void updateWeaponPartDriveSandbox(
             RE::NiNode* weaponNode,
             std::uint64_t generationKey,
@@ -288,6 +304,10 @@ namespace redux
         std::array<PendingCaptureGap, 16> _pendingCaptureGaps{};
 
         bool _active{ false };
+        // True only while AuthoredOnly owns the independent off-screen
+        // preharvest lane. Used to make mode transitions one-shot cleanup,
+        // never a per-frame hook/queue operation.
+        bool _authoredPreharvestModeActive{ false };
         std::uint32_t _lastClipHarvestWeaponFormId{ 0 };
         std::uint64_t _clipHarvestWalkGenerationKey{ 0 };
         std::uint32_t _clipHarvestWalkAttempts{ 0 };

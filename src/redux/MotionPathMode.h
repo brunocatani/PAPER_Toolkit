@@ -6,31 +6,25 @@
 namespace redux
 {
     /*
-     * Which stored motion-path source may DRIVE a grabbed part. Selection
-     * happens at lookup time only: collection is always unrestricted (the
-     * learner records every part and the harvest keeps extracting clips in
-     * every mode), so switching modes via INI hot reload takes effect
-     * immediately with whatever data both sources have accumulated.
+     * Which independent motion source may DRIVE a grabbed part. There is no
+     * mixed/hybrid selector: exact authored data can never silently fall back
+     * to runtime-learned observations, and learned mode never consumes an
+     * authored path.
      */
     enum class MotionPathMode : std::uint8_t
     {
-        // Learned paths outrank authored clip strokes; authored bootstraps
-        // parts the player has not taught yet (the original behavior).
-        Hybrid = 0,
-        // Only clip-harvested strokes drive parts.
-        AuthoredOnly = 1,
+        // Only exact equipped-weapon animation preharvest drives parts.
+        AuthoredOnly = 0,
         // Only runtime-learned paths drive parts.
-        LearnedOnly = 2,
+        LearnedOnly = 1,
         /*
          * Clip scrub: the hand drives the live reload CLIP's time (Havok
          * user-controlled mode on the captured hkbClipGenerator) and the
          * ENGINE poses every part — no stored path geometry is replayed.
-         * Stored paths are still consulted for their EXISTENCE only (the
-         * "must move" eligibility gate uses a Hybrid lookup), never for
-         * drive-time data, so this mode is immune to the authored basis
-         * conversion. Learned/authored collection keeps running.
+         * Stored paths are consulted only for their EXISTENCE by the
+         * eligibility gate, never as drive-time geometry.
          */
-        ClipScrub = 3,
+        ClipScrub = 2,
     };
 
     [[nodiscard]] inline constexpr const char* motionPathModeName(MotionPathMode mode)
@@ -42,9 +36,8 @@ namespace redux
             return "learned";
         case MotionPathMode::ClipScrub:
             return "scrub";
-        case MotionPathMode::Hybrid:
         default:
-            return "hybrid";
+            return "authored";
         }
     }
 
@@ -64,10 +57,6 @@ namespace redux
             }
             return true;
         };
-        if (equalsIgnoreCase(text, "hybrid")) {
-            outMode = MotionPathMode::Hybrid;
-            return true;
-        }
         if (equalsIgnoreCase(text, "authored")) {
             outMode = MotionPathMode::AuthoredOnly;
             return true;

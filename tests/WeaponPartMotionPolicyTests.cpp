@@ -1,5 +1,7 @@
 #include "redux/MotionLibraryFormat.h"
 #include "redux/RichMotionCaptureFormat.h"
+#include "redux/TransformMath.h"
+#include "redux/WeaponAnimationPreharvestPolicy.h"
 #include "redux/WeaponClipStrokePolicy.h"
 #include "redux/WeaponPartEligibility.h"
 #include "redux/WeaponPartMotionLearner.h"
@@ -64,6 +66,25 @@ namespace
         bool candidateValid{ false };
     };
 
+    struct TestVector
+    {
+        float x{ 0.0f };
+        float y{ 0.0f };
+        float z{ 0.0f };
+    };
+
+    struct TestMatrix
+    {
+        float entry[3][4]{};
+    };
+
+    struct TestTransform
+    {
+        TestMatrix rotate{};
+        TestVector translate{};
+        float scale{ 1.0f };
+    };
+
     void captureRawSummary(const redux::WeaponPartMotionLearner::RawCaptureView& capture, void* context)
     {
         auto& summary = *static_cast<CapturedRawSummary*>(context);
@@ -88,6 +109,86 @@ namespace
 int main()
 {
     bool ok = true;
+
+    {
+        using namespace redux;
+        using namespace redux::weapon_animation_preharvest_policy;
+
+        MotionPathMode parsed = MotionPathMode::LearnedOnly;
+        ok &= expectFalse("removed hybrid mode cannot be parsed",
+            parseMotionPathMode("hybrid", parsed));
+        ok &= expectTrue("authored mode parses independently",
+            parseMotionPathMode("AUTHORED", parsed) &&
+                parsed == MotionPathMode::AuthoredOnly);
+
+        ok &= expectTrue("first-person graph selection is fixed at index one",
+            selectFirstPersonGraph(2, 2).valid &&
+                selectFirstPersonGraph(2, 2).graphIndex == 1);
+        ok &= expectFalse("missing first-person graph fails closed",
+            selectFirstPersonGraph(1, 2).valid);
+        ok &= expectTrue("ready resource states expose native data",
+            animationResourceCanExposeData(3u << 28) &&
+                animationResourceCanExposeData(4u << 28));
+        ok &= expectFalse("pending resource state exposes no data",
+            animationResourceCanExposeData(2u << 28));
+        ok &= expectEqual("one-second clip samples at 120 Hz including endpoints",
+            clipSampleCount(1.0f), 121u);
+        ok &= expectEqual("long clip sampling is bounded",
+            clipSampleCount(100.0f), kMaximumClipSamples);
+        ok &= expectTrue("sample time reaches the exact clip endpoint",
+            std::abs(clipSampleTime(2.0f, 120, 121) - 2.0f) < 0.0001f);
+        ok &= expectTrue("scene instance suffix does not break bone matching",
+            boneNameMatchesSceneNode("WeaponMagazine", "weaponmagazine:12"));
+
+        std::array<std::int16_t, 4> mapping{};
+        const std::array<std::int16_t, 3> explicitMap{ 3, 1, 2 };
+        ok &= expectTrue("explicit hka track map is preserved",
+            buildTrackToBoneMap(3, 4, explicitMap, {}, {}, mapping) &&
+                mapping[0] == 3 && mapping[1] == 1 && mapping[2] == 2);
+        const std::array<std::uint16_t, 1> partitionIndices{ 0 };
+        const std::array<SkeletonPartition, 1> partitions{
+            SkeletonPartition{ .startBone = 1, .boneCount = 3 }
+        };
+        ok &= expectTrue("partition hka track map expands in bone order",
+            buildTrackToBoneMap(
+                3, 4, {}, partitionIndices, partitions, mapping) &&
+                mapping[0] == 1 && mapping[1] == 2 && mapping[2] == 3);
+        ok &= expectFalse("truncated explicit hka map fails as a unit",
+            buildTrackToBoneMap(
+                4, 4, explicitMap, {}, {}, mapping));
+        ok &= expectFalse("partial mapless animation cannot assume identity",
+            buildTrackToBoneMap(
+                3, 4, {}, {}, {}, mapping));
+
+        const std::array<std::int16_t, 6> parents{ -1, 0, 1, 2, 1, 4 };
+        std::array<std::int16_t, 6> chain{};
+        const auto chainCount = buildBoneChainBelowAncestor(5, 1, parents, chain);
+        ok &= expectTrue("weapon-relative bone chain is root-to-target",
+            chainCount == 2 && chain[0] == 4 && chain[1] == 5);
+        ok &= expectEqual("unrelated bone is rejected",
+            buildBoneChainBelowAncestor(0, 1, parents, chain), 0u);
+
+        auto sourceFirst =
+            transform_math::makeIdentityTransform<TestTransform>();
+        sourceFirst.translate = { 10.0f, 2.0f, -3.0f };
+        auto sourceKey = sourceFirst;
+        sourceKey.translate.x += 3.0f;
+        auto liveAnchor =
+            transform_math::makeIdentityTransform<TestTransform>();
+        liveAnchor.translate = { 100.0f, 20.0f, 30.0f };
+        const auto rebased = transform_math::rebaseParentFrameMotion(
+            sourceFirst, sourceKey, liveAnchor);
+        ok &= expectTrue("exact animation parent delta rebases onto live rest",
+            std::abs(rebased.translate.x - 103.0f) < 0.0001f &&
+                std::abs(rebased.translate.y - 20.0f) < 0.0001f &&
+                std::abs(rebased.translate.z - 30.0f) < 0.0001f);
+        const auto rebasedRest = transform_math::rebaseParentFrameMotion(
+            sourceFirst, sourceFirst, liveAnchor);
+        ok &= expectTrue("exact animation key zero preserves live rest",
+            std::abs(rebasedRest.translate.x - liveAnchor.translate.x) < 0.0001f &&
+                std::abs(rebasedRest.translate.y - liveAnchor.translate.y) < 0.0001f &&
+                std::abs(rebasedRest.translate.z - liveAnchor.translate.z) < 0.0001f);
+    }
 
     {
         using namespace redux::weapon_part_motion_path;
@@ -276,7 +377,7 @@ int main()
         magTrack.sampleCount = kClipSampleCount;
         ejectorTrack.sampleCount = kClipSampleCount;
 
-        std::array<AuthoredStrokeGroup, kMaxGroupsPerClip> groups{};
+        std::array<AuthoredStrokeGroup, 4> groups{};
         const auto groupCount = buildAuthoredGroups(
             clipTracks.data(),
             static_cast<std::uint32_t>(clipTracks.size()),
@@ -315,9 +416,9 @@ int main()
     }
 
     {
-        // Dual-source storage + mode selection: authored and learned records
-        // must coexist per part, with the MotionPathMode picking the serving
-        // source at lookup time only.
+        // Independent source storage: authored and learned records coexist,
+        // but there is no hybrid lookup and AuthoredOnly serves exact
+        // equipped-weapon preharvest data exclusively.
         using namespace redux;
         using redux::weapon_part_motion_path::PoseSample;
         using redux::weapon_part_motion_path::Vec3;
@@ -336,14 +437,10 @@ int main()
         }
         fallbackGroup.leaderPath.totalArcLength = 4.0f;
         fallbackGroup.leaderPath.valid = true;
-        learner.storeAuthoredGroup({ kWeapon, 0, kPart }, fallbackGroup, true);
+        learner.storeAuthoredGroup({ kWeapon, 0, kPart }, fallbackGroup);
 
-        ok &= expectTrue("authored-only serves the fallback stroke",
-            learner.findPath({ kWeapon, 0, kPart }, MotionPathMode::AuthoredOnly) != nullptr);
-        ok &= expectTrue("hybrid serves authored while nothing is learned",
-            learner.findGroup({ kWeapon, 0, kPart }, MotionPathMode::Hybrid).authored);
-        ok &= expectTrue("hybrid reports the fallback tier",
-            learner.findGroup({ kWeapon, 0, kPart }, MotionPathMode::Hybrid).fallbackSource);
+        ok &= expectTrue("authored-only rejects loaded fallback evidence",
+            learner.findPath({ kWeapon, 0, kPart }, MotionPathMode::AuthoredOnly) == nullptr);
         ok &= expectTrue("learned-only has nothing before learning",
             learner.findPath({ kWeapon, 0, kPart }, MotionPathMode::LearnedOnly) == nullptr);
 
@@ -353,17 +450,31 @@ int main()
             activatedGroup.leaderPath.keys[key].translate.y *= 0.75f;
         }
         activatedGroup.leaderPath.totalArcLength = 3.0f;
-        activatedGroup.activatedClip = true;
-        learner.storeAuthoredGroup({ kWeapon, 0, kPart }, activatedGroup, false);
+        activatedGroup.source = weapon_clip_stroke::AuthoredClipSource::ActivatedClip;
+        learner.storeAuthoredGroup({ kWeapon, 0, kPart }, activatedGroup);
+        ok &= expectTrue("authored-only rejects activation-era evidence",
+            learner.findPath({ kWeapon, 0, kPart }, MotionPathMode::AuthoredOnly) == nullptr);
+
+        // Exact preharvest outranks both legacy tiers even when its stroke is
+        // shorter, then becomes the only authored-serving record.
+        weapon_clip_stroke::AuthoredStrokeGroup exactGroup = activatedGroup;
+        for (std::uint32_t key = 0; key < weapon_part_motion_path::kResampledKeyCount; ++key) {
+            exactGroup.leaderPath.keys[key].translate.y *= 0.5f;
+        }
+        exactGroup.leaderPath.totalArcLength = 1.5f;
+        exactGroup.source = weapon_clip_stroke::AuthoredClipSource::ExactWeaponPreharvest;
+        exactGroup.trackSpace = weapon_clip_stroke::AuthoredTrackSpace::WeaponRootLocal;
+        learner.storeAuthoredGroup({ kWeapon, 0, kPart }, exactGroup);
         {
             const auto view = learner.findGroup({ kWeapon, 0, kPart }, MotionPathMode::AuthoredOnly);
-            ok &= expectTrue("activated stroke replaces the fallback tier", view.leaderPath && !view.fallbackSource);
-            ok &= expectTrue("activated stroke arc stored",
-                view.leaderPath && std::abs(view.leaderPath->totalArcLength - 3.0f) < 0.01f);
+            ok &= expectTrue("exact preharvest replaces both legacy tiers", view.leaderPath && !view.fallbackSource);
+            ok &= expectTrue("exact preharvest arc stored",
+                view.leaderPath && std::abs(view.leaderPath->totalArcLength - 1.5f) < 0.01f);
         }
-        // ...and a later fallback store never demotes it.
-        learner.storeAuthoredGroup({ kWeapon, 0, kPart }, fallbackGroup, true);
-        ok &= expectFalse("fallback store cannot demote an activated stroke",
+        // Lower-authority evidence never demotes the exact record.
+        learner.storeAuthoredGroup({ kWeapon, 0, kPart }, fallbackGroup);
+        learner.storeAuthoredGroup({ kWeapon, 0, kPart }, activatedGroup);
+        ok &= expectFalse("legacy store cannot demote exact preharvest",
             learner.findGroup({ kWeapon, 0, kPart }, MotionPathMode::AuthoredOnly).fallbackSource);
 
         // OMOD identity isolation: two parts sharing a node name but owned
@@ -372,9 +483,9 @@ int main()
         // ITS OWN data or none, never a lookalike's.
         constexpr std::uint32_t kOmodA = 0x00112233;
         constexpr std::uint32_t kOmodB = 0x00445566;
-        weapon_clip_stroke::AuthoredStrokeGroup omodAGroup = fallbackGroup;
+        weapon_clip_stroke::AuthoredStrokeGroup omodAGroup = exactGroup;
         omodAGroup.leaderPath.totalArcLength = 6.0f;
-        learner.storeAuthoredGroup({ kWeapon, kOmodA, kPart }, omodAGroup, false);
+        learner.storeAuthoredGroup({ kWeapon, kOmodA, kPart }, omodAGroup);
         ok &= expectTrue("omod-keyed record found under its own key",
             learner.findPath({ kWeapon, kOmodA, kPart }, MotionPathMode::AuthoredOnly) != nullptr);
         ok &= expectTrue("different omod, same name: no data served",
@@ -383,7 +494,7 @@ int main()
             // The omod-A store must not have touched the base (omod 0) record.
             const auto baseView = learner.findGroup({ kWeapon, 0, kPart }, MotionPathMode::AuthoredOnly);
             ok &= expectTrue("base-key record untouched by omod-keyed store",
-                baseView.leaderPath && std::abs(baseView.leaderPath->totalArcLength - 3.0f) < 0.01f);
+                baseView.leaderPath && std::abs(baseView.leaderPath->totalArcLength - 1.5f) < 0.01f);
         }
 
         // Teach a learned stroke through real observations.
@@ -426,9 +537,7 @@ int main()
             const auto authoredView = learner.findGroup({ kWeapon, 0, kPart }, MotionPathMode::AuthoredOnly);
             ok &= expectTrue("authored record survives learning", authoredView.leaderPath != nullptr);
             ok &= expectTrue("authored-only still serves the authored stroke",
-                authoredView.leaderPath && std::abs(authoredView.leaderPath->totalArcLength - 3.0f) < 0.01f);
-            const auto hybridView = learner.findGroup({ kWeapon, 0, kPart }, MotionPathMode::Hybrid);
-            ok &= expectTrue("hybrid now serves the learned stroke", hybridView.leaderPath && !hybridView.authored);
+                authoredView.leaderPath && std::abs(authoredView.leaderPath->totalArcLength - 1.5f) < 0.01f);
             const auto availability = learner.sourceAvailability({ kWeapon, 0, kPart });
             ok &= expectTrue("availability reports both sources", availability.learned && availability.authored);
         }
@@ -440,14 +549,23 @@ int main()
             biggerActivated.leaderPath.keys[key].translate.y *= 2.0f;
         }
         biggerActivated.leaderPath.totalArcLength = 6.0f;
-        learner.storeAuthoredGroup({ kWeapon, 0, kPart }, biggerActivated, false);
+        learner.storeAuthoredGroup({ kWeapon, 0, kPart }, biggerActivated);
         ok &= expectTrue("learned record survives an authored update",
             learner.findPath({ kWeapon, 0, kPart }, MotionPathMode::LearnedOnly) != nullptr);
         {
             const auto authoredView = learner.findGroup({ kWeapon, 0, kPart }, MotionPathMode::AuthoredOnly);
-            ok &= expectTrue("larger same-tier authored stroke replaced the stored one",
-                authoredView.leaderPath && std::abs(authoredView.leaderPath->totalArcLength - 6.0f) < 0.01f);
+            ok &= expectTrue("larger legacy stroke cannot replace exact preharvest",
+                authoredView.leaderPath && std::abs(authoredView.leaderPath->totalArcLength - 1.5f) < 0.01f);
         }
+        auto biggerExact = biggerActivated;
+        biggerExact.source = weapon_clip_stroke::AuthoredClipSource::ExactWeaponPreharvest;
+        biggerExact.trackSpace = weapon_clip_stroke::AuthoredTrackSpace::WeaponRootLocal;
+        learner.storeAuthoredGroup({ kWeapon, 0, kPart }, biggerExact);
+        const auto* biggerExactPath =
+            learner.findPath({ kWeapon, 0, kPart }, MotionPathMode::AuthoredOnly);
+        ok &= expectTrue("larger exact stroke replaces same-tier exact data",
+            biggerExactPath &&
+                std::abs(biggerExactPath->totalArcLength - 6.0f) < 0.01f);
 
         // Learned co-movement followers must carry the follower's OBSERVED
         // weapon-local scale: drives restate scale, and a hard-coded 1
@@ -782,8 +900,9 @@ int main()
         }
         group.leaderPath.totalArcLength = 4.6f;
         group.leaderPath.valid = true;
-        group.activatedClip = true;
-        source.storeAuthoredGroup({ kWeapon, kOmod, kPart }, group, false);
+        group.source = weapon_clip_stroke::AuthoredClipSource::ExactWeaponPreharvest;
+        group.trackSpace = weapon_clip_stroke::AuthoredTrackSpace::WeaponRootLocal;
+        source.storeAuthoredGroup({ kWeapon, kOmod, kPart }, group);
 
         std::array<WeaponPartMotionLearner::RecordView, WeaponPartMotionLearner::kMaxStoredPaths> records{};
         const auto exported = source.exportWeaponRecords(kWeapon, records.data(),
@@ -798,7 +917,11 @@ int main()
             ok &= expectTrue("import seeds an empty learner",
                 destination.importRecord({ kWeapon, kOmod, kPart }, records[0]));
             const auto* imported = destination.findPath({ kWeapon, kOmod, kPart }, MotionPathMode::AuthoredOnly);
-            ok &= expectTrue("imported path serves under the same key",
+            ok &= expectTrue("persisted authored data waits for exact revalidation",
+                imported == nullptr);
+            destination.storeAuthoredGroup({ kWeapon, kOmod, kPart }, group);
+            imported = destination.findPath({ kWeapon, kOmod, kPart }, MotionPathMode::AuthoredOnly);
+            ok &= expectTrue("exact preharvest revalidation enables authored serving",
                 imported && std::abs(imported->totalArcLength - 4.6f) < 0.001f);
 
             // A second import against now-populated records applies nothing.

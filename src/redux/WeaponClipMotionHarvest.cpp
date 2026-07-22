@@ -1469,7 +1469,10 @@ namespace redux::weapon_clip_motion_harvest
             // Provenance travels with each group: activation strokes are the
             // weapon's own animation; walk strokes are loaded-set fallback.
             for (std::uint32_t i = 0; i < groupCount; ++i) {
-                groups[i].activatedClip = fromActivation;
+                groups[i].source = fromActivation
+                    ? weapon_clip_stroke::AuthoredClipSource::ActivatedClip
+                    : weapon_clip_stroke::AuthoredClipSource::LoadedGraphFallback;
+                groups[i].trackSpace = weapon_clip_stroke::AuthoredTrackSpace::RigBoneLocal;
                 groups[i].clipAnimationName = {};
                 if (clipAnimationName) {
                     std::size_t length = 0;
@@ -1491,9 +1494,10 @@ namespace redux::weapon_clip_motion_harvest
                      * fallback group instead of dropping the activated one.
                      */
                     bool evicted = false;
-                    if (groups[i].activatedClip) {
+                    if (groups[i].source == weapon_clip_stroke::AuthoredClipSource::ActivatedClip) {
                         for (std::uint32_t slot = 0; slot < s_queueCount; ++slot) {
-                            if (!s_queue[slot].activatedClip) {
+                            if (s_queue[slot].source ==
+                                weapon_clip_stroke::AuthoredClipSource::LoadedGraphFallback) {
                                 s_queue[slot] = groups[i];
                                 s_groupsQueued.fetch_add(1, std::memory_order_relaxed);
                                 evicted = true;

@@ -495,7 +495,7 @@ namespace redux
                     seeded.arcPosition,
                     group.leaderPath->totalArcLength,
                     motionPathModeName(session.mode),
-                    !group.authored ? "runtime-learned" : (group.fallbackSource ? "authored-fallback" : "authored-clip"),
+                    !group.authored ? "runtime-learned" : "authored-exact",
                     session.followerCount,
                     session.followerCount - keptCount,
                     group.returnPath != nullptr,

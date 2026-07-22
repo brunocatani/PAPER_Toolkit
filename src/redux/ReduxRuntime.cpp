@@ -4,6 +4,8 @@
 #include "ReduxLog.h"
 #include "redux/EngineShellEject.h"
 #include "redux/TransformMath.h"
+#include "redux/WeaponAnimationPreharvest.h"
+#include "redux/WeaponAnimationPreharvestPolicy.h"
 #include "redux/WeaponClipMotionHarvest.h"
 #include "redux/WeaponPartEligibility.h"
 #include "redux/WeaponPartMotionScrubPolicy.h"
@@ -134,6 +136,27 @@ namespace redux
             return pose;
         }
 
+        [[nodiscard]] RE::NiTransform niTransformFromPose(
+            const weapon_part_motion_path::PoseSample& pose)
+        {
+            RE::NiTransform transform =
+                transform_math::makeIdentityTransform<RE::NiTransform>();
+            transform.translate = {
+                pose.translate.x,
+                pose.translate.y,
+                pose.translate.z,
+            };
+            const float quaternion[4]{
+                pose.rotate.x,
+                pose.rotate.y,
+                pose.rotate.z,
+                pose.rotate.w,
+            };
+            transform.rotate =
+                transform_math::havokQuaternionToNiRows<RE::NiMatrix3>(quaternion);
+            return transform;
+        }
+
         [[nodiscard]] std::string rootRelativeNodePath(RE::NiAVObject* root, RE::NiAVObject* target)
         {
             if (!root || !target) {
@@ -220,13 +243,8 @@ namespace redux
             if (!nodeName) {
                 return false;
             }
-            const std::string_view nodeView{ nodeName };
-            if (nodeView == boneName) {
-                return true;
-            }
-            return nodeView.size() > boneName.size() &&
-                   nodeView.compare(0, boneName.size(), boneName) == 0 &&
-                   nodeView[boneName.size()] == ':';
+            return weapon_animation_preharvest_policy::boneNameMatchesSceneNode(
+                boneName, std::string_view{ nodeName });
         }
 
         [[nodiscard]] RE::NiAVObject* findWeaponNodeByBoneName(RE::NiAVObject* root, std::string_view boneName, int maxDepth)
@@ -350,6 +368,28 @@ namespace redux
             const void* _manager{ nullptr };
         };
 
+        void appendUniqueSceneNodeName(
+            const char* name,
+            const char** outNames,
+            const std::uint32_t maxNames,
+            std::uint32_t& count)
+        {
+            if (!name || name[0] == '\0' || !outNames || count >= maxNames) {
+                return;
+            }
+            const auto normalized =
+                weapon_animation_preharvest_policy::withoutSceneInstanceSuffix(
+                    std::string_view{ name });
+            for (std::uint32_t index = 0; index < count; ++index) {
+                if (outNames[index] &&
+                    weapon_animation_preharvest_policy::boneNameMatchesSceneNode(
+                        normalized, std::string_view{ outNames[index] })) {
+                    return;
+                }
+            }
+            outNames[count++] = name;
+        }
+
         // Collect the names of every node strictly under `root` (the root
         // itself carries whole-weapon motion and is excluded). Non-owning
         // pointers into the nodes' names; valid only within the frame.
@@ -363,9 +403,8 @@ namespace redux
             if (!object || count >= maxNames || maxDepth < 0) {
                 return;
             }
-            if (const char* name = object->name.c_str(); name && name[0] != '\0') {
-                outNames[count++] = name;
-            }
+            appendUniqueSceneNodeName(
+                object->name.c_str(), outNames, maxNames, count);
             auto* node = object->IsNode();
             if (!node) {
                 return;
@@ -385,19 +424,42 @@ namespace redux
         }
         ageDrivenPartLeases();
         _lastRockFrameIndex = snapshot.frameIndex;
+        const bool authoredMode =
+            g_reduxConfig.motionPathMode == MotionPathMode::AuthoredOnly;
+        if (authoredMode && !_authoredPreharvestModeActive) {
+            // Authored is an independent offline lane. Purge every live-clip
+            // producer/target before starting it; no activation, update, or
+            // scrub callback is required to discover the weapon's files.
+            weapon_clip_motion_harvest::setRichCaptureEnabled(false);
+            weapon_clip_motion_harvest::setClipScrubCaptureConfig(false, nullptr);
+            weapon_clip_motion_harvest::endClipScrubSession();
+            weapon_clip_motion_harvest::clearPending();
+            weapon_clip_motion_harvest::resetWalk();
+            weapon_clip_motion_harvest::clearClipActivationTargets();
+            weapon_animation_preharvest::reset();
+            _learner.resetRecorders(rich_capture::StrokeTermination::CaptureDisabled);
+            _authoredPreharvestModeActive = true;
+            RDX_LOG_INFO(Weapon,
+                "AuthoredOnly entered: exact off-screen weapon-animation preharvest active; live clip harvest/scrub disabled");
+        } else if (!authoredMode && _authoredPreharvestModeActive) {
+            weapon_animation_preharvest::reset();
+            _authoredPreharvestModeActive = false;
+        }
         updateRichCaptureState(snapshot);
 
-        // Keep the sweep probe's view of the INI fresh across hot reloads;
-        // one uncontended lock and a small copy per frame.
+        // Live clip time control is isolated to the explicit ClipScrub mode;
+        // AuthoredOnly never arms or installs this interception path.
+        const bool clipScrubMode =
+            g_reduxConfig.motionPathMode == MotionPathMode::ClipScrub;
         weapon_clip_motion_harvest::setScrubSweepConfig(
-            g_reduxConfig.clipScrubSweepTest,
+            clipScrubMode && g_reduxConfig.clipScrubSweepTest,
             g_reduxConfig.clipScrubSweepSeconds,
             g_reduxConfig.clipScrubSweepClipFilter.c_str());
         // Scrub mode arms the session capture: the next activating clip
         // matching the filter freezes and waits for a hand. Same filter as
         // the sweep probe (the probe wins when both are enabled).
         weapon_clip_motion_harvest::setClipScrubCaptureConfig(
-            g_reduxConfig.motionPathMode == MotionPathMode::ClipScrub,
+            clipScrubMode,
             g_reduxConfig.clipScrubSweepClipFilter.c_str());
 
         auto* weaponNode = reinterpret_cast<RE::NiNode*>(snapshot.weaponNode);
@@ -417,14 +479,20 @@ namespace redux
         updateMotionLibrary(weaponFormId);
         observeWeaponPartMotion(weaponNode, generationKey, weaponFormId);
         drainRichClipCaptures(generationKey, weaponFormId, snapshot.frameIndex);
-        drainWeaponClipHarvest(weaponNode, generationKey, weaponFormId);
-        updateWeaponClipHarvestWalk(weaponNode, generationKey, weaponFormId);
+        if (authoredMode) {
+            updateAuthoredAnimationPreharvest(
+                weaponNode, generationKey, weaponFormId);
+        } else {
+            drainWeaponClipHarvest(weaponNode, generationKey, weaponFormId);
+            updateWeaponClipHarvestWalk(weaponNode, generationKey, weaponFormId);
+        }
         updateWeaponPartDriveSandbox(weaponNode, generationKey, weaponFormId, snapshot);
     }
 
     void ReduxRuntime::updateRichCaptureState(const rock::provider::RockProviderFrameSnapshot& snapshot)
     {
-        const bool wanted = g_reduxConfig.motionLibrary && !g_reduxConfig.motionLibraryReadOnly &&
+        const bool wanted = g_reduxConfig.motionPathMode != MotionPathMode::AuthoredOnly &&
+            g_reduxConfig.motionLibrary && !g_reduxConfig.motionLibraryReadOnly &&
             g_reduxConfig.richMotionCapture;
         const bool recorderGenerationChanged = snapshot.weaponFormId != _recorderWeaponFormId ||
             snapshot.weaponGenerationKey != _recorderGenerationKey;
@@ -1536,6 +1604,7 @@ namespace redux
     void ReduxRuntime::wipeLearnedPaths()
     {
         _learner.reset();
+        weapon_animation_preharvest::reset();
         std::uint32_t deletedFiles = 0;
         if (g_reduxConfig.motionLibrary) {
             deletedFiles = _libraryStore.deleteAllExceptCurated();
@@ -1547,12 +1616,16 @@ namespace redux
         _libraryWeaponRef = {};
         _libraryStableFrames = 0;
         RDX_LOG_INFO(Weapon,
-            "Learned motion data WIPED (bResetLearnedPaths) — {} library file(s) deleted (curated kept); reloads re-record from scratch, authored strokes re-harvest on the next equip/clip playback",
+            "Motion data WIPED (bResetLearnedPaths) — {} library file(s) deleted (curated kept); learned paths re-record and exact authored animations preharvest again for the equipped weapon",
             deletedFiles);
     }
 
     void ReduxRuntime::shutdown()
     {
+        // Release the direct HKX handle before tearing down any consumer or
+        // writer state; Bethesda resource ownership is confined to the frame
+        // thread and never survives runtime shutdown.
+        weapon_animation_preharvest::reset();
         // Preserve partial raw evidence and graph-thread clip packets before
         // the writer is drained and before any recorder/queue storage dies.
         if (_richCaptureActive) {
@@ -1639,6 +1712,7 @@ namespace redux
         _richCaptureSessionId.clear();
         _richCaptureSequence = 0;
         _pendingCaptureGaps = {};
+        _authoredPreharvestModeActive = false;
         _active = false;
     }
 
@@ -1805,6 +1879,24 @@ namespace redux
                     parent = parent->parent;
                 }
             }
+
+            const auto weaponWorldInverse =
+                transform_math::invertTransform(weaponNode->world);
+            for (std::uint32_t i = 0; i < _drivePartCache.count; ++i) {
+                auto& entry = _drivePartCache.entries[i];
+                if (!entry.node ||
+                    !nodeContainsNode(weaponNode, entry.node, 64)) {
+                    continue;
+                }
+                const auto weaponLocal = transform_math::composeTransforms(
+                    weaponWorldInverse, entry.node->world);
+                if (!finiteNiTransform(weaponLocal)) {
+                    continue;
+                }
+                entry.generationAnchorPose = poseFromNiTransform(weaponLocal);
+                entry.generationAnchorScale = weaponLocal.scale;
+                entry.generationAnchorValid = true;
+            }
         }
 
         if (sawCurrentGeneration) {
@@ -1850,17 +1942,6 @@ namespace redux
             length += name.size();
         };
 
-        /*
-         * ClipScrub drives no stored geometry, but the "must move" gate
-         * still applies — under a HYBRID lookup: any source's mere
-         * EXISTENCE (learned or authored, however broken authored's
-         * conversion is) proves the animation moves this part, so static
-         * receivers keep their normal grip in scrub mode too.
-         */
-        const auto eligibilityLookupMode = g_reduxConfig.motionPathMode == MotionPathMode::ClipScrub
-            ? MotionPathMode::Hybrid
-            : g_reduxConfig.motionPathMode;
-
         if (cacheGeneration != 0 && weaponFormId != 0) {
             const auto& allowList = g_reduxConfig.attachOnlyParts;
             for (std::uint32_t i = 0; i < _drivePartCache.count; ++i) {
@@ -1879,9 +1960,21 @@ namespace redux
                 // "Must move": without a motion path under the active mode
                 // the part is not attach-only and not grouped — it keeps its
                 // normal grip even though its class is allowlisted.
-                if (!_learner.findPath(
-                        WeaponPartMotionLearner::PartKey{ weaponFormId, entry.omodFormId, sourceName },
-                        eligibilityLookupMode)) {
+                const WeaponPartMotionLearner::PartKey partKey{
+                    weaponFormId, entry.omodFormId, sourceName
+                };
+                bool hasMotionPath = false;
+                if (g_reduxConfig.motionPathMode == MotionPathMode::ClipScrub) {
+                    // ClipScrub does not replay either store. Any recorded
+                    // source can prove only that the part moves; this is an
+                    // explicit existence query, not a removed hybrid drive.
+                    const auto available = _learner.sourceAvailability(partKey);
+                    hasMotionPath = available.learned || available.authored;
+                } else {
+                    hasMotionPath =
+                        _learner.findPath(partKey, g_reduxConfig.motionPathMode) != nullptr;
+                }
+                if (!hasMotionPath) {
                     appendName(unmappedNames, unmappedLength, sourceName);
                     ++unmappedCount;
                     continue;
@@ -1943,6 +2036,8 @@ namespace redux
         const bool hasScrubClipContext = !hasRichClipContext && scrubClipContext.active &&
             scrubClipContext.weaponFormId == weaponFormId &&
             scrubClipContext.weaponGenerationKey == generationKey;
+        const bool collectLearnedMotion =
+            g_reduxConfig.motionPathMode != MotionPathMode::AuthoredOnly;
         // Hot-reloadable grouping/staging tuning; cheap by-value refresh so
         // an INI change applies to the very next completed stroke.
         _learner.setGroupingTuning(WeaponPartMotionLearner::GroupingTuning{
@@ -1954,7 +2049,9 @@ namespace redux
         });
         // Frame-align every recorder before this frame's observations so
         // concurrent recordings can be compared for co-movement grouping.
-        _learner.beginObservationFrame();
+        if (collectLearnedMotion) {
+            _learner.beginObservationFrame();
+        }
         for (std::uint32_t i = 0; i < _drivePartCache.count; ++i) {
             auto& entry = _drivePartCache.entries[i];
             if (!entry.node || !nodeContainsNode(weaponNode, entry.node, 64)) {
@@ -1969,49 +2066,51 @@ namespace redux
                 continue;
             }
             const auto pose = poseFromNiTransform(partWeaponLocal);
-            _learner.observe(WeaponPartMotionLearner::Observation{
-                .weaponFormId = weaponFormId,
-                .omodFormId = entry.omodFormId,
-                .sourceName = providerFixedStringView(entry.sourceName.data(), entry.sourceName.size()),
-                .pose = pose,
-                .scale = partWeaponLocal.scale,
-                .trusted = !driven,
-                .rockFrameIndex = _lastRockFrameIndex,
-                .weaponGenerationKey = generationKey,
-                .catalogPartId = entry.catalogPartId,
-                .bodyId = entry.bodyId,
-                .nodePath = providerFixedStringView(entry.nodePath.data(), entry.nodePath.size()),
-                .nodePathTruncated = entry.nodePathTruncated,
-                .clipActivityId = hasRichClipContext
-                    ? richClipContext.activityId
-                    : 0,
-                .clipScrubSessionId = hasScrubClipContext ? scrubClipContext.sessionId : 0,
-                .clipConcurrentActivityCount = hasRichClipContext
-                    ? richClipContext.concurrentActivityCount
-                    : (hasScrubClipContext ? 1u : 0u),
-                .clipFraction = hasRichClipContext
-                    ? richClipContext.fraction
-                    : (hasScrubClipContext ? scrubClipContext.fraction : 0.0f),
-                .clipLocalTimeSeconds = hasRichClipContext
-                    ? richClipContext.localTimeSeconds
-                    : (hasScrubClipContext
-                            ? scrubClipContext.cropStartSeconds +
-                                  scrubClipContext.fraction * scrubClipContext.croppedDurationSeconds
-                            : 0.0f),
-                .clipName = hasRichClipContext
-                    ? providerFixedStringView(
-                          richClipContext.animationName.data(), richClipContext.animationName.size())
-                    : (hasScrubClipContext
-                            ? providerFixedStringView(
-                                  scrubClipContext.clipName.data(), scrubClipContext.clipName.size())
-                            : std::string_view{}),
-                .clipDurationSeconds = hasRichClipContext
-                    ? richClipContext.durationSeconds
-                    : (hasScrubClipContext ? scrubClipContext.durationSeconds : 0.0f),
-                .clipCroppedDurationSeconds = hasRichClipContext
-                    ? richClipContext.croppedDurationSeconds
-                    : (hasScrubClipContext ? scrubClipContext.croppedDurationSeconds : 0.0f),
-            });
+            if (collectLearnedMotion) {
+                _learner.observe(WeaponPartMotionLearner::Observation{
+                    .weaponFormId = weaponFormId,
+                    .omodFormId = entry.omodFormId,
+                    .sourceName = providerFixedStringView(entry.sourceName.data(), entry.sourceName.size()),
+                    .pose = pose,
+                    .scale = partWeaponLocal.scale,
+                    .trusted = !driven,
+                    .rockFrameIndex = _lastRockFrameIndex,
+                    .weaponGenerationKey = generationKey,
+                    .catalogPartId = entry.catalogPartId,
+                    .bodyId = entry.bodyId,
+                    .nodePath = providerFixedStringView(entry.nodePath.data(), entry.nodePath.size()),
+                    .nodePathTruncated = entry.nodePathTruncated,
+                    .clipActivityId = hasRichClipContext
+                        ? richClipContext.activityId
+                        : 0,
+                    .clipScrubSessionId = hasScrubClipContext ? scrubClipContext.sessionId : 0,
+                    .clipConcurrentActivityCount = hasRichClipContext
+                        ? richClipContext.concurrentActivityCount
+                        : (hasScrubClipContext ? 1u : 0u),
+                    .clipFraction = hasRichClipContext
+                        ? richClipContext.fraction
+                        : (hasScrubClipContext ? scrubClipContext.fraction : 0.0f),
+                    .clipLocalTimeSeconds = hasRichClipContext
+                        ? richClipContext.localTimeSeconds
+                        : (hasScrubClipContext
+                                ? scrubClipContext.cropStartSeconds +
+                                      scrubClipContext.fraction * scrubClipContext.croppedDurationSeconds
+                                : 0.0f),
+                    .clipName = hasRichClipContext
+                        ? providerFixedStringView(
+                              richClipContext.animationName.data(), richClipContext.animationName.size())
+                        : (hasScrubClipContext
+                                ? providerFixedStringView(
+                                      scrubClipContext.clipName.data(), scrubClipContext.clipName.size())
+                                : std::string_view{}),
+                    .clipDurationSeconds = hasRichClipContext
+                        ? richClipContext.durationSeconds
+                        : (hasScrubClipContext ? scrubClipContext.durationSeconds : 0.0f),
+                    .clipCroppedDurationSeconds = hasRichClipContext
+                        ? richClipContext.croppedDurationSeconds
+                        : (hasScrubClipContext ? scrubClipContext.croppedDurationSeconds : 0.0f),
+                });
+            }
 
             // Rest-pose capture for the delta-curve anchors (see the cache
             // entry declaration): a driven or hand-held part is not resting.
@@ -2026,6 +2125,7 @@ namespace redux
                     }
                     if (entry.stationaryFrames >= kRestPoseStationaryFrames) {
                         entry.restPose = pose;
+                        entry.restScale = partWeaponLocal.scale;
                         entry.restPoseValid = true;
                     }
                 } else {
@@ -2034,6 +2134,71 @@ namespace redux
                 entry.lastObserved = pose;
                 entry.hasLastObserved = true;
             }
+        }
+    }
+
+    void ReduxRuntime::updateAuthoredAnimationPreharvest(
+        RE::NiNode* weaponNode,
+        const std::uint64_t generationKey,
+        const std::uint32_t weaponFormId)
+    {
+        if (!weaponNode || generationKey == 0 || weaponFormId == 0) {
+            (void)weapon_animation_preharvest::step(
+                0, 0, nullptr, 0, nullptr, 0);
+            return;
+        }
+
+        // Attribution waits for ROCK's committed evidence snapshot so paths
+        // bind to the final concrete part/OMOD identities for this generation.
+        refreshDrivePartCache(weaponNode, generationKey);
+        if (_drivePartCache.generationKey != generationKey) {
+            return;
+        }
+
+        // Scene-node matching includes animated rig ancestors that are not
+        // themselves ROCK evidence parts, so this is wider than the 128-part
+        // drive cache while remaining fixed and stack-small.
+        std::array<const char*, 256> allowedNodeNames{};
+        std::uint32_t allowedNodeNameCount = 0;
+        // Concrete ROCK evidence/observation entries are the attribution
+        // authority and receive capacity first. The wider scene walk then
+        // adds animated ancestors without duplicate instance-suffixed names.
+        for (std::uint32_t entryIndex = 0;
+             entryIndex < _drivePartCache.count;
+             ++entryIndex) {
+            const auto* node = _drivePartCache.entries[entryIndex].node;
+            appendUniqueSceneNodeName(
+                node ? node->name.c_str() : nullptr,
+                allowedNodeNames.data(),
+                static_cast<std::uint32_t>(allowedNodeNames.size()),
+                allowedNodeNameCount);
+        }
+        auto& weaponChildren = weaponNode->GetRuntimeData().children;
+        for (std::uint16_t child = 0; child < weaponChildren.size(); ++child) {
+            collectSubtreeNodeNames(
+                weaponChildren[child].get(),
+                allowedNodeNames.data(),
+                static_cast<std::uint32_t>(allowedNodeNames.size()),
+                allowedNodeNameCount,
+                32);
+        }
+        if (allowedNodeNameCount == 0) {
+            return;
+        }
+
+        const auto result = weapon_animation_preharvest::step(
+            weaponFormId,
+            generationKey,
+            allowedNodeNames.data(),
+            allowedNodeNameCount,
+            _clipHarvestDrainGroups.data(),
+            static_cast<std::uint32_t>(_clipHarvestDrainGroups.size()));
+        if (result.groupsProduced > 0) {
+            adoptWeaponClipHarvestBatch(
+                weaponNode,
+                generationKey,
+                weaponFormId,
+                result.groupsProduced);
         }
     }
 
@@ -2316,6 +2481,25 @@ namespace redux
             return false;
         }
 
+        adoptWeaponClipHarvestBatch(
+            weaponNode, generationKey, weaponFormId, drainedCount);
+        return drainedCount == static_cast<std::uint32_t>(drainedGroups.size());
+    }
+
+    void ReduxRuntime::adoptWeaponClipHarvestBatch(
+        RE::NiNode* weaponNode,
+        const std::uint64_t generationKey,
+        const std::uint32_t weaponFormId,
+        const std::uint32_t groupCount)
+    {
+        if (!weaponNode || generationKey == 0 || weaponFormId == 0 ||
+            groupCount == 0) {
+            return;
+        }
+        auto& drainedGroups = _clipHarvestDrainGroups;
+        const auto drainedCount = (std::min)(
+            groupCount, static_cast<std::uint32_t>(drainedGroups.size()));
+
         const auto niToPose = [](const RE::NiTransform& transform) {
             weapon_part_motion_path::PoseSample pose{};
             float quaternion[4]{};
@@ -2323,6 +2507,33 @@ namespace redux
             pose.rotate = weapon_part_motion_path::Quat{ quaternion[3], quaternion[0], quaternion[1], quaternion[2] };
             pose.translate = weapon_part_motion_path::Vec3{ transform.translate.x, transform.translate.y, transform.translate.z };
             return pose;
+        };
+        const auto authoredSourceLabel = [](
+            const weapon_clip_stroke::AuthoredClipSource source) {
+            switch (source) {
+            case weapon_clip_stroke::AuthoredClipSource::ExactWeaponPreharvest:
+                return "exact-preharvest";
+            case weapon_clip_stroke::AuthoredClipSource::ActivatedClip:
+                return "activated-legacy";
+            case weapon_clip_stroke::AuthoredClipSource::LoadedGraphFallback:
+            default:
+                return "loaded-fallback";
+            }
+        };
+        /*
+         * Exact tracks already carry the complete target bone transform in
+         * animation-Weapon-local space. Apply their parent-frame delta to
+         * the concrete live scene anchor; this preserves authored rotation,
+         * translation, and lever-arm motion without PAPER's historical rig
+         * basis calibration.
+         */
+        const auto rebaseExactKey = [](const weapon_part_motion_path::PoseSample& sourceFirst,
+                                       const weapon_part_motion_path::PoseSample& sourceKey,
+                                       const RE::NiTransform& liveAnchor) {
+            const auto sourceFirstTransform = niTransformFromPose(sourceFirst);
+            const auto sourceKeyTransform = niTransformFromPose(sourceKey);
+            return transform_math::rebaseParentFrameMotion(
+                sourceFirstTransform, sourceKeyTransform, liveAnchor);
         };
         /*
          * Clip keys are RIG-bone-local under the rig 'Weapon' bone: their
@@ -2420,12 +2631,33 @@ namespace redux
                                            const RE::NiTransform& leaderRestWeaponLocal,
                                            const RE::NiTransform* tail,
                                            weapon_part_motion_path::MotionPath& outPath) {
-            const bool applyRotation = source.activatedClip;
             outPath = weapon_part_motion_path::MotionPath{};
             RE::NiTransform anchor = leaderRestWeaponLocal;
             if (tail) {
                 anchor = transform_math::composeTransforms(anchor, *tail);
             }
+            if (source.trackSpace ==
+                weapon_clip_stroke::AuthoredTrackSpace::WeaponRootLocal) {
+                const auto& firstKey = source.leaderPath.keys[0];
+                float arc = 0.0f;
+                for (std::uint32_t key = 0;
+                     key < weapon_part_motion_path::kResampledKeyCount;
+                     ++key) {
+                    const auto keyTransform = rebaseExactKey(
+                        firstKey, source.leaderPath.keys[key], anchor);
+                    outPath.keys[key] = niToPose(keyTransform);
+                    if (key > 0) {
+                        arc += weapon_part_motion_path::poseDistance(
+                            outPath.keys[key], outPath.keys[key - 1]);
+                    }
+                }
+                outPath.totalArcLength = arc;
+                outPath.valid = arc > 0.0f;
+                return outPath.valid;
+            }
+
+            const bool applyRotation = source.source ==
+                weapon_clip_stroke::AuthoredClipSource::ActivatedClip;
             // The track rotates its bone about the bone origin; an evidence
             // node offset inside the bone (tail) orbits that origin.
             const RE::NiPoint3 lever{
@@ -2464,10 +2696,72 @@ namespace redux
         };
 
         const RE::NiTransform weaponWorldInverse = transform_math::invertTransform(weaponNode->world);
+        /*
+         * Resolve every exact leader once for this clip. When two animated
+         * bones are nested, the child branch owns its own fully reconstructed
+         * Weapon-local track; the parent's stroke must not be copied onto it
+         * just because the child collider sits below the parent scene node.
+         * Unanimated descendants still inherit their nearest animated
+         * ancestor, which is the correct rigid-subtree behavior.
+         */
+        std::array<RE::NiAVObject*, weapon_clip_stroke::kMaxGroupsPerClip>
+            exactLeaderNodes{};
+        for (std::uint32_t groupIndex = 0; groupIndex < drainedCount; ++groupIndex) {
+            const auto& group = drainedGroups[groupIndex];
+            if (group.source !=
+                    weapon_clip_stroke::AuthoredClipSource::ExactWeaponPreharvest ||
+                group.trackSpace !=
+                    weapon_clip_stroke::AuthoredTrackSpace::WeaponRootLocal) {
+                continue;
+            }
+            exactLeaderNodes[groupIndex] = findWeaponNodeByBoneName(
+                weaponNode,
+                providerFixedStringView(
+                    group.leaderBoneName.data(), group.leaderBoneName.size()),
+                32);
+        }
+        const auto crossesDifferentExactLeader = [&](const std::uint32_t ownerGroupIndex,
+                                                     RE::NiAVObject* candidate,
+                                                     RE::NiAVObject* ownerLeader) {
+            for (auto* current = candidate;
+                 current && current != ownerLeader;
+                 current = current->parent) {
+                for (std::uint32_t otherGroupIndex = 0;
+                     otherGroupIndex < drainedCount;
+                     ++otherGroupIndex) {
+                    if (otherGroupIndex != ownerGroupIndex &&
+                        exactLeaderNodes[otherGroupIndex] == current) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+        const auto stablePartAnchor = [](const DrivePartCacheEntry& entry,
+                                         const RE::NiTransform& fallback) {
+            if (entry.restPoseValid) {
+                auto anchor = niTransformFromPose(entry.restPose);
+                anchor.scale = entry.restScale;
+                return anchor;
+            }
+            if (entry.generationAnchorValid) {
+                auto anchor = niTransformFromPose(entry.generationAnchorPose);
+                anchor.scale = entry.generationAnchorScale;
+                return anchor;
+            }
+            return fallback;
+        };
         for (std::uint32_t groupIndex = 0; groupIndex < drainedCount; ++groupIndex) {
             const auto& group = drainedGroups[groupIndex];
             const auto leaderName = providerFixedStringView(group.leaderBoneName.data(), group.leaderBoneName.size());
-            auto* leaderNode = findWeaponNodeByBoneName(weaponNode, leaderName, 32);
+            const bool exactWeaponRootSpace =
+                group.source ==
+                    weapon_clip_stroke::AuthoredClipSource::ExactWeaponPreharvest &&
+                group.trackSpace ==
+                    weapon_clip_stroke::AuthoredTrackSpace::WeaponRootLocal;
+            auto* leaderNode = exactWeaponRootSpace
+                ? exactLeaderNodes[groupIndex]
+                : findWeaponNodeByBoneName(weaponNode, leaderName, 32);
             if (!leaderNode || !leaderNode->parent || !group.leaderPath.valid) {
                 // Clip does not belong to this weapon (or the rig bone is not
                 // in the assembled tree) — normal for NPC/other-race clips.
@@ -2482,7 +2776,8 @@ namespace redux
              * ACTIVATED is the weapon's animation; loaded-set walk strokes
              * are fallback only, replaced the moment real data arrives.
              */
-            const bool fallbackSource = !group.activatedClip;
+            const bool fallbackSource = group.source ==
+                weapon_clip_stroke::AuthoredClipSource::LoadedGraphFallback;
             /*
              * Fallback plausibility cap (in-game 2026-07-04): the 23-unit
              * 'WeaponExtra2' carry track from the loaded shared clip mapped
@@ -2509,7 +2804,8 @@ namespace redux
             // tracks must read as a straight -Y back pull, mags as -Z-biased
             // down-and-back; any other shape means the calibration is off
             // for this rig family.
-            {
+            if (group.trackSpace ==
+                weapon_clip_stroke::AuthoredTrackSpace::RigBoneLocal) {
                 const auto restPose = niToPose(leaderRestWeaponLocal);
                 const auto& key0 = group.leaderPath.keys[0];
                 const auto& keyLast = group.leaderPath.keys[weapon_part_motion_path::kResampledKeyCount - 1];
@@ -2524,7 +2820,7 @@ namespace redux
                 RDX_LOG_INFO(Weapon,
                     "WeaponClipHarvest basis: leader '{}' src={} clip='{}' restT=({:.2f},{:.2f},{:.2f}) restQ=({:.3f},{:.3f},{:.3f},{:.3f}) key0Q=({:.3f},{:.3f},{:.3f},{:.3f}) keyLastQ=({:.3f},{:.3f},{:.3f},{:.3f}) rigDeltaT=({:.2f},{:.2f},{:.2f}) sceneDeltaT=({:.2f},{:.2f},{:.2f}) sceneDeltaQ=(w{:.3f},{:.3f},{:.3f},{:.3f})",
                     leaderName,
-                    group.activatedClip ? "activated" : "loaded",
+                    authoredSourceLabel(group.source),
                     group.clipAnimationName.data(),
                     restPose.translate.x,
                     restPose.translate.y,
@@ -2558,6 +2854,10 @@ namespace redux
             // onto that node's rest pose the same way as the leader.
             weapon_clip_stroke::AuthoredStrokeGroup converted{};
             converted.leaderBoneName = group.leaderBoneName;
+            converted.source = group.source;
+            converted.trackSpace =
+                weapon_clip_stroke::AuthoredTrackSpace::WeaponRootLocal;
+            converted.clipAnimationName = group.clipAnimationName;
             for (std::uint32_t follower = 0; follower < group.followerCount && follower < group.followers.size(); ++follower) {
                 const auto followerName = providerFixedStringView(
                     group.followers[follower].boneName.data(),
@@ -2566,20 +2866,46 @@ namespace redux
                 if (!followerNode || !followerNode->parent || followerNode == leaderNode) {
                     continue;
                 }
-                const RE::NiTransform followerRestWeaponLocal =
+                RE::NiTransform followerRestWeaponLocal =
                     transform_math::composeTransforms(weaponWorldInverse, followerNode->world);
+                if (group.trackSpace ==
+                        weapon_clip_stroke::AuthoredTrackSpace::WeaponRootLocal &&
+                    _drivePartCache.generationKey == generationKey) {
+                    for (std::uint32_t entryIndex = 0;
+                         entryIndex < _drivePartCache.count;
+                         ++entryIndex) {
+                        const auto& entry = _drivePartCache.entries[entryIndex];
+                        if (entry.node == followerNode) {
+                            followerRestWeaponLocal = stablePartAnchor(
+                                entry, followerRestWeaponLocal);
+                            break;
+                        }
+                    }
+                }
                 const auto& followerFirstKey = group.followers[follower].keys[0];
                 auto& slot = converted.followers[converted.followerCount];
                 slot.boneName = group.followers[follower].boneName;
                 for (std::uint32_t key = 0; key < weapon_part_motion_path::kResampledKeyCount; ++key) {
                     const auto& clipKey = group.followers[follower].keys[key];
-                    const auto sceneDelta = rigDeltaToScene(
-                        clipKey.translate.x - followerFirstKey.translate.x,
-                        clipKey.translate.y - followerFirstKey.translate.y,
-                        clipKey.translate.z - followerFirstKey.translate.z);
-                    RE::NiTransform keyTransform = followerRestWeaponLocal;
-                    keyTransform.translate += sceneDelta;
-                    if (group.activatedClip) {
+                    RE::NiTransform keyTransform{};
+                    if (group.trackSpace ==
+                        weapon_clip_stroke::AuthoredTrackSpace::WeaponRootLocal) {
+                        keyTransform = rebaseExactKey(
+                            followerFirstKey,
+                            clipKey,
+                            followerRestWeaponLocal);
+                    } else {
+                        const auto sceneDelta = rigDeltaToScene(
+                            clipKey.translate.x - followerFirstKey.translate.x,
+                            clipKey.translate.y - followerFirstKey.translate.y,
+                            clipKey.translate.z - followerFirstKey.translate.z);
+                        keyTransform = followerRestWeaponLocal;
+                        keyTransform.translate += sceneDelta;
+                    }
+                    if (group.source ==
+                            weapon_clip_stroke::AuthoredClipSource::ActivatedClip &&
+                        group.trackSpace ==
+                            weapon_clip_stroke::AuthoredTrackSpace::RigBoneLocal) {
                         const auto rotationDelta = sceneRotationDelta(followerFirstKey, clipKey);
                         keyTransform.rotate = applyDeltaToRest(followerRestWeaponLocal.rotate, rotationDelta);
                     }
@@ -2591,23 +2917,35 @@ namespace redux
 
             /*
              * The leader stroke is stored once per matching evidence part so a
-             * grip on the authored rig bone or on any collider node beneath it
-             * scrubs the same authored stroke; tail carries the evidence
-             * node's static offset inside the leader bone's frame.
+             * grip on the authored rig bone or a rigid collider node beneath it
+             * guides that part along the same authored path; tail carries the
+             * evidence node's static offset inside the leader bone's frame.
              */
             bool storedForEvidence = false;
             if (_drivePartCache.generationKey == generationKey) {
                 for (std::uint32_t entryIndex = 0; entryIndex < _drivePartCache.count; ++entryIndex) {
                     const auto& entry = _drivePartCache.entries[entryIndex];
                     if (!entry.node ||
-                        (entry.node != leaderNode && !nodeContainsNode(leaderNode, entry.node, 16))) {
+                        (entry.node != leaderNode && !nodeContainsNode(leaderNode, entry.node, 16)) ||
+                        (exactWeaponRootSpace && crossesDifferentExactLeader(
+                            groupIndex, entry.node, leaderNode))) {
                         continue;
                     }
+                    const RE::NiTransform currentEntryRest =
+                        transform_math::composeTransforms(
+                            weaponWorldInverse, entry.node->world);
                     const RE::NiTransform tail = transform_math::composeTransforms(
                         transform_math::invertTransform(leaderNode->world),
                         entry.node->world);
-                    const RE::NiTransform* tailPtr = entry.node != leaderNode ? &tail : nullptr;
-                    if (!convertLeaderPath(group, leaderRestWeaponLocal, tailPtr, converted.leaderPath)) {
+                    const RE::NiTransform entryAnchor = exactWeaponRootSpace
+                        ? stablePartAnchor(entry, currentEntryRest)
+                        : leaderRestWeaponLocal;
+                    const RE::NiTransform* tailPtr = !exactWeaponRootSpace &&
+                            entry.node != leaderNode
+                        ? &tail
+                        : nullptr;
+                    if (!convertLeaderPath(
+                            group, entryAnchor, tailPtr, converted.leaderPath)) {
                         continue;
                     }
                     /*
@@ -2628,11 +2966,35 @@ namespace redux
                         const auto& other = _drivePartCache.entries[otherIndex];
                         if (otherIndex == entryIndex || !other.node || other.node == entry.node ||
                             (other.node != leaderNode &&
-                                !nodeContainsNode(leaderNode, other.node, 16))) {
+                                !nodeContainsNode(leaderNode, other.node, 16)) ||
+                            (exactWeaponRootSpace && crossesDifferentExactLeader(
+                                groupIndex, other.node, leaderNode))) {
                             continue;
                         }
-                        const RE::NiTransform otherRestWeaponLocal =
+                        const auto otherName = providerFixedStringView(
+                            other.sourceName.data(), other.sourceName.size());
+                        bool alreadyFollower = false;
+                        for (std::uint32_t existing = 0;
+                             existing < groupForEntry.followerCount;
+                             ++existing) {
+                            if (weapon_animation_preharvest_policy::boneNameMatchesSceneNode(
+                                    providerFixedStringView(
+                                        groupForEntry.followers[existing].boneName.data(),
+                                        groupForEntry.followers[existing].boneName.size()),
+                                    otherName)) {
+                                alreadyFollower = true;
+                                break;
+                            }
+                        }
+                        if (alreadyFollower) {
+                            continue;
+                        }
+                        RE::NiTransform otherRestWeaponLocal =
                             transform_math::composeTransforms(weaponWorldInverse, other.node->world);
+                        if (exactWeaponRootSpace) {
+                            otherRestWeaponLocal = stablePartAnchor(
+                                other, otherRestWeaponLocal);
+                        }
                         // Rigid with the leader bone: the sibling orbits the
                         // bone origin under the leader's rotation delta.
                         const RE::NiPoint3 siblingLever{
@@ -2648,12 +3010,26 @@ namespace redux
                             (std::min)(slot.boneName.size() - 1, other.sourceName.size()));
                         for (std::uint32_t key = 0; key < weapon_part_motion_path::kResampledKeyCount; ++key) {
                             const auto& clipKey = group.leaderPath.keys[key];
-                            const auto sceneDelta = rigDeltaToScene(
-                                clipKey.translate.x - group.leaderPath.keys[0].translate.x,
-                                clipKey.translate.y - group.leaderPath.keys[0].translate.y,
-                                clipKey.translate.z - group.leaderPath.keys[0].translate.z);
-                            RE::NiTransform keyTransform = otherRestWeaponLocal;
-                            if (group.activatedClip) {
+                            RE::NiTransform keyTransform{};
+                            RE::NiPoint3 sceneDelta{};
+                            if (group.trackSpace ==
+                                weapon_clip_stroke::AuthoredTrackSpace::WeaponRootLocal) {
+                                keyTransform = rebaseExactKey(
+                                    group.leaderPath.keys[0],
+                                    clipKey,
+                                    otherRestWeaponLocal);
+                            } else {
+                                sceneDelta = rigDeltaToScene(
+                                    clipKey.translate.x - group.leaderPath.keys[0].translate.x,
+                                    clipKey.translate.y - group.leaderPath.keys[0].translate.y,
+                                    clipKey.translate.z - group.leaderPath.keys[0].translate.z);
+                                keyTransform = otherRestWeaponLocal;
+                                keyTransform.translate += sceneDelta;
+                            }
+                            if (group.source ==
+                                    weapon_clip_stroke::AuthoredClipSource::ActivatedClip &&
+                                group.trackSpace ==
+                                    weapon_clip_stroke::AuthoredTrackSpace::RigBoneLocal) {
                                 const auto rotationDelta =
                                     sceneRotationDelta(group.leaderPath.keys[0], clipKey);
                                 const auto rotatedLever = transform_math::rotateWorldVectorToLocal<RE::NiMatrix3, RE::NiPoint3>(
@@ -2661,8 +3037,6 @@ namespace redux
                                 keyTransform.translate =
                                     leaderRestWeaponLocal.translate + sceneDelta + rotatedLever;
                                 keyTransform.rotate = applyDeltaToRest(otherRestWeaponLocal.rotate, rotationDelta);
-                            } else {
-                                keyTransform.translate += sceneDelta;
                             }
                             slot.keys[key] = niToPose(keyTransform);
                         }
@@ -2674,8 +3048,7 @@ namespace redux
                             weaponFormId,
                             entry.omodFormId,
                             providerFixedStringView(entry.sourceName.data(), entry.sourceName.size()) },
-                        groupForEntry,
-                        fallbackSource);
+                        groupForEntry);
                     storedForEvidence = true;
                 }
             }
@@ -2689,14 +3062,10 @@ namespace redux
                 if (convertLeaderPath(group, leaderRestWeaponLocal, nullptr, converted.leaderPath)) {
                     _learner.storeAuthoredGroup(
                         WeaponPartMotionLearner::PartKey{ weaponFormId, 0, leaderName },
-                        converted,
-                        fallbackSource);
+                        converted);
                 }
             }
         }
-        // A full batch may leave more groups queued; tell the caller to
-        // drain again this frame.
-        return drainedCount == static_cast<std::uint32_t>(drainedGroups.size());
     }
 
     void ReduxRuntime::updateWeaponPartDriveSandbox(

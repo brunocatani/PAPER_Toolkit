@@ -207,6 +207,23 @@ namespace redux::transform_math
     }
 
     /*
+     * Rebase a sampled parent-space transform curve onto a concrete live
+     * anchor. The left/parent-frame delta preserves translation, rotation,
+     * and lever-arm motion even when the animation skeleton's reference pose
+     * differs from the assembled scene node's rest transform.
+     */
+    template <class Transform>
+    inline Transform rebaseParentFrameMotion(
+        const Transform& sourceFirst,
+        const Transform& sourceKey,
+        const Transform& liveAnchor)
+    {
+        const auto parentFrameDelta = composeTransforms(
+            sourceKey, invertTransform(sourceFirst));
+        return composeTransforms(parentFrameDelta, liveAnchor);
+    }
+
+    /*
      * FO4VR hknp BODY slots store the three local axes as 4-float blocks:
      * [0,1,2], [4,5,6], [8,9,10]. ROCK's grab-space NiTransform helpers also
      * store local axes as rows, because localVectorToWorld applies x*row0 +

@@ -26,16 +26,21 @@ namespace redux::weapon_clip_stroke
     using weapon_part_motion_path::lerpPose;
     using weapon_part_motion_path::poseDistance;
 
+    // Legacy live-activation capture remains fixed at 64 samples so its graph-
+    // thread hook stays bounded. Exact off-screen preharvest may accumulate up
+    // to the learner's 720-sample ceiling incrementally across frames.
     inline constexpr std::uint32_t kClipSampleCount = 64;
-    // Sized so one reload clip maps EVERY moving weapon part (Bruno,
-    // 2026-07-04: "see every single thing in the reload"): template rigs
-    // alone carry 11+ tracks and modded rigs add their own bones on top,
-    // and every moving track becomes its own group leader.
-    inline constexpr std::uint32_t kMaxTracksPerClip = 32;
+    inline constexpr std::uint32_t kMaxClipSampleCount = 720;
+    // Legacy live capture remains bounded independently from exact preharvest;
+    // its graph-thread packets must not inherit the 720-sample offline buffer.
+    inline constexpr std::uint32_t kMaxTracksPerClip = 64;
+    // Matches PAPER's full observation/evidence ceiling for complex weapon
+    // assemblies. Exact storage is process-lifetime heap/member memory.
+    inline constexpr std::uint32_t kMaxExactTracksPerClip = 128;
     // Sized for real assemblies: a magazine leads its whole bullet stack,
     // a slide carries its sights and decorative riders.
     inline constexpr std::uint32_t kMaxFollowers = 10;
-    inline constexpr std::uint32_t kMaxGroupsPerClip = 16;
+    inline constexpr std::uint32_t kMaxGroupsPerClip = kMaxExactTracksPerClip;
     inline constexpr std::size_t kMaxBoneName = 64;
     // Followers move less than leaders (an ejector nudge vs the slide stroke);
     // anything below this is sampling noise and stays undriven.
@@ -46,16 +51,52 @@ namespace redux::weapon_clip_stroke
     // groups mean the same thing by "follower".
     inline constexpr float kRigidFollowerDistanceToleranceGameUnits = 0.6f;
 
-    struct TrackSamples
+    template <std::uint32_t SampleCapacity>
+    struct BasicTrackSamples
     {
         std::array<char, kMaxBoneName> boneName{};
         std::uint32_t sampleCount{ 0 };
-        std::array<PoseSample, kClipSampleCount> samples{};
+        std::array<PoseSample, SampleCapacity> samples{};
         // Exact authored hkQs scale vector. Serving paths currently preserve
         // scene-observed scalar rest scale, but the evidence archive retains
         // all three clip-authored components for offline analysis.
-        std::array<weapon_part_motion_path::Vec3, kClipSampleCount> scales{};
+        std::array<weapon_part_motion_path::Vec3, SampleCapacity> scales{};
     };
+
+    using TrackSamples = BasicTrackSamples<kClipSampleCount>;
+    using ExactTrackSamples = BasicTrackSamples<kMaxClipSampleCount>;
+
+    enum class AuthoredClipSource : std::uint8_t
+    {
+        // A binding found loaded on a graph without proof that it belongs to
+        // the exact equipped weapon configuration.
+        LoadedGraphFallback = 0,
+        // Legacy evidence captured when the live graph activated the clip.
+        ActivatedClip = 1,
+        // Exact AnimationFileData path from the equipped weapon's off-screen
+        // first-person subgraph, loaded and sampled without playback.
+        ExactWeaponPreharvest = 2,
+    };
+
+    enum class AuthoredTrackSpace : std::uint8_t
+    {
+        // Legacy clip tracks expressed in the old rig-bone frame and requiring
+        // PAPER's historical calibrated basis conversion.
+        RigBoneLocal = 0,
+        // Bone hierarchy reconstructed relative to the animation Weapon bone.
+        // This is the native preharvest contract and needs no learned basis.
+        WeaponRootLocal = 1,
+    };
+
+    [[nodiscard]] inline constexpr bool isWeaponSpecificSource(const AuthoredClipSource source)
+    {
+        return source != AuthoredClipSource::LoadedGraphFallback;
+    }
+
+    [[nodiscard]] inline constexpr bool isExactWeaponPreharvest(const AuthoredClipSource source)
+    {
+        return source == AuthoredClipSource::ExactWeaponPreharvest;
+    }
 
     struct AuthoredFollower
     {
@@ -69,12 +110,8 @@ namespace redux::weapon_clip_stroke
     struct AuthoredStrokeGroup
     {
         std::array<char, kMaxBoneName> leaderBoneName{};
-        // Provenance: true when the stroke was harvested from a clip the
-        // weapon ACTIVATED while equipped (its own animation, via the
-        // activation hook); false for clips merely found loaded on the
-        // graph (shared/template data — fallback only, outranked by
-        // activated strokes for the same part).
-        bool activatedClip{ false };
+        AuthoredClipSource source{ AuthoredClipSource::LoadedGraphFallback };
+        AuthoredTrackSpace trackSpace{ AuthoredTrackSpace::RigBoneLocal };
         // Animation name from the activating hkbClipGenerator (empty on
         // the walk path or when the read fails); diagnostics/provenance.
         std::array<char, kMaxBoneName> clipAnimationName{};
@@ -83,7 +120,8 @@ namespace redux::weapon_clip_stroke
         std::array<AuthoredFollower, kMaxFollowers> followers{};
     };
 
-    inline float trackExcursion(const TrackSamples& track)
+    template <std::uint32_t SampleCapacity>
+    inline float trackExcursion(const BasicTrackSamples<SampleCapacity>& track)
     {
         float excursion = 0.0f;
         for (std::uint32_t i = 1; i < track.sampleCount; ++i) {
@@ -95,7 +133,10 @@ namespace redux::weapon_clip_stroke
         return excursion;
     }
 
-    inline PoseSample poseAtSamplePosition(const TrackSamples& track, float samplePosition)
+    template <std::uint32_t SampleCapacity>
+    inline PoseSample poseAtSamplePosition(
+        const BasicTrackSamples<SampleCapacity>& track,
+        float samplePosition)
     {
         if (track.sampleCount == 0) {
             return {};
@@ -117,8 +158,9 @@ namespace redux::weapon_clip_stroke
      * each key's fractional source-sample position so followers can be
      * sampled at the same clip times.
      */
+    template <std::uint32_t SampleCapacity>
     inline bool buildLeaderPath(
-        const TrackSamples& track,
+        const BasicTrackSamples<SampleCapacity>& track,
         MotionPath& outPath,
         std::array<float, kResampledKeyCount>& outKeySamplePositions)
     {
@@ -182,8 +224,9 @@ namespace redux::weapon_clip_stroke
      * (in-game 2026-07-04: pulling the AK bolt drove the mag and bullets
      * down and out of the weapon).
      */
+    template <std::uint32_t SampleCapacity>
     inline std::uint32_t buildAuthoredGroups(
-        const TrackSamples* tracks,
+        const BasicTrackSamples<SampleCapacity>* tracks,
         std::uint32_t trackCount,
         AuthoredStrokeGroup* outGroups,
         std::uint32_t maxGroups)
@@ -192,8 +235,9 @@ namespace redux::weapon_clip_stroke
             return 0;
         }
 
-        std::array<float, kMaxTracksPerClip> excursions{};
-        const auto boundedTrackCount = (std::min)(trackCount, kMaxTracksPerClip);
+        std::array<float, kMaxExactTracksPerClip> excursions{};
+        const auto boundedTrackCount =
+            (std::min)(trackCount, kMaxExactTracksPerClip);
         for (std::uint32_t i = 0; i < boundedTrackCount; ++i) {
             excursions[i] = trackExcursion(tracks[i]);
         }

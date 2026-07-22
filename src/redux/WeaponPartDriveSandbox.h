@@ -147,7 +147,7 @@ namespace redux
             // INI-selected path source. Pinned into each session at grip
             // start so a hot-reload mode switch never swaps the path under a
             // hand mid-scrub; it applies to the next grip.
-            MotionPathMode motionPathMode{ MotionPathMode::Hybrid };
+            MotionPathMode motionPathMode{ MotionPathMode::AuthoredOnly };
             /*
              * Stage handoff at the physical travel extremes (delta-curve
              * max/min): reaching either extreme of the active stage hands
@@ -214,7 +214,7 @@ namespace redux
             // Learner-key OMOD identity pinned at grip start (see HandInput).
             std::uint32_t omodFormId{ 0 };
             // Path source pinned at grip start (see FrameInput).
-            MotionPathMode mode{ MotionPathMode::Hybrid };
+            MotionPathMode mode{ MotionPathMode::AuthoredOnly };
             // Which learned stage the session is scrubbing; flips at the
             // stage ends when a chained return stage exists.
             bool onReturnStage{ false };

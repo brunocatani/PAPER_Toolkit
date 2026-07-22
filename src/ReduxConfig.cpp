@@ -22,18 +22,14 @@ namespace redux
 
         constexpr const char* kDefaultIniContent =
             "[PAPERRedux]\n"
-            "; Master switch for the weapon-part reload runtime (clip harvest, motion\n"
-            "; learner, and part-drive scrubbing through ROCK's provider API).\n"
+            "; Master switch for exact authored preharvest, learned observation, and\n"
+            "; part guidance through ROCK's provider API.\n"
             "; Hot-reloadable: toggling while in game shuts the runtime down/brings it back.\n"
             "bEnabled = true\n"
             "\n"
-            "; Which motion-path source may DRIVE a grabbed part. Data collection is\n"
-            "; always on in every mode (the learner keeps recording, the harvest keeps\n"
-            "; extracting clips), so switching modes applies instantly to NEW grips with\n"
-            "; whatever both sources have accumulated.\n"
-            ";   hybrid   - learned paths outrank authored clip strokes; authored\n"
-            ";              bootstraps parts not taught yet (original behavior)\n"
-            ";   authored - only clip-harvested strokes drive parts\n"
+            "; Which independent motion source may DRIVE a grabbed part. There is no\n"
+            "; mixed fallback between authored and learned data.\n"
+            ";   authored - only exact equipped-weapon animation preharvest drives parts\n"
             ";   learned  - only runtime-learned paths drive parts\n"
             ";   scrub    - the hand drives the live reload ANIMATION's time and the\n"
             ";              engine poses every part: trigger a reload (it freezes at\n"
@@ -42,7 +38,7 @@ namespace redux
             ";              end (or let it time out) and the engine finishes the\n"
             ";              reload natively. Uses sClipScrubSweepClipFilter to pick\n"
             ";              which clips are scrubbable.\n"
-            "sMotionPathMode = hybrid\n"
+            "sMotionPathMode = authored\n"
             "\n"
             "; Log verbosity: 0=trace 1=debug 2=info 3=warn 4=error 5=critical 6=off.\n"
             "; Hot-reloadable; drop to 1 or 0 when collecting harvest/scrub diagnostics.\n"
@@ -271,7 +267,7 @@ namespace redux
         if (modeText && parseMotionPathMode(modeText, parsedMode)) {
             motionPathMode = parsedMode;
         } else {
-            RDX_LOG_WARN(Config, "Invalid sMotionPathMode='{}' — keeping '{}' (valid: hybrid, authored, learned)",
+            RDX_LOG_WARN(Config, "Invalid sMotionPathMode='{}' — keeping '{}' (valid: authored, learned, scrub; hybrid was removed)",
                 modeText ? modeText : "",
                 motionPathModeName(motionPathMode));
         }
@@ -336,7 +332,7 @@ namespace redux
             }
             if (motionPathMode != previousMode) {
                 RDX_LOG_INFO(Config,
-                    "sMotionPathMode: {} -> {} (applies to NEW grips; active scrub sessions keep their source)",
+                    "sMotionPathMode: {} -> {} (stored-path sessions stay pinned until release; leaving scrub releases its live clip)",
                     motionPathModeName(previousMode),
                     motionPathModeName(motionPathMode));
             }

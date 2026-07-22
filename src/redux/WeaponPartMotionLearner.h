@@ -18,12 +18,11 @@ namespace redux
      * where our drive owned the node arrive with trusted=false so the
      * recorder never learns our own authority back.
      *
-     * Storage keeps the LEARNED and AUTHORED sources SIDE BY SIDE per
-     * (weapon form ID, part source name) key: collection is unrestricted in
-     * every mode, and the INI-selected MotionPathMode picks the serving
-     * source at lookup time only — so a hot-reload mode switch applies
-     * instantly with whatever data both sources have accumulated, and
-     * neither source can destroy the other's data.
+     * Storage keeps LEARNED and AUTHORED sources side by side per concrete
+     * part identity. They are independent: AuthoredOnly records no learned
+     * observations and serves only exact equipped-weapon preharvest, while
+     * LearnedOnly serves only runtime observation. Neither source can
+     * destroy or silently substitute for the other.
      *
      * The learned source additionally keeps a RETURN STAGE per part: a
      * completed stroke whose start pose chains onto the primary stroke's
@@ -224,8 +223,7 @@ namespace redux
         /*
          * Full stroke-group view for a part under the given mode: the leader
          * path plus its followers, and — learned source only — the return
-         * stage the scrub consumer flips to at the path extremes. Hybrid
-         * serves learned over authored.
+         * stage the drive consumer flips to at the path extremes.
          */
         struct GroupView
         {
@@ -236,8 +234,8 @@ namespace redux
             const weapon_clip_stroke::AuthoredFollower* returnFollowers{ nullptr };
             std::uint32_t returnFollowerCount{ 0 };
             bool authored{ false };
-            // Authored-only: stroke came from a merely-loaded (fallback)
-            // clip rather than one the weapon activated.
+            // Retained for library/evidence provenance. AuthoredOnly's exact
+            // authority gate means a served authored group is never fallback.
             bool fallbackSource{ false };
         };
         [[nodiscard]] GroupView findGroup(const PartKey& key, MotionPathMode mode) const;
@@ -255,16 +253,14 @@ namespace redux
         /*
          * Store a clip-harvested stroke group (already converted to
          * weapon-root-local and mapped to the evidence source name) into the
-         * AUTHORED record. `fallbackSource` marks strokes from clips merely
-         * found LOADED on the graph (shared/template data): a stroke from a
-         * clip the weapon ACTIVATED always beats a fallback stroke for the
-         * same part, and fallback data is used only when it is all that
-         * exists. Within the same tier the largest leader stroke wins.
+         * AUTHORED record. Source authority is carried by the group itself:
+         * exact equipped-weapon preharvest outranks live activation evidence,
+         * which outranks a merely-loaded graph fallback. AuthoredOnly serves
+         * only the exact tier. Within one tier the largest leader stroke wins.
          */
         void storeAuthoredGroup(
             const PartKey& key,
-            const weapon_clip_stroke::AuthoredStrokeGroup& group,
-            bool fallbackSource);
+            const weapon_clip_stroke::AuthoredStrokeGroup& group);
 
         /*
          * Motion-library bridge (phase 2). StageView pointers are non-owning
@@ -329,9 +325,12 @@ namespace redux
             // extraction); dropped when a replaced primary breaks the chain.
             StrokeGroup learnedReturn{};
             StrokeGroup authored{};
-            // Authored stroke came from a merely-loaded (fallback) clip;
-            // outranked by the weapon's own activated-clip strokes.
+            // Persistence currently carries fallback/non-fallback only; the
+            // exact tier is reconstructed by preharvest on each equip.
             bool authoredFallback{ false };
+            // 0=loaded fallback, 1=activation/disk evidence, 2=exact equipped-
+            // weapon preharvest. Only tier 2 is eligible for AuthoredOnly.
+            std::uint8_t authoredAuthorityTier{ 0 };
         };
 
         struct RecorderSlot

@@ -50,6 +50,34 @@ namespace redux
                    slotOmodFormId == key.omodFormId &&
                    slotName(name) == key.sourceName;
         }
+
+        [[nodiscard]] constexpr std::uint8_t authoredAuthorityTier(
+            const weapon_clip_stroke::AuthoredClipSource source)
+        {
+            switch (source) {
+            case weapon_clip_stroke::AuthoredClipSource::ExactWeaponPreharvest:
+                return 2;
+            case weapon_clip_stroke::AuthoredClipSource::ActivatedClip:
+                return 1;
+            case weapon_clip_stroke::AuthoredClipSource::LoadedGraphFallback:
+            default:
+                return 0;
+            }
+        }
+
+        [[nodiscard]] constexpr const char* authoredSourceName(
+            const weapon_clip_stroke::AuthoredClipSource source)
+        {
+            switch (source) {
+            case weapon_clip_stroke::AuthoredClipSource::ExactWeaponPreharvest:
+                return "exact-preharvest";
+            case weapon_clip_stroke::AuthoredClipSource::ActivatedClip:
+                return "activated-legacy";
+            case weapon_clip_stroke::AuthoredClipSource::LoadedGraphFallback:
+            default:
+                return "loaded-fallback";
+            }
+        }
     }
 
     void WeaponPartMotionLearner::beginObservationFrame()
@@ -161,18 +189,13 @@ namespace redux
     {
         switch (mode) {
         case MotionPathMode::AuthoredOnly:
-            return slot.authored.used ? &slot.authored : nullptr;
+            return slot.authored.used && slot.authoredAuthorityTier == 2
+                ? &slot.authored
+                : nullptr;
         case MotionPathMode::LearnedOnly:
             return slot.learnedPrimary.used ? &slot.learnedPrimary : nullptr;
-        case MotionPathMode::Hybrid:
         default:
-            // Learner priority (Bruno, 2026-07-04): a real observed stroke
-            // outranks authored clip data; authored fills the gap until the
-            // part is taught.
-            if (slot.learnedPrimary.used) {
-                return &slot.learnedPrimary;
-            }
-            return slot.authored.used ? &slot.authored : nullptr;
+            return nullptr;
         }
     }
 
@@ -286,8 +309,7 @@ namespace redux
 
     void WeaponPartMotionLearner::storeAuthoredGroup(
         const PartKey& key,
-        const weapon_clip_stroke::AuthoredStrokeGroup& group,
-        bool fallbackSource)
+        const weapon_clip_stroke::AuthoredStrokeGroup& group)
     {
         if (key.weaponFormId == 0 || key.sourceName.empty() || !group.leaderPath.valid) {
             return;
@@ -299,25 +321,22 @@ namespace redux
             return;
         }
         auto& record = target->authored;
+        const auto candidateAuthorityTier = authoredAuthorityTier(group.source);
         if (record.used) {
-            // SOURCE TIER (Bruno, 2026-07-04): the data must be what THIS
-            // weapon actually plays — a stroke from a clip the weapon
-            // ACTIVATED always beats a merely-loaded fallback stroke for the
-            // same part; fallback data only stands while nothing else
-            // exists. Within the same tier the largest leader stroke wins
-            // (a reload stroke beats a fire nudge).
-            if (target->authoredFallback != fallbackSource) {
-                if (fallbackSource) {
-                    return;
-                }
-            } else if (!weapon_part_motion_path::shouldReplacePath(record.path, group.leaderPath)) {
+            if (candidateAuthorityTier < target->authoredAuthorityTier) {
+                return;
+            }
+            if (candidateAuthorityTier == target->authoredAuthorityTier &&
+                !weapon_part_motion_path::shouldReplacePath(record.path, group.leaderPath)) {
                 return;
             }
         }
 
         const bool replaced = record.used;
         record.used = true;
-        target->authoredFallback = fallbackSource;
+        target->authoredFallback =
+            group.source == weapon_clip_stroke::AuthoredClipSource::LoadedGraphFallback;
+        target->authoredAuthorityTier = candidateAuthorityTier;
         record.path = group.leaderPath;
         record.followerCount = (std::min)(group.followerCount, static_cast<std::uint32_t>(record.followers.size()));
         record.followers = group.followers;
@@ -332,7 +351,7 @@ namespace redux
         RDX_LOG_INFO(Weapon,
             "WeaponPartMotionLearner: {} AUTHORED [{}] stroke group for part '{}' (omod {:08X}) on weapon {:08X} (leader arc {:.2f} game units, {} followers, learned record {}) start=({:.2f},{:.2f},{:.2f}) end=({:.2f},{:.2f},{:.2f})",
             replaced ? "updated" : "stored",
-            fallbackSource ? "fallback-loaded" : "weapon-clip",
+            authoredSourceName(group.source),
             key.sourceName,
             key.omodFormId,
             key.weaponFormId,
@@ -410,6 +429,7 @@ namespace redux
         }
         if (applyStage(target->authored, record.authored)) {
             target->authoredFallback = record.authoredFallback;
+            target->authoredAuthorityTier = record.authoredFallback ? 0 : 1;
             applied = true;
         }
         if (applied) {

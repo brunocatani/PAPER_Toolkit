@@ -204,4 +204,12 @@ if(BUILD_PAPER_REDUX_TESTS)
   target_link_libraries(PAPERReduxWeaponPartMotionPolicyTests PRIVATE nlohmann_json::nlohmann_json)
   add_test(NAME PAPERReduxWeaponPartMotionPolicyTests COMMAND $<TARGET_FILE:PAPERReduxWeaponPartMotionPolicyTests>)
   set_tests_properties(PAPERReduxWeaponPartMotionPolicyTests PROPERTIES LABELS "policy")
+
+  find_program(PWSH_EXECUTABLE NAMES pwsh REQUIRED)
+  add_test(
+    NAME PAPERReduxAuthoredAnimationPreharvestSourceTests
+    COMMAND "${PWSH_EXECUTABLE}" -NoLogo -NoProfile -File
+      "${ROOT_DIR}/tests/AuthoredAnimationPreharvestSourceTests.ps1"
+  )
+  set_tests_properties(PAPERReduxAuthoredAnimationPreharvestSourceTests PROPERTIES LABELS "policy;source")
 endif()

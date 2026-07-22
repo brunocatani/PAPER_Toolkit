@@ -232,6 +232,8 @@ namespace redux::weapon_clip_motion_harvest
         std::array<CapturedClipAnnotation, kMaxCapturedClipAnnotations> annotations{};
         std::array<CapturedClipTrigger, kMaxCapturedClipTriggers> triggers{};
     };
+    static_assert(sizeof(RichClipCapturePacket) < 512 * 1024,
+        "live graph-thread capture must not inherit exact preharvest sample storage");
 
     void setRichCaptureEnabled(bool enabled);
     // Generation transition barrier: discard only live clip-activity
