@@ -212,4 +212,11 @@ if(BUILD_PAPER_REDUX_TESTS)
       "${ROOT_DIR}/tests/AuthoredAnimationPreharvestSourceTests.ps1"
   )
   set_tests_properties(PAPERReduxAuthoredAnimationPreharvestSourceTests PROPERTIES LABELS "policy;source")
+
+  add_test(
+    NAME PAPERReduxProviderApiSourceTests
+    COMMAND "${PWSH_EXECUTABLE}" -NoLogo -NoProfile -File
+      "${ROOT_DIR}/tests/ProviderApiSourceTests.ps1"
+  )
+  set_tests_properties(PAPERReduxProviderApiSourceTests PROPERTIES LABELS "policy;source")
 endif()

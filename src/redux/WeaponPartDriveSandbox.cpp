@@ -197,9 +197,22 @@ namespace redux
             static_cast<std::uint32_t>(::rock::provider::RockProviderConsumerCapabilityV1::WeaponPartInteraction);
         ::rock::provider::RockProviderConsumerHandleV1 handle{};
         const auto result = api->registerConsumerV1(&registration, &handle);
-        if (result != ::rock::provider::RockProviderResultV1::Ok || handle.ownerToken == 0) {
+        const bool granted =
+            result == ::rock::provider::RockProviderResultV1::Ok &&
+            handle.ownerToken != 0 &&
+            ::rock::provider::hasConsumerCapabilityV1(
+                handle.grantedCapabilities,
+                ::rock::provider::RockProviderConsumerCapabilityV1::WeaponPartInteraction);
+        if (!granted) {
+            if (handle.ownerToken != 0 && api->unregisterConsumerV1) {
+                (void)api->unregisterConsumerV1(handle.ownerToken);
+            }
             if (!_registrationWarned) {
-                RDX_LOG_WARN(Weapon, "WeaponPartDriveSandbox: consumer registration failed result={}", static_cast<std::uint32_t>(result));
+                RDX_LOG_WARN(
+                    Weapon,
+                    "WeaponPartDriveSandbox: consumer registration failed result={} granted=0x{:08X}",
+                    static_cast<std::uint32_t>(result),
+                    handle.grantedCapabilities);
                 _registrationWarned = true;
             }
             _registrationRetryCooldownFrames = kRegistrationRetryFrames;

@@ -1,5 +1,6 @@
 
 #include <cstdint>
+#include <cstdio>
 
 #include "ReduxConfig.h"
 #include "ReduxLog.h"
@@ -20,6 +21,7 @@ namespace
      * gated against the snapshot ROCK hands us.
      */
     ReduxRuntime s_runtime{};
+    std::uint64_t s_ownerToken = 0;
     std::uint64_t s_frameCallbackToken = 0;
     bool s_rockReady = false;
     bool s_runtimeWasEnabled = false;
@@ -56,7 +58,7 @@ namespace
 
         const int err = RockProviderApi::initialize(
             ROCK_PROVIDER_API_VERSION,
-            ROCK_PROVIDER_API_V1_WEAPON_PART_GRIP_STATE_TABLE_BYTES);
+            ROCK_PROVIDER_API_V1_OWNER_FRAME_CALLBACKS_TABLE_BYTES);
         if (err != 0) {
             switch (err) {
             case 1:
@@ -72,7 +74,10 @@ namespace
                 logger::critical("PAPERRedux: loaded ROCK API is older than required v{}. Deploy the matching ROCK.dll. PAPER_Redux is now DISABLED.", ROCK_PROVIDER_API_VERSION);
                 break;
             case 5:
-                logger::critical("PAPERRedux: loaded ROCK API table is missing the weapon-part grip-state functions. Deploy the matching ROCK.dll. PAPER_Redux is now DISABLED.");
+                logger::critical("PAPERRedux: loaded ROCK API table is missing the owner frame-callback extent. Deploy the matching ROCK.dll. PAPER_Redux is now DISABLED.");
+                break;
+            case 6:
+                logger::critical("PAPERRedux: ROCK provider descriptor is missing or invalid. Deploy the matching ROCK.dll. PAPER_Redux is now DISABLED.");
                 break;
             default:
                 logger::critical("PAPERRedux: ROCK API initialization failed (error {}). PAPER_Redux is now DISABLED.", err);
@@ -85,12 +90,23 @@ namespace
         if (!queryProviderLimitsV1(limits) ||
             !supportsWeaponPartInteractionV1(limits) ||
             !supportsWeaponPartGripStateV1(limits) ||
+            !supportsOwnerFrameCallbacksV1() ||
             !hasFeatureBitV1(limits.featureBits, RockProviderFeatureBitV1::FrameCallbacks) ||
             !hasFeatureBitV1(limits.featureBits, RockProviderFeatureBitV1::WeaponEvidence) ||
             !hasFeatureBitV1(limits.featureBits, RockProviderFeatureBitV1::ConsumerRegistrationV1)) {
             logger::critical(
                 "PAPERRedux: ROCK provider is missing required features (bits={:#x}). Deploy the matching ROCK.dll. PAPER_Redux is now DISABLED.",
                 limits.featureBits);
+            return false;
+        }
+
+        if (!RockProviderApi::inst->registerConsumerV1 ||
+            !RockProviderApi::inst->unregisterConsumerV1 ||
+            !RockProviderApi::inst->registerFrameCallbackForOwnerV1 ||
+            !RockProviderApi::inst->unregisterFrameCallbackForOwnerV1) {
+            logger::critical(
+                "PAPERRedux: ROCK provider owner registration/callback functions are null. "
+                "Deploy the matching ROCK.dll. PAPER_Redux is now DISABLED.");
             return false;
         }
 
@@ -118,9 +134,51 @@ namespace
             }
 
             if (s_frameCallbackToken == 0) {
-                s_frameCallbackToken = rock::provider::RockProviderApi::inst->registerFrameCallback(&onRockFrame, nullptr);
-                if (s_frameCallbackToken == 0) {
+                if (s_ownerToken == 0) {
+                    rock::provider::RockProviderConsumerRegistrationV1 registration{};
+                    std::snprintf(
+                        registration.modName,
+                        sizeof(registration.modName),
+                        "PAPER_Redux Frames");
+                    registration.requestedCapabilities = static_cast<std::uint32_t>(
+                        rock::provider::RockProviderConsumerCapabilityV1::FrameSnapshots);
+                    rock::provider::RockProviderConsumerHandleV1 handle{};
+                    const auto result = rock::provider::RockProviderApi::inst->registerConsumerV1(
+                        &registration,
+                        &handle);
+                    const bool granted =
+                        result == rock::provider::RockProviderResultV1::Ok &&
+                        handle.ownerToken != 0 &&
+                        rock::provider::hasConsumerCapabilityV1(
+                            handle.grantedCapabilities,
+                            rock::provider::RockProviderConsumerCapabilityV1::FrameSnapshots);
+                    if (!granted) {
+                        if (handle.ownerToken != 0) {
+                            (void)rock::provider::RockProviderApi::inst->unregisterConsumerV1(
+                                handle.ownerToken);
+                        }
+                        logger::critical(
+                            "PAPERRedux: ROCK frame consumer registration failed (result={}, granted={:#x}). PAPER_Redux is now DISABLED.",
+                            static_cast<std::uint32_t>(result),
+                            handle.grantedCapabilities);
+                        s_rockReady = false;
+                        return;
+                    }
+                    s_ownerToken = handle.ownerToken;
+                }
+
+                const auto callbackResult =
+                    rock::provider::RockProviderApi::inst->registerFrameCallbackForOwnerV1(
+                        s_ownerToken,
+                        &onRockFrame,
+                        nullptr,
+                        &s_frameCallbackToken);
+                if (callbackResult != rock::provider::RockProviderResultV1::Ok ||
+                    s_frameCallbackToken == 0) {
                     logger::critical("PAPERRedux: ROCK frame-callback registration failed. PAPER_Redux is now DISABLED.");
+                    (void)rock::provider::RockProviderApi::inst->unregisterConsumerV1(
+                        s_ownerToken);
+                    s_ownerToken = 0;
                     s_rockReady = false;
                     return;
                 }
