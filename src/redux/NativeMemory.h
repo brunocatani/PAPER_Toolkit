@@ -13,6 +13,9 @@ namespace redux::native_memory
      */
     [[nodiscard]] bool pointerLooksReadable(const void* pointer);
     [[nodiscard]] bool pointerRangeLooksReadable(const void* pointer, std::size_t byteCount);
+    // Required before invoking a native lock whose acquire/release mutates
+    // opaque Bethesda-owned storage. Readability alone is insufficient.
+    [[nodiscard]] bool pointerRangeLooksWritable(const void* pointer, std::size_t byteCount);
     [[nodiscard]] bool guardedCopyFromMemory(const void* source, void* target, std::size_t byteCount);
 
     template <class T>

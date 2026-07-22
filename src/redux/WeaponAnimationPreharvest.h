@@ -50,6 +50,10 @@ namespace redux::weapon_animation_preharvest
         std::uint32_t groupsProduced{ 0 };
         std::uint32_t clipsRejected{ 0 };
         std::uint32_t targetBonesTruncated{ 0 };
+        // True when the numeric AnimationFileData lookup was unavailable and
+        // the exact selected subgraph's loaded binding table supplied the
+        // clip paths instead. Both sources remain exact-weapon evidence.
+        bool usedLoadedGraphPathFallback{ false };
     };
 
     [[nodiscard]] Stats snapshotStats() noexcept;

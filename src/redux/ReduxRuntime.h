@@ -225,6 +225,9 @@ namespace redux
         bool _pipboySuppressionAvailable{ false };
         // Last attach-arming state, for transition logging only.
         bool _lastAttachModeArmed{ false };
+        // Once-per-grip proof that ROCK reported a normal grip even though a
+        // PAPER scene-source target was already installed for that part.
+        std::array<std::uint64_t, 2> _lastUnmatchedEligibleGripSequence{};
         // Clip-scrub session bookkeeping: frames with a live frozen clip
         // but no hand driving it (idle release), and the last session id
         // seen (resets the idle counter on capture turnover).

@@ -87,11 +87,33 @@ namespace redux::weapon_animation_preharvest
         constexpr std::ptrdiff_t kRootContainerFromAnimationDataOffset = 0x08;
         constexpr std::size_t kSampleTracksVtableSlot = 5;
 
+        // ROCK's independently established loaded-subgraph binding-table
+        // layout. Some weapon projects load a complete exact subgraph but do
+        // not expose AnimationFileData through the numeric lookup. The table
+        // is the graph's authoritative set of bound clip paths for the same
+        // selected subgraph identifier, so it is an exact discovery fallback
+        // rather than the old shared/live-graph evidence tier.
+        constexpr std::ptrdiff_t kGraphLoadedSubgraphsOffset = 0x3A0;
+        constexpr std::ptrdiff_t kLoadedSubgraphsEntriesOffset = 0x00;
+        constexpr std::ptrdiff_t kLoadedSubgraphsCountOffset = 0x10;
+        constexpr std::ptrdiff_t kLoadedSubgraphsLockOffset = 0x28;
+        constexpr std::size_t kLoadedSubgraphEntryStride = 0x48;
+        constexpr std::ptrdiff_t kLoadedSubgraphBindingTableOffset = 0x08;
+        constexpr std::ptrdiff_t kBindingTableBucketCountOffset = 0x0C;
+        constexpr std::ptrdiff_t kBindingTableBucketsOffset = 0x28;
+        constexpr std::ptrdiff_t kBindingTableSubgraphIdentifierOffset = 0xC0;
+        constexpr std::size_t kBindingTableNodeStride = 0x18;
+        constexpr std::ptrdiff_t kBindingTableNodeKeyOffset = 0x00;
+        constexpr std::ptrdiff_t kBindingTableNodeOccupancyOffset = 0x10;
+
         constexpr std::size_t kMaxBonesAndTracks = 768;
         constexpr std::size_t kMaxSkeletonPartitions = 256;
         constexpr std::size_t kMaxBoneChainDepth = 96;
         constexpr std::size_t kMaxAnimationFiles = 512;
         constexpr std::size_t kAnimationPathCapacity = 260;
+        constexpr std::size_t kMaxLoadedSubgraphs = 128;
+        constexpr std::size_t kMaxClipBindingBuckets = 4096;
+        constexpr std::size_t kMaxFixedStringShallowDepth = 8;
         constexpr std::uint32_t kSamplesPerFrame = 24;
         constexpr std::uint32_t kWeaponAnimationRole = 1;
         constexpr std::int32_t kIoTaskPriority = 3;
@@ -154,6 +176,7 @@ namespace redux::weapon_animation_preharvest
             std::int16_t boneIndex{ -1 };
             std::uint16_t chainCount{ 0 };
             std::array<std::int16_t, kMaxBoneChainDepth> chain{};
+            bool magazineBranch{ false };
         };
 
         struct ClipWork
@@ -502,9 +525,10 @@ namespace redux::weapon_animation_preharvest
 
             if (terminalState == State::Completed) {
                 RDX_LOG_INFO(Animation,
-                    "Authored animation preharvest complete weapon={:08X} generation={:016X} files={} sampled={} movingClips={} groups={} rejected={}",
+                    "Authored animation preharvest complete weapon={:08X} generation={:016X} pathSource={} files={} sampled={} movingClips={} groups={} rejected={}",
                     formId,
                     generation,
+                    stats.usedLoadedGraphPathFallback ? "loaded-exact-subgraph" : "AnimationFileData",
                     stats.animationFileCount,
                     stats.clipsSampled,
                     stats.clipsWithPartMotion,
@@ -1052,9 +1076,27 @@ namespace redux::weapon_animation_preharvest
                 target.boneIndex = static_cast<std::int16_t>(bone);
                 target.chainCount = static_cast<std::uint16_t>(chainCount);
                 target.chain = chain;
+                for (std::uint32_t chainIndex = 0;
+                     chainIndex < chainCount;
+                     ++chainIndex) {
+                    std::array<char, weapon_clip_stroke::kMaxBoneName>
+                        chainBoneName{};
+                    if (skeletonBoneName(
+                            bones,
+                            chain[chainIndex],
+                            chainBoneName) &&
+                        weapon_animation_preharvest_policy::boneNameMatchesSceneNode(
+                            "WeaponMagazine",
+                            std::string_view{ chainBoneName.data() })) {
+                        target.magazineBranch = true;
+                        break;
+                    }
+                }
                 auto& track = prepared.tracks[prepared.targetCount];
                 track.sampleCount = 0;
                 track.boneName = name;
+                track.isolateMagazineExtractionLeg =
+                    target.magazineBranch;
                 ++prepared.targetCount;
             }
             if (matchingBoneCount > prepared.targets.size()) {
@@ -1257,7 +1299,7 @@ namespace redux::weapon_animation_preharvest
                 std::memcpy(
                     group.clipAnimationName.data(), fileName.data(), copyCount);
                 RDX_LOG_INFO(Animation,
-                    "Authored preharvest stage weapon={:08X} clip='{}' part='{}' samples={} window={}->{} peak={} restT=({:.3f},{:.3f},{:.3f}) extremeT=({:.3f},{:.3f},{:.3f}) arc={:.3f}",
+                    "Authored preharvest stage weapon={:08X} clip='{}' part='{}' samples={} window={}->{} peak={} boundary={} restT=({:.3f},{:.3f},{:.3f}) extremeT=({:.3f},{:.3f},{:.3f}) arc={:.3f}",
                     state.job.weaponFormId,
                     fileName,
                     group.leaderBoneName.data(),
@@ -1265,6 +1307,8 @@ namespace redux::weapon_animation_preharvest
                     group.sourceSampleStart,
                     group.sourceSampleEnd,
                     group.sourceSamplePeak,
+                    weapon_clip_stroke::boundaryName(
+                        group.sourceBoundary),
                     group.leaderPath.keys.front().translate.x,
                     group.leaderPath.keys.front().translate.y,
                     group.leaderPath.keys.front().translate.z,
@@ -1279,16 +1323,33 @@ namespace redux::weapon_animation_preharvest
             if (groupCount > 0) {
                 ++state.stats.clipsWithPartMotion;
             }
-            RDX_LOG_INFO(Animation,
-                "Authored animation sampled weapon={:08X} clip={}/{} '{}' duration={:.3f}s samples={} targetBones={} movingGroups={}",
-                state.job.weaponFormId,
-                state.job.animationPathIndex + 1,
-                state.job.animationPathCount,
-                fileName,
-                clip.durationSeconds,
-                clip.sampleCount,
-                clip.targetCount,
-                groupCount);
+            if (groupCount > 0) {
+                RDX_LOG_INFO(Animation,
+                    "Authored animation sampled weapon={:08X} clip={}/{} '{}' duration={:.3f}s samples={} targetBones={} movingGroups={}",
+                    state.job.weaponFormId,
+                    state.job.animationPathIndex + 1,
+                    state.job.animationPathCount,
+                    fileName,
+                    clip.durationSeconds,
+                    clip.sampleCount,
+                    clip.targetCount,
+                    groupCount);
+            } else {
+                // Most exact weapon subgraphs include dozens of locomotion,
+                // paired-kill, and idle clips with no part motion. Keep their
+                // per-clip proof at DEBUG so INFO retains the moving stages,
+                // failures, and terminal summary instead of hitting the
+                // runtime log-size ceiling before large weapon sets finish.
+                RDX_LOG_DEBUG(Animation,
+                    "Authored animation sampled weapon={:08X} clip={}/{} '{}' duration={:.3f}s samples={} targetBones={} movingGroups=0",
+                    state.job.weaponFormId,
+                    state.job.animationPathIndex + 1,
+                    state.job.animationPathCount,
+                    fileName,
+                    clip.durationSeconds,
+                    clip.sampleCount,
+                    clip.targetCount);
+            }
             return groupCount;
         }
 
@@ -1403,6 +1464,239 @@ namespace redux::weapon_animation_preharvest
             return true;
         }
 
+        [[nodiscard]] bool appendExactAnimationPath(
+            Runtime& state,
+            const std::string_view path)
+        {
+            if (path.empty()) {
+                return true;
+            }
+            if (path.size() >= kAnimationPathCapacity) {
+                ++state.stats.clipsRejected;
+                RDX_LOG_WARN(Animation,
+                    "Authored animation preharvest rejected overlong exact clip path ({} bytes)",
+                    path.size());
+                return true;
+            }
+
+            for (std::uint32_t existing = 0;
+                 existing < state.job.animationPathCount;
+                 ++existing) {
+                const std::string_view existingPath{
+                    state.job.animationPaths[existing].data()
+                };
+                if (existingPath.size() != path.size()) {
+                    continue;
+                }
+                bool duplicate = true;
+                for (std::size_t character = 0;
+                     character < path.size();
+                     ++character) {
+                    if (weapon_animation_preharvest_policy::asciiLower(
+                            existingPath[character]) !=
+                        weapon_animation_preharvest_policy::asciiLower(
+                            path[character])) {
+                        duplicate = false;
+                        break;
+                    }
+                }
+                if (duplicate) {
+                    return true;
+                }
+            }
+
+            if (state.job.animationPathCount >= state.job.animationPaths.size()) {
+                return false;
+            }
+            auto& destination =
+                state.job.animationPaths[state.job.animationPathCount++];
+            destination.fill('\0');
+            std::memcpy(destination.data(), path.data(), path.size());
+            return true;
+        }
+
+        [[nodiscard]] bool copyBorrowedFixedString(
+            const void* stringEntry,
+            std::array<char, kAnimationPathCapacity>& outPath)
+        {
+            outPath.fill('\0');
+            const void* current = stringEntry;
+            for (std::size_t depth = 0;
+                 depth < kMaxFixedStringShallowDepth;
+                 ++depth) {
+                std::uint16_t flags = 0;
+                if (!native_memory::tryReadField(current, 0x08, flags)) {
+                    return false;
+                }
+                if ((flags & RE::BSStringPool::Entry::kShallow) != 0) {
+                    void* right = nullptr;
+                    if (!native_memory::tryReadField(current, 0x10, right) ||
+                        !right) {
+                        return false;
+                    }
+                    current = right;
+                    continue;
+                }
+                if ((flags & RE::BSStringPool::Entry::kWide) != 0) {
+                    return false;
+                }
+
+                std::uint32_t length = 0;
+                if (!native_memory::tryReadField(current, 0x10, length) ||
+                    length == 0 || length >= outPath.size()) {
+                    return false;
+                }
+                const auto* characters =
+                    reinterpret_cast<const char*>(current) +
+                    sizeof(RE::BSStringPool::Entry);
+                if (!native_memory::guardedCopyFromMemory(
+                        characters,
+                        outPath.data(),
+                        static_cast<std::size_t>(length) + 1)) {
+                    return false;
+                }
+                return outPath[length] == '\0';
+            }
+            return false;
+        }
+
+        [[nodiscard]] bool copyLoadedExactSubgraphPaths(
+            Runtime& state,
+            RE::BShkbAnimationGraph* graph)
+        {
+            if (!graph || state.job.subgraphIdentifier == 0) {
+                return false;
+            }
+
+            void* loadedSubgraphs = nullptr;
+            if (!native_memory::tryReadField(
+                    graph, kGraphLoadedSubgraphsOffset, loadedSubgraphs) ||
+                !loadedSubgraphs) {
+                return false;
+            }
+
+            RE::BSSpinLock* graphLock = nullptr;
+            if (!native_memory::tryReadField(
+                    loadedSubgraphs,
+                    kLoadedSubgraphsLockOffset,
+                    graphLock) ||
+                !graphLock ||
+                !native_memory::pointerRangeLooksWritable(
+                    graphLock, sizeof(*graphLock))) {
+                return false;
+            }
+
+            RE::BSAutoLock<RE::BSSpinLock> lock{ graphLock };
+            void* entries = nullptr;
+            std::uint32_t entryCount = 0;
+            if (!native_memory::tryReadField(
+                    loadedSubgraphs,
+                    kLoadedSubgraphsEntriesOffset,
+                    entries) ||
+                !entries ||
+                !native_memory::tryReadField(
+                    loadedSubgraphs,
+                    kLoadedSubgraphsCountOffset,
+                    entryCount) ||
+                entryCount == 0 || entryCount > kMaxLoadedSubgraphs) {
+                return false;
+            }
+
+            void* bindingTable = nullptr;
+            for (std::uint32_t index = 0; index < entryCount; ++index) {
+                const auto* entry =
+                    reinterpret_cast<const std::byte*>(entries) +
+                    static_cast<std::size_t>(index) *
+                        kLoadedSubgraphEntryStride;
+                void* candidateTable = nullptr;
+                std::uint64_t candidateIdentifier = 0;
+                if (!native_memory::tryReadField(
+                        entry,
+                        kLoadedSubgraphBindingTableOffset,
+                        candidateTable) ||
+                    !candidateTable ||
+                    !native_memory::tryReadField(
+                        candidateTable,
+                        kBindingTableSubgraphIdentifierOffset,
+                        candidateIdentifier)) {
+                    continue;
+                }
+                if (candidateIdentifier == state.job.subgraphIdentifier) {
+                    bindingTable = candidateTable;
+                    break;
+                }
+            }
+            if (!bindingTable) {
+                return false;
+            }
+
+            void* buckets = nullptr;
+            std::uint32_t bucketCount = 0;
+            if (!native_memory::tryReadField(
+                    bindingTable,
+                    kBindingTableBucketsOffset,
+                    buckets) ||
+                !buckets ||
+                !native_memory::tryReadField(
+                    bindingTable,
+                    kBindingTableBucketCountOffset,
+                    bucketCount) ||
+                bucketCount == 0 || bucketCount > kMaxClipBindingBuckets) {
+                return false;
+            }
+
+            state.job.animationPathCount = 0;
+            std::uint32_t unreadableOccupiedPaths = 0;
+            for (std::uint32_t index = 0; index < bucketCount; ++index) {
+                const auto* node =
+                    reinterpret_cast<const std::byte*>(buckets) +
+                    static_cast<std::size_t>(index) *
+                        kBindingTableNodeStride;
+                void* occupancy = nullptr;
+                if (!native_memory::tryReadField(
+                        node,
+                        kBindingTableNodeOccupancyOffset,
+                        occupancy) ||
+                    !occupancy) {
+                    continue;
+                }
+
+                void* stringEntry = nullptr;
+                std::array<char, kAnimationPathCapacity> path{};
+                if (!native_memory::tryReadField(
+                        node,
+                        kBindingTableNodeKeyOffset,
+                        stringEntry) ||
+                    !stringEntry ||
+                    !copyBorrowedFixedString(stringEntry, path)) {
+                    ++unreadableOccupiedPaths;
+                    continue;
+                }
+                if (!appendExactAnimationPath(
+                        state, std::string_view{ path.data() })) {
+                    state.job.animationPathCount = 0;
+                    return false;
+                }
+            }
+
+            // This fallback promises the complete exact bound-path set. An
+            // occupied bucket whose key cannot be copied would silently make
+            // the harvest partial, so reject the fallback as a unit.
+            if (unreadableOccupiedPaths != 0 ||
+                state.job.animationPathCount == 0) {
+                state.job.animationPathCount = 0;
+                return false;
+            }
+            state.stats.usedLoadedGraphPathFallback = true;
+            RDX_LOG_INFO(Animation,
+                "Authored animation preharvest recovered {} exact clip path(s) from loaded subgraph bindings weapon={:08X} subgraph={:016X} buckets={}",
+                state.job.animationPathCount,
+                state.job.weaponFormId,
+                state.job.subgraphIdentifier,
+                bucketCount);
+            return true;
+        }
+
         [[nodiscard]] bool copyExactAnimationPaths(Runtime& state)
         {
             auto* holder = graphHolder(state.job);
@@ -1425,70 +1719,47 @@ namespace redux::weapon_animation_preharvest
                 return false;
             }
 
-            void* lookupSingleton = nullptr;
-            const auto singletonAddress =
-                REL::Offset(kAnimationFileLookupSingleton).address();
-            if (!native_memory::tryReadValue(
-                    reinterpret_cast<void* const*>(singletonAddress), lookupSingleton) ||
-                !lookupSingleton) {
-                return false;
-            }
-            const auto* files = state.native.getAnimationFilesForSubgraph(
-                &state.job.subgraphIdentifier);
-            if (!files || files->empty() || files->size() > kMaxAnimationFiles) {
+            const auto graphIndex =
+                static_cast<decltype(manager->graph)::size_type>(
+                    selection.graphIndex);
+            auto* graph = manager->graph[graphIndex].get();
+            if (!graph) {
                 return false;
             }
 
+            void* lookupSingleton = nullptr;
+            const auto singletonAddress =
+                REL::Offset(kAnimationFileLookupSingleton).address();
             state.job.animationPathCount = 0;
-            for (const auto& file : *files) {
-                const char* path = file.c_str();
-                if (!path || path[0] == '\0') {
-                    continue;
-                }
-                const std::string_view pathView{ path };
-                if (pathView.size() >= kAnimationPathCapacity) {
-                    ++state.stats.clipsRejected;
-                    RDX_LOG_WARN(Animation,
-                        "Authored animation preharvest rejected overlong AnimationFileData path ({} bytes)",
-                        pathView.size());
-                    continue;
-                }
-                bool duplicate = false;
-                for (std::uint32_t existing = 0;
-                     existing < state.job.animationPathCount;
-                     ++existing) {
-                    const std::string_view existingPath{
-                        state.job.animationPaths[existing].data()
-                    };
-                    if (existingPath.size() != pathView.size()) {
-                        continue;
-                    }
-                    duplicate = true;
-                    for (std::size_t character = 0;
-                         character < pathView.size();
-                         ++character) {
-                        if (weapon_animation_preharvest_policy::asciiLower(
-                                existingPath[character]) !=
-                            weapon_animation_preharvest_policy::asciiLower(
-                                pathView[character])) {
-                            duplicate = false;
-                            break;
-                        }
-                    }
-                    if (duplicate) {
-                        break;
+            const bool lookupAvailable = native_memory::tryReadValue(
+                reinterpret_cast<void* const*>(singletonAddress),
+                lookupSingleton) &&
+                lookupSingleton;
+            const auto* files = lookupAvailable
+                ? state.native.getAnimationFilesForSubgraph(
+                      &state.job.subgraphIdentifier)
+                : nullptr;
+            if (files && !files->empty() &&
+                files->size() <= kMaxAnimationFiles) {
+                for (const auto& file : *files) {
+                    const char* path = file.c_str();
+                    if (path && !appendExactAnimationPath(
+                                    state, std::string_view{ path })) {
+                        return false;
                     }
                 }
-                if (duplicate) {
-                    continue;
+                if (state.job.animationPathCount > 0) {
+                    state.stats.animationFileCount =
+                        state.job.animationPathCount;
+                    return true;
                 }
-                auto& destination =
-                    state.job.animationPaths[state.job.animationPathCount++];
-                destination.fill('\0');
-                std::memcpy(destination.data(), pathView.data(), pathView.size());
+            }
+
+            if (!copyLoadedExactSubgraphPaths(state, graph)) {
+                return false;
             }
             state.stats.animationFileCount = state.job.animationPathCount;
-            return state.job.animationPathCount > 0;
+            return true;
         }
 
         [[nodiscard]] bool playerContextStillMatches(const Job& job)
@@ -1605,9 +1876,10 @@ namespace redux::weapon_animation_preharvest
                 job.phaseStartedAtMilliseconds = now;
                 job.longLoadLogged = false;
                 RDX_LOG_INFO(Animation,
-                    "Authored animation preharvest exact subgraph ready weapon={:08X} subgraph={:016X} files={}",
+                    "Authored animation preharvest exact subgraph ready weapon={:08X} subgraph={:016X} pathSource={} files={}",
                     job.weaponFormId,
                     job.subgraphIdentifier,
+                    state.stats.usedLoadedGraphPathFallback ? "loaded-exact-subgraph" : "AnimationFileData",
                     job.animationPathCount);
                 return StepResult{ .state = job.phase };
             }

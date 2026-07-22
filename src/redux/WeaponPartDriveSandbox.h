@@ -14,7 +14,7 @@ namespace redux
 
     /*
      * The drive loop of the reload runtime: registers PAPER_Redux as a ROCK
-     * provider consumer, installs a NonExclusive AttachOnly whitelist of
+     * provider consumer, installs a NonExclusive AttachOnly target set of
      * PER-PART targets (only the parts the runtime resolved as allowlisted
      * AND moving — so unmapped parts and every other grip surface keep
      * their normal behavior), and drives a gripped part along its
@@ -111,10 +111,15 @@ namespace redux
         // One whitelist-eligible part of the current weapon: allowlisted
         // class AND a motion path exists under the active mode ("must
         // move"). The runtime computes these; this class encodes them as
-        // per-bodyId NonExclusive AttachOnly provider targets.
+        // generation-pinned scene-source AttachOnly provider targets.
         struct EligiblePart
         {
             std::uint32_t bodyId{ 0x7FFF'FFFFu };
+            // Stable scene-source identity for this weapon generation. ROCK
+            // can publish multiple collision bodies for one driven node;
+            // targeting therefore matches this pointer, while the body
+            // captured by the grip remains the drive matcher.
+            std::uintptr_t sourceRoot{ 0 };
             std::array<char, kMaxSourceName> sourceName{};
         };
         // Matches the runtime's drive-part cache capacity.
@@ -202,6 +207,22 @@ namespace redux
         void shutdown();
 
         [[nodiscard]] std::uint64_t ownerToken() const { return _ownerToken; }
+        [[nodiscard]] bool hasInstalledTarget(
+            std::uint64_t weaponGenerationKey,
+            std::uintptr_t sourceRoot) const
+        {
+            if (!_installedTargets.any ||
+                _installedTargets.weaponGenerationKey != weaponGenerationKey ||
+                sourceRoot == 0) {
+                return false;
+            }
+            for (std::uint32_t i = 0; i < _installedTargets.count; ++i) {
+                if (_installedTargets.sourceRoots[i] == sourceRoot) {
+                    return true;
+                }
+            }
+            return false;
+        }
 
     private:
         struct HandSession
@@ -273,7 +294,7 @@ namespace redux
             bool any{ false };
             std::uint64_t weaponGenerationKey{ 0 };
             std::uint32_t count{ 0 };
-            std::array<std::uint32_t, kMaxEligibleParts> bodyIds{};
+            std::array<std::uintptr_t, kMaxEligibleParts> sourceRoots{};
         };
 
         std::uint64_t _ownerToken{ 0 };

@@ -15,7 +15,7 @@ namespace redux
      * not move is never attach-only and never grouped, no matter what the
      * allowlist says. Eligibility is therefore resolved per PART, per
      * weapon, at runtime (ReduxRuntime::refreshEligibleParts) and encoded
-     * as per-bodyId provider targets.
+     * as generation-pinned scene-source provider targets.
      */
     struct AttachOnlyAllowList
     {

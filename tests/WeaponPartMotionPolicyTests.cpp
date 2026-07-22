@@ -547,11 +547,70 @@ int main()
                 &magazinePeak));
         ok &= expectTrue("magazine stage ends before later hand-carried motion",
             magazineWindow.valid && magazineWindow.lastSample == 24 &&
+                magazineWindow.boundary ==
+                    AuthoredStrokeGroup::Boundary::StableDwell &&
                 magazinePeak == 24 &&
                 magazinePath.totalArcLength > 9.9f &&
                 magazinePath.totalArcLength < 10.1f &&
                 std::abs(magazinePath.keys.back().translate.x) < 0.05f &&
                 std::abs(magazinePath.keys.back().translate.z + 10.0f) < 0.05f);
+
+        // Some weapon clips have no stable socket-limit frame: the authored
+        // hand begins carrying the detached magazine immediately. Skeleton
+        // ancestry marks only magazine branches for first-leg isolation, so
+        // the sustained direction turn becomes the extraction boundary.
+        ExactTrackSamples noDwellMagazine{};
+        std::memcpy(
+            noDwellMagazine.boneName.data(),
+            "WeaponMagazine",
+            std::strlen("WeaponMagazine"));
+        noDwellMagazine.isolateMagazineExtractionLeg = true;
+        noDwellMagazine.sampleCount = 80;
+        for (std::uint32_t sample = 0;
+             sample < noDwellMagazine.sampleCount;
+             ++sample) {
+            if (sample <= 24) {
+                noDwellMagazine.samples[sample].translate.z =
+                    -10.0f * static_cast<float>(sample) / 24.0f;
+            } else {
+                noDwellMagazine.samples[sample].translate.z = -10.0f;
+                noDwellMagazine.samples[sample].translate.x =
+                    1.5f * static_cast<float>(sample - 24);
+                noDwellMagazine.samples[sample].translate.y =
+                    0.75f * static_cast<float>(sample - 24);
+            }
+        }
+        redux::weapon_part_motion_path::MotionPath noDwellPath{};
+        std::array<float, redux::weapon_part_motion_path::kResampledKeyCount>
+            noDwellKeyPositions{};
+        StrokeSampleWindow noDwellWindow{};
+        std::uint32_t noDwellPeak = 0;
+        ok &= expectTrue("no-dwell magazine yields a bounded extraction leg",
+            buildLeaderPath(
+                noDwellMagazine,
+                noDwellPath,
+                noDwellKeyPositions,
+                &noDwellWindow,
+                &noDwellPeak));
+        ok &= expectTrue("no-dwell magazine excludes the hand-carried turn",
+            noDwellWindow.valid &&
+                noDwellWindow.lastSample >= 23 &&
+                noDwellWindow.lastSample <= 25 &&
+                noDwellWindow.boundary ==
+                    AuthoredStrokeGroup::Boundary::MagazineTurn &&
+                noDwellPeak == noDwellWindow.lastSample &&
+                noDwellPath.totalArcLength > 9.5f &&
+                noDwellPath.totalArcLength < 10.6f &&
+                std::abs(noDwellPath.keys.back().translate.x) < 0.05f);
+
+        auto unclassifiedTurn = noDwellMagazine;
+        unclassifiedTurn.isolateMagazineExtractionLeg = false;
+        const auto unclassifiedWindow =
+            findFirstMotionStage(unclassifiedTurn);
+        ok &= expectTrue("translation-turn isolation is magazine-ancestry scoped",
+            unclassifiedWindow.valid &&
+                unclassifiedWindow.lastSample ==
+                    unclassifiedTurn.sampleCount - 1);
 
         ExactTrackSamples slowContinuous{};
         slowContinuous.sampleCount = 100;

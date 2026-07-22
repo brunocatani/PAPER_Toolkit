@@ -216,14 +216,16 @@ namespace redux
     void WeaponPartDriveSandbox::ensureTargetsInstalled(const FrameInput& input)
     {
         const auto count = (std::min)(input.eligiblePartCount, static_cast<std::uint32_t>(kMaxEligibleParts));
-        // Change detection: same generation and same bodyId set means the
-        // installed targets are already correct (the common per-frame case).
+        // Change detection: same generation and same source-node set means
+        // the installed targets are already correct (the common per-frame
+        // case).
         if (_installedTargets.any &&
             _installedTargets.weaponGenerationKey == input.weaponGenerationKey &&
             _installedTargets.count == count) {
             bool same = true;
             for (std::uint32_t i = 0; i < count; ++i) {
-                if (_installedTargets.bodyIds[i] != input.eligibleParts[i].bodyId) {
+                if (_installedTargets.sourceRoots[i] !=
+                    input.eligibleParts[i].sourceRoot) {
                     same = false;
                     break;
                 }
@@ -250,8 +252,10 @@ namespace redux
 
         /*
          * Per-part whitelist: one NonExclusive AttachOnly target per
-         * eligible part, matched by bodyId and pinned to the weapon
-         * generation. Parts of the same weapon that are NOT in this set —
+         * eligible part, matched by its scene source root and pinned to the
+         * weapon generation. A visual part may own multiple Havok bodies;
+         * source-root identity still selects the one node PAPER can drive.
+         * Parts of the same weapon that are NOT in this set —
          * allowlisted classes without motion data included — never match a
          * target and keep their normal grip behavior; a weapon swap
          * invalidates everything through the generation key until the
@@ -261,10 +265,10 @@ namespace redux
         for (std::uint32_t i = 0; i < count; ++i) {
             auto& target = targets[i];
             target.flags = static_cast<std::uint32_t>(::rock::provider::RockProviderWeaponPartTargetFlagV1::NonExclusive) |
-                           static_cast<std::uint32_t>(::rock::provider::RockProviderWeaponPartTargetFlagV1::MatchBodyId);
+                           static_cast<std::uint32_t>(::rock::provider::RockProviderWeaponPartTargetFlagV1::MatchSourceRoot);
             target.grabMode = ::rock::provider::RockProviderWeaponPartGrabModeV1::AttachOnly;
             target.weaponGenerationKey = input.weaponGenerationKey;
-            target.bodyId = input.eligibleParts[i].bodyId;
+            target.sourceRoot = input.eligibleParts[i].sourceRoot;
             target.groupId = 1;
             target.priority = kDrivePriority;
         }
@@ -287,7 +291,8 @@ namespace redux
         _installedTargets.weaponGenerationKey = input.weaponGenerationKey;
         _installedTargets.count = count;
         for (std::uint32_t i = 0; i < count; ++i) {
-            _installedTargets.bodyIds[i] = input.eligibleParts[i].bodyId;
+            _installedTargets.sourceRoots[i] =
+                input.eligibleParts[i].sourceRoot;
         }
 
         // Compact one-line set dump — this is the live answer to "why is

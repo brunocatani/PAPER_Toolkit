@@ -32,6 +32,9 @@ function Assert-Excludes {
 }
 
 Assert-Contains 'exact AnimationFileData lookup' $preharvest 'kGetAnimationFilesForSubgraph\s*=\s*0x1769140'
+Assert-Contains 'loaded exact subgraph path fallback' $preharvest 'copyLoadedExactSubgraphPaths'
+Assert-Contains 'loaded subgraph fallback takes graph lock' $preharvest 'BSAutoLock<RE::BSSpinLock>'
+Assert-Contains 'loaded subgraph fallback remains identifier-pinned' $preharvest 'candidateIdentifier\s*==\s*state\.job\.subgraphIdentifier'
 Assert-Contains 'direct HKX resource load' $preharvest 'kLoadAnimationResource\s*=\s*0x1728BA0'
 Assert-Contains 'native hka sampler slot' $preharvest 'kSampleTracksVtableSlot\s*=\s*5'
 Assert-Contains 'first-person exact subgraph selection' $preharvest 'selectFirstPersonGraph'
@@ -49,6 +52,7 @@ Assert-Excludes 'no giant aggregate clip-work temporary' $preharvest 'state\.cli
 Assert-Excludes 'no live clip generator dependency' $preharvest 'hkbClipGenerator'
 Assert-Excludes 'no live activation hook dependency' $preharvest 'ensureClipActivationHookInstalled'
 Assert-Excludes 'no user-controlled clip-time dependency' $preharvest 'userControlled'
+Assert-Contains 'zero-motion clip detail stays below INFO' $preharvest 'RDX_LOG_DEBUG\(Animation,[\s\S]*movingGroups=0'
 
 Assert-Contains 'authored runtime calls only preharvest lane' $runtime 'if\s*\(authoredMode\)[\s\S]*updateAuthoredAnimationPreharvest'
 Assert-Contains 'legacy harvesting remains outside authored branch' $runtime 'else\s*\{\s*drainWeaponClipHarvest[\s\S]*updateWeaponClipHarvestWalk'

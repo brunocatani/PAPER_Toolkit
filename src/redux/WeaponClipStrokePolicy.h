@@ -63,6 +63,16 @@ namespace redux::weapon_clip_stroke
     inline constexpr std::uint32_t kStageRetreatConfirmSamples = 2;
     inline constexpr float kStageRetreatMinimumGameUnits = 0.15f;
     inline constexpr float kStageRetreatFraction = 0.08f;
+    // Detachable-magazine clips sometimes move directly from the socket
+    // extraction into a hand-carried trajectory without any dwell. Compare
+    // short translation legs on each side of a candidate boundary and accept
+    // only a sustained near-orthogonal turn. This is deliberately enabled by
+    // skeleton ancestry, never for bolts/slides/handles whose manipulation
+    // stroke itself may be curved.
+    inline constexpr std::uint32_t kStageTurnWindowSamples = 4;
+    inline constexpr std::uint32_t kStageTurnConfirmSamples = 3;
+    inline constexpr float kStageTurnMinimumTranslationGameUnits = 0.25f;
+    inline constexpr float kStageTurnMaximumDirectionCosine = 0.20f;
 
     template <std::uint32_t SampleCapacity>
     struct BasicTrackSamples
@@ -74,6 +84,10 @@ namespace redux::weapon_clip_stroke
         // scene-observed scalar rest scale, but the evidence archive retains
         // all three clip-authored components for offline analysis.
         std::array<weapon_part_motion_path::Vec3, SampleCapacity> scales{};
+        // Set only when the exact target's skeleton chain passes through the
+        // standard WeaponMagazine bone. It lets the stage finder separate a
+        // no-dwell extraction leg from later hand-carried motion.
+        bool isolateMagazineExtractionLeg{ false };
     };
 
     using TrackSamples = BasicTrackSamples<kClipSampleCount>;
@@ -131,6 +145,14 @@ namespace redux::weapon_clip_stroke
         std::uint32_t sourceSampleStart{ 0 };
         std::uint32_t sourceSamplePeak{ 0 };
         std::uint32_t sourceSampleEnd{ 0 };
+        enum class Boundary : std::uint8_t
+        {
+            None,
+            StableDwell,
+            Retreat,
+            MagazineTurn,
+            ClipEnd,
+        } sourceBoundary{ Boundary::None };
         MotionPath leaderPath{};
         std::uint32_t followerCount{ 0 };
         std::array<AuthoredFollower, kMaxFollowers> followers{};
@@ -141,7 +163,94 @@ namespace redux::weapon_clip_stroke
         bool valid{ false };
         std::uint32_t firstSample{ 0 };
         std::uint32_t lastSample{ 0 };
+        AuthoredStrokeGroup::Boundary boundary{
+            AuthoredStrokeGroup::Boundary::None
+        };
     };
+
+    [[nodiscard]] inline constexpr const char* boundaryName(
+        const AuthoredStrokeGroup::Boundary boundary)
+    {
+        switch (boundary) {
+        case AuthoredStrokeGroup::Boundary::StableDwell:
+            return "stable-dwell";
+        case AuthoredStrokeGroup::Boundary::Retreat:
+            return "retreat";
+        case AuthoredStrokeGroup::Boundary::MagazineTurn:
+            return "magazine-turn";
+        case AuthoredStrokeGroup::Boundary::ClipEnd:
+            return "clip-end";
+        default:
+            return "none";
+        }
+    }
+
+    template <std::uint32_t SampleCapacity>
+    [[nodiscard]] inline std::uint32_t findMagazineTranslationTurn(
+        const BasicTrackSamples<SampleCapacity>& track,
+        const std::uint32_t motionStart)
+    {
+        if (!track.isolateMagazineExtractionLeg ||
+            track.sampleCount <=
+                2 * kStageTurnWindowSamples + kStageTurnConfirmSamples ||
+            motionStart == 0) {
+            return 0;
+        }
+
+        const auto translationDelta = [&track](
+                                          const std::uint32_t first,
+                                          const std::uint32_t last) {
+            return weapon_part_motion_path::sub(
+                track.samples[last].translate,
+                track.samples[first].translate);
+        };
+        const auto vectorLength = [](const weapon_part_motion_path::Vec3& value) {
+            return weapon_part_motion_path::length(value);
+        };
+
+        const auto firstCandidate = (std::max)(
+            motionStart + kStageTurnWindowSamples,
+            kStageTurnWindowSamples);
+        const auto lastCandidate =
+            track.sampleCount - kStageTurnWindowSamples -
+            kStageTurnConfirmSamples;
+        for (std::uint32_t candidate = firstCandidate;
+             candidate <= lastCandidate;
+             ++candidate) {
+            const auto incoming = translationDelta(
+                candidate - kStageTurnWindowSamples, candidate);
+            const float incomingLength = vectorLength(incoming);
+            if (incomingLength < kStageTurnMinimumTranslationGameUnits) {
+                continue;
+            }
+
+            bool sustainedTurn = true;
+            for (std::uint32_t confirmation = 0;
+                 confirmation < kStageTurnConfirmSamples;
+                 ++confirmation) {
+                const auto outgoing = translationDelta(
+                    candidate + confirmation,
+                    candidate + confirmation + kStageTurnWindowSamples);
+                const float outgoingLength = vectorLength(outgoing);
+                if (outgoingLength <
+                    kStageTurnMinimumTranslationGameUnits) {
+                    sustainedTurn = false;
+                    break;
+                }
+                const float cosine = weapon_part_motion_path::dot(
+                                         incoming, outgoing) /
+                    (incomingLength * outgoingLength);
+                if (cosine > kStageTurnMaximumDirectionCosine) {
+                    sustainedTurn = false;
+                    break;
+                }
+            }
+            if (sustainedTurn) {
+                return candidate;
+            }
+        }
+        return 0;
+    }
 
     template <std::uint32_t SampleCapacity>
     [[nodiscard]] inline bool stageWindowIsStill(
@@ -195,11 +304,17 @@ namespace redux::weapon_clip_stroke
             return {};
         }
 
+        const auto magazineTurn =
+            findMagazineTranslationTurn(track, motionStart);
+        const auto lastStageCandidate = magazineTurn > motionStart
+            ? magazineTurn
+            : track.sampleCount - 1;
+
         float peakExcursion = 0.0f;
         std::uint32_t peakSample = motionStart;
         std::uint32_t retreatSamples = 0;
         for (std::uint32_t sample = motionStart;
-             sample < track.sampleCount;
+             sample <= lastStageCandidate;
              ++sample) {
             const float excursion = poseDistance(track.samples[sample], rest);
             if (excursion > peakExcursion) {
@@ -216,6 +331,7 @@ namespace redux::weapon_clip_stroke
                         .valid = true,
                         .firstSample = 0,
                         .lastSample = stableStart,
+                        .boundary = AuthoredStrokeGroup::Boundary::StableDwell,
                     };
                 }
             }
@@ -231,6 +347,7 @@ namespace redux::weapon_clip_stroke
                         .valid = true,
                         .firstSample = 0,
                         .lastSample = peakSample,
+                        .boundary = AuthoredStrokeGroup::Boundary::Retreat,
                     };
                 }
             } else if (sample != peakSample) {
@@ -242,7 +359,10 @@ namespace redux::weapon_clip_stroke
             ? StrokeSampleWindow{
                   .valid = true,
                   .firstSample = 0,
-                  .lastSample = track.sampleCount - 1,
+                  .lastSample = lastStageCandidate,
+                  .boundary = magazineTurn > motionStart
+                      ? AuthoredStrokeGroup::Boundary::MagazineTurn
+                      : AuthoredStrokeGroup::Boundary::ClipEnd,
               }
             : StrokeSampleWindow{};
     }
@@ -381,6 +501,7 @@ namespace redux::weapon_clip_stroke
             group.leaderBoneName = tracks[leader].boneName;
             group.sourceSampleStart = stageWindow.firstSample;
             group.sourceSampleEnd = stageWindow.lastSample;
+            group.sourceBoundary = stageWindow.boundary;
 
             for (std::uint32_t follower = 0; follower < boundedTrackCount && group.followerCount < kMaxFollowers; ++follower) {
                 if (follower == leader || excursions[follower] < kFollowerMinExcursionGameUnits) {

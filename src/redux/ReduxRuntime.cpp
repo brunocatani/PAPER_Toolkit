@@ -1685,6 +1685,7 @@ namespace redux
         _eligibleConfigRevision = 0;
         _eligibleResolvedOnce = false;
         _lastAttachModeArmed = false;
+        _lastUnmatchedEligibleGripSequence = {};
         _scrubIdleFrames = 0;
         _scrubLastSessionId = 0;
         weapon_clip_motion_harvest::setClipScrubCaptureConfig(false, nullptr);
@@ -1979,11 +1980,30 @@ namespace redux
                     ++unmappedCount;
                     continue;
                 }
+                bool sourceAlreadyEligible = false;
+                const auto sourceRoot =
+                    reinterpret_cast<std::uintptr_t>(entry.node);
+                for (std::uint32_t eligible = 0;
+                     eligible < _eligiblePartCount;
+                     ++eligible) {
+                    if (_eligibleParts[eligible].sourceRoot == sourceRoot) {
+                        sourceAlreadyEligible = true;
+                        break;
+                    }
+                }
+                if (sourceAlreadyEligible) {
+                    // Multiple generated shapes may publish distinct body
+                    // IDs for the same scene source. One source-root target
+                    // covers all of them and preserves capacity for other
+                    // moving parts.
+                    continue;
+                }
                 if (_eligiblePartCount >= _eligibleParts.size()) {
                     break;
                 }
                 auto& part = _eligibleParts[_eligiblePartCount++];
                 part.bodyId = entry.bodyId;
+                part.sourceRoot = sourceRoot;
                 part.sourceName = entry.sourceName;
             }
         }
@@ -3244,6 +3264,25 @@ namespace redux
                 continue;
             }
             const auto& report = gripReports[isLeft ? 1u : 0u];
+            const auto handIndex = isLeft ? 1u : 0u;
+            if (report.active != 0 && report.attachOnly == 0 &&
+                report.weaponGenerationKey == generationKey &&
+                _sandbox.hasInstalledTarget(
+                    generationKey, report.sourceRoot) &&
+                _lastUnmatchedEligibleGripSequence[handIndex] !=
+                    report.gripSequence) {
+                _lastUnmatchedEligibleGripSequence[handIndex] =
+                    report.gripSequence;
+                RDX_LOG_WARN(Weapon,
+                    "WeaponPartDriveSandbox: ROCK reported a normal grip for an installed moving-part target hand={} part='{}' body={} sourceRoot=0x{:X} generation={:016X}",
+                    isLeft ? "left" : "right",
+                    providerFixedStringView(
+                        report.sourceName,
+                        ::rock::provider::ROCK_PROVIDER_MAX_EVIDENCE_NAME),
+                    report.bodyId,
+                    report.sourceRoot,
+                    report.weaponGenerationKey);
+            }
             // Ownership IS the policy: an AttachOnly grip carrying our owner
             // token matched one of our per-part targets, which by
             // construction are allowlisted AND moving — no separate class or
@@ -3276,6 +3315,31 @@ namespace redux
                         if (_drivePartCache.entries[i].restPoseValid) {
                             handInput.restPoseValid = true;
                             handInput.restPose = _drivePartCache.entries[i].restPose;
+                        }
+                        break;
+                    }
+                }
+                if (!node && report.sourceRoot != 0) {
+                    // One scene source can own multiple generated collision
+                    // bodies. The target intentionally matches that source;
+                    // recover the same cached node even when the gripped body
+                    // is a sibling body rather than the catalog body that
+                    // first made the part eligible.
+                    for (std::uint32_t i = 0;
+                         i < _drivePartCache.count;
+                         ++i) {
+                        auto& entry = _drivePartCache.entries[i];
+                        if (reinterpret_cast<std::uintptr_t>(entry.node) !=
+                            report.sourceRoot) {
+                            continue;
+                        }
+                        node = entry.node;
+                        handInput.sourceName = providerFixedStringView(
+                            entry.sourceName.data(), entry.sourceName.size());
+                        handInput.omodFormId = entry.omodFormId;
+                        if (entry.restPoseValid) {
+                            handInput.restPoseValid = true;
+                            handInput.restPose = entry.restPose;
                         }
                         break;
                     }

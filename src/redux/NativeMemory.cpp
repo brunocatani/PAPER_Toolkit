@@ -28,6 +28,23 @@ namespace redux::native_memory
             }
         }
 
+        [[nodiscard]] bool pageProtectionAllowsWrite(const DWORD protection)
+        {
+            if ((protection & PAGE_GUARD) != 0 ||
+                (protection & PAGE_NOACCESS) != 0) {
+                return false;
+            }
+            switch (protection & 0xFF) {
+            case PAGE_READWRITE:
+            case PAGE_WRITECOPY:
+            case PAGE_EXECUTE_READWRITE:
+            case PAGE_EXECUTE_WRITECOPY:
+                return true;
+            default:
+                return false;
+            }
+        }
+
         [[nodiscard]] bool rangeHasProtection(
             const void* pointer,
             const std::size_t byteCount,
@@ -68,6 +85,13 @@ namespace redux::native_memory
     bool pointerRangeLooksReadable(const void* pointer, const std::size_t byteCount)
     {
         return rangeHasProtection(pointer, byteCount, pageProtectionAllowsRead);
+    }
+
+    bool pointerRangeLooksWritable(
+        const void* pointer,
+        const std::size_t byteCount)
+    {
+        return rangeHasProtection(pointer, byteCount, pageProtectionAllowsWrite);
     }
 
     bool guardedCopyFromMemory(const void* source, void* target, const std::size_t byteCount)
