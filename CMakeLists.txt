@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 4.2)
 
 
-set(NAME "PAPERRedux")
-set(FRIENDLY_NAME "PAPER Redux")
+set(NAME "PAPER_Toolkit")
+set(FRIENDLY_NAME "PAPER Toolkit")
 set(VERSION 0.1.0)
 
 message(">>> Start build for '${NAME}' v${VERSION}")
@@ -157,7 +157,7 @@ string(REPLACE "/Ob2" "/Ob3" CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}
 
 # Mirrors ROCK's split: fast local builds deploy the DLL/PDB into the mod
 # root, tests stay an explicit configuration, release stays plain.
-option(POST_BUILD_COPY_PLUGIN "Copy PAPERRedux.dll and PAPERRedux.pdb to configured mod root after building." OFF)
+option(POST_BUILD_COPY_PLUGIN "Copy PAPER_Toolkit.dll and PAPER_Toolkit.pdb to configured mod root after building." OFF)
 set(COPY_PLUGIN_BASE_PATH "" CACHE STRING "Semicolon-separated mod roots that contain F4SE/Plugins.")
 
 if(POST_BUILD_COPY_PLUGIN)
@@ -183,8 +183,8 @@ else()
   message(">>> No post build copy")
 endif()
 
-option(BUILD_PAPER_REDUX_TESTS "Build PAPER Redux focused regression tests" OFF)
-if(BUILD_PAPER_REDUX_TESTS)
+option(BUILD_PAPER_TOOLKIT_TESTS "Build PAPER Toolkit focused regression tests" OFF)
+if(BUILD_PAPER_TOOLKIT_TESTS)
   enable_testing()
 
   # Pure-policy tests: the motion path / scrub / clip stroke policies, the
@@ -192,31 +192,31 @@ if(BUILD_PAPER_REDUX_TESTS)
   # test binary needs no CommonLib or F4SE (the learner's logging compiles
   # out via the test define; nlohmann is header-only).
   find_package(nlohmann_json CONFIG REQUIRED)
-  add_executable(PAPERReduxWeaponPartMotionPolicyTests
+  add_executable(PAPER_ToolkitWeaponPartMotionPolicyTests
     "${ROOT_DIR}/tests/WeaponPartMotionPolicyTests.cpp"
-    "${SOURCE_DIR}/redux/WeaponPartMotionLearner.cpp"
-    "${SOURCE_DIR}/redux/MotionLibraryFormat.cpp"
-    "${SOURCE_DIR}/redux/RichMotionCaptureFormat.cpp"
+    "${SOURCE_DIR}/paper_toolkit/WeaponPartMotionLearner.cpp"
+    "${SOURCE_DIR}/paper_toolkit/MotionLibraryFormat.cpp"
+    "${SOURCE_DIR}/paper_toolkit/RichMotionCaptureFormat.cpp"
   )
-  target_compile_features(PAPERReduxWeaponPartMotionPolicyTests PRIVATE cxx_std_23)
-  target_include_directories(PAPERReduxWeaponPartMotionPolicyTests PRIVATE ${SOURCE_DIR})
-  target_compile_definitions(PAPERReduxWeaponPartMotionPolicyTests PRIVATE REDUX_POLICY_TEST_NO_RUNTIME_LOGGER=1)
-  target_link_libraries(PAPERReduxWeaponPartMotionPolicyTests PRIVATE nlohmann_json::nlohmann_json)
-  add_test(NAME PAPERReduxWeaponPartMotionPolicyTests COMMAND $<TARGET_FILE:PAPERReduxWeaponPartMotionPolicyTests>)
-  set_tests_properties(PAPERReduxWeaponPartMotionPolicyTests PROPERTIES LABELS "policy")
+  target_compile_features(PAPER_ToolkitWeaponPartMotionPolicyTests PRIVATE cxx_std_23)
+  target_include_directories(PAPER_ToolkitWeaponPartMotionPolicyTests PRIVATE ${SOURCE_DIR})
+  target_compile_definitions(PAPER_ToolkitWeaponPartMotionPolicyTests PRIVATE PAPER_TOOLKIT_POLICY_TEST_NO_RUNTIME_LOGGER=1)
+  target_link_libraries(PAPER_ToolkitWeaponPartMotionPolicyTests PRIVATE nlohmann_json::nlohmann_json)
+  add_test(NAME PAPER_ToolkitWeaponPartMotionPolicyTests COMMAND $<TARGET_FILE:PAPER_ToolkitWeaponPartMotionPolicyTests>)
+  set_tests_properties(PAPER_ToolkitWeaponPartMotionPolicyTests PROPERTIES LABELS "policy")
 
   find_program(PWSH_EXECUTABLE NAMES pwsh REQUIRED)
   add_test(
-    NAME PAPERReduxAuthoredAnimationPreharvestSourceTests
+    NAME PAPER_ToolkitAuthoredAnimationPreharvestSourceTests
     COMMAND "${PWSH_EXECUTABLE}" -NoLogo -NoProfile -File
       "${ROOT_DIR}/tests/AuthoredAnimationPreharvestSourceTests.ps1"
   )
-  set_tests_properties(PAPERReduxAuthoredAnimationPreharvestSourceTests PROPERTIES LABELS "policy;source")
+  set_tests_properties(PAPER_ToolkitAuthoredAnimationPreharvestSourceTests PROPERTIES LABELS "policy;source")
 
   add_test(
-    NAME PAPERReduxProviderApiSourceTests
+    NAME PAPER_ToolkitProviderApiSourceTests
     COMMAND "${PWSH_EXECUTABLE}" -NoLogo -NoProfile -File
       "${ROOT_DIR}/tests/ProviderApiSourceTests.ps1"
   )
-  set_tests_properties(PAPERReduxProviderApiSourceTests PROPERTIES LABELS "policy;source")
+  set_tests_properties(PAPER_ToolkitProviderApiSourceTests PROPERTIES LABELS "policy;source")
 endif()

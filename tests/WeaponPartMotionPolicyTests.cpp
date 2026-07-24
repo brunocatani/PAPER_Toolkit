@@ -1,12 +1,12 @@
-#include "redux/MotionLibraryFormat.h"
-#include "redux/RichMotionCaptureFormat.h"
-#include "redux/TransformMath.h"
-#include "redux/WeaponAnimationPreharvestPolicy.h"
-#include "redux/WeaponClipStrokePolicy.h"
-#include "redux/WeaponPartEligibility.h"
-#include "redux/WeaponPartMotionLearner.h"
-#include "redux/WeaponPartMotionPathPolicy.h"
-#include "redux/WeaponPartMotionScrubPolicy.h"
+#include "paper_toolkit/MotionLibraryFormat.h"
+#include "paper_toolkit/RichMotionCaptureFormat.h"
+#include "paper_toolkit/TransformMath.h"
+#include "paper_toolkit/WeaponAnimationPreharvestPolicy.h"
+#include "paper_toolkit/WeaponClipStrokePolicy.h"
+#include "paper_toolkit/WeaponPartEligibility.h"
+#include "paper_toolkit/WeaponPartMotionLearner.h"
+#include "paper_toolkit/WeaponPartMotionPathPolicy.h"
+#include "paper_toolkit/WeaponPartMotionScrubPolicy.h"
 
 #include <array>
 #include <cmath>
@@ -52,8 +52,8 @@ namespace
     struct CapturedRawSummary
     {
         std::uint32_t callbackCount{ 0 };
-        redux::rich_capture::StrokeTermination termination{};
-        redux::rich_capture::ServingDecision decision{};
+        paper_toolkit::rich_capture::StrokeTermination termination{};
+        paper_toolkit::rich_capture::ServingDecision decision{};
         std::uint32_t sampleCount{ 0 };
         std::uint64_t firstFrame{ 0 };
         std::uint64_t lastFrame{ 0 };
@@ -85,7 +85,7 @@ namespace
         float scale{ 1.0f };
     };
 
-    void captureRawSummary(const redux::WeaponPartMotionLearner::RawCaptureView& capture, void* context)
+    void captureRawSummary(const paper_toolkit::WeaponPartMotionLearner::RawCaptureView& capture, void* context)
     {
         auto& summary = *static_cast<CapturedRawSummary*>(context);
         ++summary.callbackCount;
@@ -111,8 +111,8 @@ int main()
     bool ok = true;
 
     {
-        using namespace redux;
-        using namespace redux::weapon_animation_preharvest_policy;
+        using namespace paper_toolkit;
+        using namespace paper_toolkit::weapon_animation_preharvest_policy;
 
         MotionPathMode parsed = MotionPathMode::LearnedOnly;
         ok &= expectFalse("removed hybrid mode cannot be parsed",
@@ -245,7 +245,7 @@ int main()
     }
 
     {
-        using namespace redux::weapon_part_motion_path;
+        using namespace paper_toolkit::weapon_part_motion_path;
 
         // A synthetic bolt stroke: rest, pull back 6 units along +Y in steps,
         // hold at peak, return to rest, hold still until completion.
@@ -358,7 +358,7 @@ int main()
         ok &= expectTrue("longer stroke replaces the stored path", shouldReplacePath(path, longerPath));
         ok &= expectTrue("any valid stroke replaces an empty slot", shouldReplacePath(MotionPath{}, path));
 
-        using namespace redux::weapon_part_motion_scrub;
+        using namespace paper_toolkit::weapon_part_motion_scrub;
         const auto seededAtRest = initialScrubPosition(path, rest.translate);
         ok &= expectTrue("scrub seeds from the part pose", seededAtRest.valid);
         ok &= expectTrue("scrub seeded at rest starts near arc zero", seededAtRest.arcPosition < 0.5f);
@@ -395,8 +395,8 @@ int main()
     }
 
     {
-        using namespace redux::weapon_clip_stroke;
-        using redux::weapon_part_motion_path::PoseSample;
+        using namespace paper_toolkit::weapon_clip_stroke;
+        using paper_toolkit::weapon_part_motion_path::PoseSample;
 
         // Synthetic clip: bolt pulls 5 units along +Y (samples 8..40) and
         // returns; a handle rides it rigidly (same translation from an
@@ -457,7 +457,7 @@ int main()
             const auto& follower = boltGroup->followers[0];
             ok &= expectTrue("follower starts at rest", std::abs(follower.keys[0].translate.y) < 0.05f);
             ok &= expectTrue("follower reaches its stroke end with the leader",
-                std::abs(follower.keys[redux::weapon_part_motion_path::kResampledKeyCount - 1].translate.y - 5.0f) < 0.15f);
+                std::abs(follower.keys[paper_toolkit::weapon_part_motion_path::kResampledKeyCount - 1].translate.y - 5.0f) < 0.15f);
 
             // Half-way along the leader stroke the follower is half-way too:
             // the whole assembly moves off one scrub parameter.
@@ -470,7 +470,7 @@ int main()
     }
 
     {
-        using namespace redux::weapon_clip_stroke;
+        using namespace paper_toolkit::weapon_clip_stroke;
 
         // A full automatic-fire clip contains several complete bolt cycles.
         // Authored serving needs one rest->extreme stage, never the sum of all
@@ -490,8 +490,8 @@ int main()
                 : static_cast<float>(20 - cycleSample) / 10.0f;
             automaticBolt.samples[sample].translate.y = -8.0f * phase;
         }
-        redux::weapon_part_motion_path::MotionPath automaticPath{};
-        std::array<float, redux::weapon_part_motion_path::kResampledKeyCount>
+        paper_toolkit::weapon_part_motion_path::MotionPath automaticPath{};
+        std::array<float, paper_toolkit::weapon_part_motion_path::kResampledKeyCount>
             automaticKeyPositions{};
         StrokeSampleWindow automaticWindow{};
         std::uint32_t automaticPeak = 0;
@@ -533,8 +533,8 @@ int main()
                 compoundMagazine.samples[sample].translate.y = carried;
             }
         }
-        redux::weapon_part_motion_path::MotionPath magazinePath{};
-        std::array<float, redux::weapon_part_motion_path::kResampledKeyCount>
+        paper_toolkit::weapon_part_motion_path::MotionPath magazinePath{};
+        std::array<float, paper_toolkit::weapon_part_motion_path::kResampledKeyCount>
             magazineKeyPositions{};
         StrokeSampleWindow magazineWindow{};
         std::uint32_t magazinePeak = 0;
@@ -580,8 +580,8 @@ int main()
                     0.75f * static_cast<float>(sample - 24);
             }
         }
-        redux::weapon_part_motion_path::MotionPath noDwellPath{};
-        std::array<float, redux::weapon_part_motion_path::kResampledKeyCount>
+        paper_toolkit::weapon_part_motion_path::MotionPath noDwellPath{};
+        std::array<float, paper_toolkit::weapon_part_motion_path::kResampledKeyCount>
             noDwellKeyPositions{};
         StrokeSampleWindow noDwellWindow{};
         std::uint32_t noDwellPeak = 0;
@@ -630,9 +630,9 @@ int main()
         // Independent source storage: authored and learned records coexist,
         // but there is no hybrid lookup and AuthoredOnly serves exact
         // equipped-weapon preharvest data exclusively.
-        using namespace redux;
-        using redux::weapon_part_motion_path::PoseSample;
-        using redux::weapon_part_motion_path::Vec3;
+        using namespace paper_toolkit;
+        using paper_toolkit::weapon_part_motion_path::PoseSample;
+        using paper_toolkit::weapon_part_motion_path::Vec3;
 
         constexpr std::uint32_t kWeapon = 0x0001ABCD;
         constexpr const char* kPart = "WeaponBolt";
@@ -988,7 +988,7 @@ int main()
     {
         // AttachOnly allowlist booleans: defaults reproduce the action-role
         // + feed-chain set; per-key toggles change exactly their class.
-        using namespace redux;
+        using namespace paper_toolkit;
         using ActionRole = rock::provider::RockProviderWeaponActionRoleV1;
         using PartKind = rock::provider::RockProviderWeaponPartKindV1;
 
@@ -1032,8 +1032,8 @@ int main()
     {
         // Motion-library format: serialize -> parse must round-trip identity,
         // curation text, paths, and followers; garbage fails closed.
-        using namespace redux;
-        using namespace redux::motion_library;
+        using namespace paper_toolkit;
+        using namespace paper_toolkit::motion_library;
 
         WeaponLibrary library;
         library.weapon = FormRef{ "Fallout4.esm", 0x0004822D };
@@ -1096,7 +1096,7 @@ int main()
         // Learner export/import: records round-trip through the view API,
         // and import NEVER overwrites live in-RAM data ("disk seeds, live
         // learning wins").
-        using namespace redux;
+        using namespace paper_toolkit;
 
         constexpr std::uint32_t kWeapon = 0x0002BEEF;
         constexpr std::uint32_t kOmod = 0x00777777;
@@ -1145,8 +1145,8 @@ int main()
         // Rich learner capture is an evidence plane, not a winner-only view:
         // exact frame/scale samples survive completion, untrusted discard,
         // and a weapon-change flush.
-        using namespace redux;
-        using namespace redux::weapon_part_motion_path;
+        using namespace paper_toolkit;
+        using namespace paper_toolkit::weapon_part_motion_path;
 
         static WeaponPartMotionLearner learner{};
         learner.reset();
@@ -1250,8 +1250,8 @@ int main()
         // JSONL evidence schema: 64-bit values are strings, identities are
         // load-order independent, role names accompany raw values, and raw
         // samples use the versioned compact layout.
-        using namespace redux;
-        using namespace redux::rich_capture;
+        using namespace paper_toolkit;
+        using namespace paper_toolkit::rich_capture;
 
         WeaponSnapshotEvent snapshot{};
         snapshot.context.sessionId = "session-test";
@@ -1289,7 +1289,7 @@ int main()
         ok &= expectFalse("rich snapshot JSON parses", snapshotJson.is_discarded());
         if (!snapshotJson.is_discarded()) {
             ok &= expectTrue("rich schema and event are named",
-                snapshotJson["schema"] == "paper-redux-motion-capture" &&
+                snapshotJson["schema"] == "paper-toolkit-motion-capture" &&
                     snapshotJson["event"] == "weaponSnapshot");
             ok &= expectTrue("64-bit sequence is lossless string",
                 snapshotJson["sequence"] == "9007199254740993" &&

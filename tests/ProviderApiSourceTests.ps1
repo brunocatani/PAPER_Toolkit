@@ -1,8 +1,8 @@
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$main = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'src/PAPERReduxMain.cpp')
-$drive = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'src/redux/WeaponPartDriveSandbox.cpp')
+$main = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'src/PAPER_ToolkitMain.cpp')
+$drive = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'src/paper_toolkit/WeaponPartDriveSandbox.cpp')
 
 function Assert-Contains([string]$Label, [string]$Text, [string]$Pattern) {
     if ($Text -notmatch $Pattern) {
@@ -21,4 +21,4 @@ Assert-Contains 'weapon drive exact capability request' $drive 'requestedCapabil
 Assert-Contains 'weapon drive exact grant validation' $drive 'hasConsumerCapabilityV1\([\s\S]{0,180}grantedCapabilities[\s\S]{0,160}WeaponPartInteraction'
 Assert-Contains 'weapon drive partial-grant rollback' $drive 'if \(!granted\)[\s\S]{0,220}unregisterConsumerV1'
 
-Write-Host 'PAPER Redux provider API source invariants passed.'
+Write-Host 'PAPER Toolkit provider API source invariants passed.'

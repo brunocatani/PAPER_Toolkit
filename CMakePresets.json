@@ -49,7 +49,7 @@
     {
       "binaryDir": "${sourceDir}/build-fast",
       "cacheVariables": {
-        "BUILD_PAPER_REDUX_TESTS": false,
+        "BUILD_PAPER_TOOLKIT_TESTS": false,
         "POST_BUILD_COPY_PLUGIN": false
       },
       "inherits": ["cmake-dev", "vcpkg", "windows", "vs2022"],
@@ -58,7 +58,7 @@
     {
       "binaryDir": "${sourceDir}/build-tests",
       "cacheVariables": {
-        "BUILD_PAPER_REDUX_TESTS": true,
+        "BUILD_PAPER_TOOLKIT_TESTS": true,
         "POST_BUILD_COPY_PLUGIN": false
       },
       "inherits": ["cmake-dev", "vcpkg", "windows", "vs2022"],
@@ -67,7 +67,7 @@
     {
       "binaryDir": "${sourceDir}/build-release",
       "cacheVariables": {
-        "BUILD_PAPER_REDUX_TESTS": false,
+        "BUILD_PAPER_TOOLKIT_TESTS": false,
         "POST_BUILD_COPY_PLUGIN": false
       },
       "inherits": ["cmake-dev", "vcpkg", "windows", "vs2022"],

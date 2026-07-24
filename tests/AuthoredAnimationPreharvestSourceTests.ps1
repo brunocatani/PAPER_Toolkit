@@ -1,9 +1,9 @@
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$preharvestPath = Join-Path $repoRoot 'src/redux/WeaponAnimationPreharvest.cpp'
-$runtimePath = Join-Path $repoRoot 'src/redux/ReduxRuntime.cpp'
-$modePath = Join-Path $repoRoot 'src/redux/MotionPathMode.h'
+$preharvestPath = Join-Path $repoRoot 'src/paper_toolkit/WeaponAnimationPreharvest.cpp'
+$runtimePath = Join-Path $repoRoot 'src/paper_toolkit/PaperToolkitRuntime.cpp'
+$modePath = Join-Path $repoRoot 'src/paper_toolkit/MotionPathMode.h'
 
 $preharvest = Get-Content -LiteralPath $preharvestPath -Raw
 $runtime = Get-Content -LiteralPath $runtimePath -Raw
@@ -52,11 +52,11 @@ Assert-Excludes 'no giant aggregate clip-work temporary' $preharvest 'state\.cli
 Assert-Excludes 'no live clip generator dependency' $preharvest 'hkbClipGenerator'
 Assert-Excludes 'no live activation hook dependency' $preharvest 'ensureClipActivationHookInstalled'
 Assert-Excludes 'no user-controlled clip-time dependency' $preharvest 'userControlled'
-Assert-Contains 'zero-motion clip detail stays below INFO' $preharvest 'RDX_LOG_DEBUG\(Animation,[\s\S]*movingGroups=0'
+Assert-Contains 'zero-motion clip detail stays below INFO' $preharvest 'PAPER_TOOLKIT_LOG_DEBUG\(Animation,[\s\S]*movingGroups=0'
 
 Assert-Contains 'authored runtime calls only preharvest lane' $runtime 'if\s*\(authoredMode\)[\s\S]*updateAuthoredAnimationPreharvest'
 Assert-Contains 'legacy harvesting remains outside authored branch' $runtime 'else\s*\{\s*drainWeaponClipHarvest[\s\S]*updateWeaponClipHarvestWalk'
-Assert-Contains 'authored suppresses learned observations' $runtime 'collectLearnedMotion\s*=\s*g_reduxConfig\.motionPathMode\s*!=\s*MotionPathMode::AuthoredOnly'
+Assert-Contains 'authored suppresses learned observations' $runtime 'collectLearnedMotion\s*=\s*g_paperToolkitConfig\.motionPathMode\s*!=\s*MotionPathMode::AuthoredOnly'
 Assert-Excludes 'runtime contains no hybrid selector' $runtime 'MotionPathMode::Hybrid'
 Assert-Excludes 'mode enum contains no hybrid value' $mode '\bHybrid\s*='
 Assert-Excludes 'mode parser accepts no hybrid text' $mode 'equalsIgnoreCase\(text,\s*"hybrid"\)'
