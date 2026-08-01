@@ -196,7 +196,7 @@ namespace paper_toolkit::rich_capture
         json settingsToJson(const CaptureSettings& settings)
         {
             return json{
-                { "motionPathMode", settings.motionPathMode },
+                { "servingSource", settings.servingSource },
                 { "fullSubtreeObservation", settings.fullSubtreeObservation },
                 { "coTimedFollowers", settings.coTimedFollowers },
                 { "coTimedMinOverlap", settings.coTimedMinOverlap },
@@ -284,6 +284,17 @@ namespace paper_toolkit::rich_capture
             return "unknown";
         }
 
+        const char* clipAcquisitionName(ClipAcquisition acquisition)
+        {
+            switch (acquisition) {
+            case ClipAcquisition::LoadedGraphBinding:
+                return "loadedGraphBinding";
+            case ClipAcquisition::LiveClipActivation:
+                return "liveClipActivation";
+            }
+            return "unknown";
+        }
+
         json rawSampleToJson(const RawSample& sample)
         {
             // Compact positional encoding is intentional: raw strokes are by
@@ -300,7 +311,6 @@ namespace paper_toolkit::rich_capture
                 sample.scale,
                 sample.trusted ? 1 : 0,
                 decimal64(sample.clip.activityId),
-                decimal64(sample.clip.scrubSessionId),
                 sample.clip.concurrentActivityCount,
                 sample.clip.fraction,
                 sample.clip.localTimeSeconds,
@@ -475,7 +485,7 @@ namespace paper_toolkit::rich_capture
                 { "scale", "weapon-root-local scalar" },
                 { "sampling", "one trusted ROCK frame observation per sample; explicit frame ids may contain gaps" },
                 { "clipAttribution", "newest active weapon-track clip; concurrentClipActivityCount reports layered ambiguity" },
-                { "clipIds", "clipActivityId links authoredClip definitions; clipScrubSessionId is a separate live-scrub namespace" },
+                { "clipIds", "clipActivityId links passive clipEvidence definitions" },
             };
             out["part"] = {
                 { "catalogPartId", event.catalogPartId },
@@ -524,7 +534,7 @@ namespace paper_toolkit::rich_capture
             }
             out["rawSampleLayout"] = json::array({
                 "rockFrame", "tx", "ty", "tz", "qw", "qx", "qy", "qz", "scale", "trusted",
-                "clipActivityId", "clipScrubSessionId", "concurrentClipActivityCount", "clipFraction",
+                "clipActivityId", "concurrentClipActivityCount", "clipFraction",
                 "clipLocalTimeSeconds",
             });
             out["samples"] = std::move(samples);
@@ -532,10 +542,11 @@ namespace paper_toolkit::rich_capture
             return out;
         }
 
-        json serializeAuthoredClip(const AuthoredClipEvent& event)
+        json serializeClipEvidence(const ClipEvidenceEvent& event)
         {
             json out = contextToJson(event.context);
-            out["event"] = "authoredClip";
+            out["event"] = "clipEvidence";
+            out["dataRole"] = "evidenceOnly";
             out["activityId"] = decimal64(event.activityId);
             out["coordinateConventions"] = {
                 { "poses", "animation transform-track local space" },
@@ -544,7 +555,7 @@ namespace paper_toolkit::rich_capture
                 { "scaleSamples", "x,y,z unitless" },
                 { "sampleTimes", "uniform inclusive 0..durationSeconds" },
             };
-            out["activatedClip"] = event.activatedClip;
+            out["acquisition"] = clipAcquisitionName(event.acquisition);
             out["animationName"] = event.animationName;
             out["durationSeconds"] = event.durationSeconds;
             out["rawTransformTrackCount"] = event.rawTransformTrackCount;
@@ -626,7 +637,7 @@ namespace paper_toolkit::rich_capture
                 using Value = std::decay_t<decltype(value)>;
                 std::size_t bytes = sizeof(Value) + contextBytes(value.context);
                 if constexpr (std::is_same_v<Value, WeaponSnapshotEvent>) {
-                    bytes += value.settings.motionPathMode.capacity() + 1;
+                    bytes += value.settings.servingSource.capacity() + 1;
                     bytes += value.nodes.capacity() * sizeof(NodeSnapshot);
                     for (const auto& node : value.nodes) {
                         bytes += stringBytes(node.name) + stringBytes(node.rootRelativePath);
@@ -645,13 +656,13 @@ namespace paper_toolkit::rich_capture
                     bytes += value.pointsWeaponLocalGame.capacity() * sizeof(Point3);
                 } else if constexpr (std::is_same_v<Value, RawStrokeEvent>) {
                     bytes += formBytes(value.omod) + stringBytes(value.sourceName) + stringBytes(value.nodePath) +
-                             stringBytes(value.settings.motionPathMode) + stringBytes(value.clipName) +
+                             stringBytes(value.settings.servingSource) + stringBytes(value.clipName) +
                              value.samples.capacity() * sizeof(RawSample) +
                              value.selectedFollowers.capacity() * sizeof(SelectedFollower);
                     for (const auto& follower : value.selectedFollowers) {
                         bytes += formBytes(follower.omod) + stringBytes(follower.sourceName) + stringBytes(follower.tier);
                     }
-                } else if constexpr (std::is_same_v<Value, AuthoredClipEvent>) {
+                } else if constexpr (std::is_same_v<Value, ClipEvidenceEvent>) {
                     bytes += stringBytes(value.animationName) + value.weaponTracks.capacity() * sizeof(ClipTrack) +
                              value.annotations.capacity() * sizeof(ClipAnnotation) +
                              value.triggers.capacity() * sizeof(ClipTrigger);
@@ -685,8 +696,8 @@ namespace paper_toolkit::rich_capture
                     return serializeGeometryChunk(value);
                 } else if constexpr (std::is_same_v<Value, RawStrokeEvent>) {
                     return serializeRawStroke(value);
-                } else if constexpr (std::is_same_v<Value, AuthoredClipEvent>) {
-                    return serializeAuthoredClip(value);
+                } else if constexpr (std::is_same_v<Value, ClipEvidenceEvent>) {
+                    return serializeClipEvidence(value);
                 } else {
                     return serializeGap(value);
                 }

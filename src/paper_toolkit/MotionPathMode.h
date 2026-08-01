@@ -17,14 +17,6 @@ namespace paper_toolkit
         AuthoredOnly = 0,
         // Only runtime-learned paths drive parts.
         LearnedOnly = 1,
-        /*
-         * Clip scrub: the hand drives the live reload CLIP's time (Havok
-         * user-controlled mode on the captured hkbClipGenerator) and the
-         * ENGINE poses every part — no stored path geometry is replayed.
-         * Stored paths are consulted only for their EXISTENCE by the
-         * eligibility gate, never as drive-time geometry.
-         */
-        ClipScrub = 2,
     };
 
     [[nodiscard]] inline constexpr const char* motionPathModeName(MotionPathMode mode)
@@ -34,8 +26,6 @@ namespace paper_toolkit
             return "authored";
         case MotionPathMode::LearnedOnly:
             return "learned";
-        case MotionPathMode::ClipScrub:
-            return "scrub";
         default:
             return "authored";
         }
@@ -63,10 +53,6 @@ namespace paper_toolkit
         }
         if (equalsIgnoreCase(text, "learned")) {
             outMode = MotionPathMode::LearnedOnly;
-            return true;
-        }
-        if (equalsIgnoreCase(text, "scrub")) {
-            outMode = MotionPathMode::ClipScrub;
             return true;
         }
         return false;

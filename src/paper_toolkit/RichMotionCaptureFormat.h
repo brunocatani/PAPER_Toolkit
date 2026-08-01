@@ -20,7 +20,7 @@
  * .capture.jsonl file and are never loaded by gameplay.  Keeping evidence in
  * an append-only plane is the central invariant: path selection may replace a
  * winner, but it can never erase a raw recording, rejected candidate, loadout
- * inventory, ROCK classification, geometry cloud, or authored clip sample.
+ * inventory, ROCK classification, geometry cloud, or passive clip sample.
  *
  * This module is engine-free.  JSON construction happens on the background
  * writer thread; event-scoped vectors deliberately own everything copied from
@@ -28,7 +28,7 @@
  */
 namespace paper_toolkit::rich_capture
 {
-    inline constexpr std::uint32_t kSchemaVersion = 1;
+    inline constexpr std::uint32_t kSchemaVersion = 2;
     inline constexpr std::string_view kSchemaName = "paper-toolkit-motion-capture";
 
     struct FormInfo
@@ -144,7 +144,9 @@ namespace paper_toolkit::rich_capture
 
     struct CaptureSettings
     {
-        std::string motionPathMode;
+        // Selected gameplay source. Capture remains independent and may
+        // collect both authored and learned evidence in either source mode.
+        std::string servingSource;
         bool fullSubtreeObservation{ false };
         bool coTimedFollowers{ false };
         float coTimedMinOverlap{ 0.0f };
@@ -243,7 +245,6 @@ namespace paper_toolkit::rich_capture
     struct ClipSampleContext
     {
         std::uint64_t activityId{ 0 };
-        std::uint64_t scrubSessionId{ 0 };
         std::uint32_t concurrentActivityCount{ 0 };
         float fraction{ 0.0f };
         float localTimeSeconds{ 0.0f };
@@ -319,11 +320,17 @@ namespace paper_toolkit::rich_capture
         std::vector<Point3> scaleSamples;
     };
 
-    struct AuthoredClipEvent
+    enum class ClipAcquisition : std::uint32_t
+    {
+        LoadedGraphBinding = 0,
+        LiveClipActivation = 1,
+    };
+
+    struct ClipEvidenceEvent
     {
         EventContext context;
         std::uint64_t activityId{ 0 };
-        bool activatedClip{ false };
+        ClipAcquisition acquisition{ ClipAcquisition::LoadedGraphBinding };
         std::string animationName;
         float durationSeconds{ 0.0f };
         std::uint32_t rawTransformTrackCount{ 0 };
@@ -351,7 +358,7 @@ namespace paper_toolkit::rich_capture
         std::string reason;
     };
 
-    using Event = std::variant<WeaponSnapshotEvent, GeometryChunkEvent, RawStrokeEvent, AuthoredClipEvent, CaptureGapEvent>;
+    using Event = std::variant<WeaponSnapshotEvent, GeometryChunkEvent, RawStrokeEvent, ClipEvidenceEvent, CaptureGapEvent>;
 
     [[nodiscard]] const EventContext& contextOf(const Event& event);
     [[nodiscard]] std::size_t estimateOwnedBytes(const Event& event);

@@ -6,7 +6,7 @@
 #include "paper_toolkit/WeaponPartEligibility.h"
 #include "paper_toolkit/WeaponPartMotionLearner.h"
 #include "paper_toolkit/WeaponPartMotionPathPolicy.h"
-#include "paper_toolkit/WeaponPartMotionScrubPolicy.h"
+#include "paper_toolkit/WeaponPartPathProjectionPolicy.h"
 
 #include <array>
 #include <cmath>
@@ -117,9 +117,14 @@ int main()
         MotionPathMode parsed = MotionPathMode::LearnedOnly;
         ok &= expectFalse("removed hybrid mode cannot be parsed",
             parseMotionPathMode("hybrid", parsed));
+        ok &= expectFalse("removed scrub mode cannot be parsed",
+            parseMotionPathMode("scrub", parsed));
         ok &= expectTrue("authored mode parses independently",
             parseMotionPathMode("AUTHORED", parsed) &&
                 parsed == MotionPathMode::AuthoredOnly);
+        ok &= expectTrue("learned mode parses independently",
+            parseMotionPathMode("learned", parsed) &&
+                parsed == MotionPathMode::LearnedOnly);
 
         ok &= expectTrue("first-person graph selection is fixed at index one",
             selectFirstPersonGraph(2, 2).valid &&
@@ -358,29 +363,29 @@ int main()
         ok &= expectTrue("longer stroke replaces the stored path", shouldReplacePath(path, longerPath));
         ok &= expectTrue("any valid stroke replaces an empty slot", shouldReplacePath(MotionPath{}, path));
 
-        using namespace paper_toolkit::weapon_part_motion_scrub;
-        const auto seededAtRest = initialScrubPosition(path, rest.translate);
-        ok &= expectTrue("scrub seeds from the part pose", seededAtRest.valid);
-        ok &= expectTrue("scrub seeded at rest starts near arc zero", seededAtRest.arcPosition < 0.5f);
-        const auto seededAtPeak = initialScrubPosition(path, peak.translate);
-        ok &= expectTrue("scrub seeded at peak lands near full arc",
+        using namespace paper_toolkit::weapon_part_path_projection;
+        const auto seededAtRest = seedPathPosition(path, rest.translate);
+        ok &= expectTrue("path projection seeds from the part pose", seededAtRest.valid);
+        ok &= expectTrue("path seeded at rest starts near arc zero", seededAtRest.arcPosition < 0.5f);
+        const auto seededAtPeak = seedPathPosition(path, peak.translate);
+        ok &= expectTrue("path seeded at peak lands near full arc",
             seededAtPeak.valid && seededAtPeak.arcPosition > path.totalArcLength - 0.5f);
 
-        // Pulling the hand along the stroke advances the scrub and the target
+        // Pulling the hand along the stroke advances the path position and the target
         // follows the path; the per-frame clamp bounds each step.
         float arc = seededAtRest.arcPosition;
         Vec3 desired = rest.translate;
         desired.y += 3.0f;
         for (int i = 0; i < 8; ++i) {
-            const auto result = scrub(path, arc, desired);
-            ok &= expectTrue("scrub result stays valid", result.valid);
-            ok &= expectTrue("scrub advance respects the per-frame clamp",
-                result.arcPosition - arc <= kMaxScrubAdvancePerFrame + 0.001f);
+            const auto result = projectOntoPath(path, arc, desired);
+            ok &= expectTrue("path projection result stays valid", result.valid);
+            ok &= expectTrue("path advance respects the per-frame clamp",
+                result.arcPosition - arc <= kMaxProjectionAdvancePerFrame + 0.001f);
             arc = result.arcPosition;
         }
-        ok &= expectTrue("scrub converges to the hand's point on the stroke", std::abs(arc - 3.0f) < 0.35f);
-        const auto midTarget = scrub(path, arc, desired);
-        ok &= expectTrue("scrub target tracks the path translation",
+        ok &= expectTrue("projection converges to the hand's point on the stroke", std::abs(arc - 3.0f) < 0.35f);
+        const auto midTarget = projectOntoPath(path, arc, desired);
+        ok &= expectTrue("projected target tracks the path translation",
             std::abs(midTarget.target.translate.y - desired.y) < 0.35f &&
             std::abs(midTarget.target.translate.x - rest.translate.x) < 0.10f);
 
@@ -388,10 +393,10 @@ int main()
         Vec3 beyond = peak.translate;
         beyond.y += 10.0f;
         for (int i = 0; i < 16; ++i) {
-            arc = scrub(path, arc, beyond).arcPosition;
+            arc = projectOntoPath(path, arc, beyond).arcPosition;
         }
-        ok &= expectTrue("scrub clamps at the end of the stroke", arc <= path.totalArcLength + 0.001f);
-        ok &= expectTrue("scrub reaches the end of the stroke", arc > path.totalArcLength - 0.35f);
+        ok &= expectTrue("projection clamps at the end of the stroke", arc <= path.totalArcLength + 0.001f);
+        ok &= expectTrue("projection reaches the end of the stroke", arc > path.totalArcLength - 0.35f);
     }
 
     {
@@ -460,7 +465,7 @@ int main()
                 std::abs(follower.keys[paper_toolkit::weapon_part_motion_path::kResampledKeyCount - 1].translate.y - 5.0f) < 0.15f);
 
             // Half-way along the leader stroke the follower is half-way too:
-            // the whole assembly moves off one scrub parameter.
+            // the whole assembly moves from one shared path position.
             const float midArc = boltGroup->leaderPath.totalArcLength * 0.5f;
             const float keyPosition = keyPositionForArc(boltGroup->leaderPath, midArc);
             const auto midPose = followerPoseAtKeyPosition(follower, keyPosition);
@@ -1059,6 +1064,7 @@ int main()
         }
         library.parts.push_back(part);
 
+        ok &= expectEqual("compact serving library remains format V1", kFormatVersion, 1u);
         const auto text = serialize(library);
         WeaponLibrary parsed;
         std::string error;
@@ -1267,6 +1273,7 @@ int main()
         snapshot.classification.valid = true;
         snapshot.classification.keywordFlags = 1ull << 2;
         snapshot.classification.sizeClass = 2;
+        snapshot.settings.servingSource = "authored";
         snapshot.nodes.push_back(NodeSnapshot{ .id = 0, .parentId = -1, .name = "Weapon", .rootRelativePath = "/" });
         EvidenceSnapshot evidence{};
         evidence.id = 4;
@@ -1290,7 +1297,11 @@ int main()
         if (!snapshotJson.is_discarded()) {
             ok &= expectTrue("rich schema and event are named",
                 snapshotJson["schema"] == "paper-toolkit-motion-capture" &&
+                    snapshotJson["schemaVersion"] == 2 &&
                     snapshotJson["event"] == "weaponSnapshot");
+            ok &= expectTrue("capture settings separate serving source from collection",
+                snapshotJson["settings"]["servingSource"] == "authored" &&
+                    !snapshotJson["settings"].contains("motionPathMode"));
             ok &= expectTrue("64-bit sequence is lossless string",
                 snapshotJson["sequence"] == "9007199254740993" &&
                     snapshotJson["rockFrame"] == "9007199254740994");
@@ -1381,7 +1392,6 @@ int main()
             .scale = 0.5f,
             .clip = ClipSampleContext{
                 .activityId = 77,
-                .scrubSessionId = 88,
                 .concurrentActivityCount = 2,
                 .fraction = 0.25f,
                 .localTimeSeconds = 0.5f,
@@ -1393,20 +1403,22 @@ int main()
         ok &= expectFalse("rich stroke JSON parses", strokeJson.is_discarded());
         if (!strokeJson.is_discarded()) {
             ok &= expectTrue("raw sample layout is explicit and compact",
-                strokeJson["rawSampleLayout"].size() == 15 && strokeJson["samples"][0].size() == 15);
-            ok &= expectTrue("clip definition, scrub, and layering identities remain distinct",
-                strokeJson["samples"][0][10] == "77" && strokeJson["samples"][0][11] == "88" &&
-                    strokeJson["samples"][0][12] == 2);
+                strokeJson["schemaVersion"] == 2 &&
+                    strokeJson["rawSampleLayout"].size() == 14 &&
+                    strokeJson["samples"][0].size() == 14);
+            ok &= expectTrue("clip activity and layering identities remain distinct",
+                strokeJson["samples"][0][10] == "77" && strokeJson["samples"][0][11] == 2 &&
+                    strokeJson["samples"][0][12] == 0.25f && strokeJson["samples"][0][13] == 0.5f);
             ok &= expectTrue("termination and terminal trust survive",
                 strokeJson["termination"] == "untrustedDrive" && strokeJson["terminalSample"][9] == 0);
         }
 
-        AuthoredClipEvent clip{};
+        ClipEvidenceEvent clip{};
         clip.context.sessionId = "session-test";
         clip.context.sequence = 7;
         clip.context.weapon.ref = { "ExampleWeapon.esp", 0x1234 };
         clip.activityId = 9'007'199'254'740'997ull;
-        clip.activatedClip = true;
+        clip.acquisition = ClipAcquisition::LiveClipActivation;
         clip.animationName = "ReloadMagazine";
         clip.durationSeconds = 1.5f;
         clip.rawTransformTrackCount = 22;
@@ -1421,17 +1433,20 @@ int main()
         clip.annotations.push_back({ 0.25f, "Reload", "magazine_release" });
         clip.triggers.push_back({ 0.75f, 18, "reloadComplete" });
         const auto clipJson = nlohmann::json::parse(serializeLine(Event{ std::move(clip) }), nullptr, false);
-        ok &= expectFalse("rich authored clip JSON parses", clipJson.is_discarded());
+        ok &= expectFalse("rich clip evidence JSON parses", clipJson.is_discarded());
         if (!clipJson.is_discarded()) {
-            ok &= expectTrue("authored clip activity correlation is lossless",
-                clipJson["event"] == "authoredClip" && clipJson["activityId"] == "9007199254740997");
-            ok &= expectTrue("authored clip track and scale survive",
+            ok &= expectTrue("clip activity correlation is lossless",
+                clipJson["event"] == "clipEvidence" && clipJson["activityId"] == "9007199254740997");
+            ok &= expectTrue("clip data is explicitly passive V2 evidence",
+                clipJson["schemaVersion"] == 2 && clipJson["dataRole"] == "evidenceOnly" &&
+                    clipJson["acquisition"] == "liveClipActivation");
+            ok &= expectTrue("clip evidence track and scale survive",
                 clipJson["weaponTracks"][0]["bone"] == "WeaponMagazine" &&
                     clipJson["weaponTracks"][0]["samples"][0] ==
                         nlohmann::json::array({ 10.0f, 20.0f, 30.0f, 1.0f, 0.0f, 0.0f, 0.0f }) &&
                     clipJson["weaponTracks"][0]["scaleSamples"][0] ==
                         nlohmann::json::array({ 1.0f, 1.1f, 1.2f }));
-            ok &= expectTrue("authored clip annotations and triggers survive",
+            ok &= expectTrue("clip evidence annotations and triggers survive",
                 clipJson["annotations"][0]["track"] == "Reload" &&
                     clipJson["annotations"][0]["text"] == "magazine_release" &&
                     clipJson["triggers"][0]["eventId"] == 18 &&

@@ -44,7 +44,7 @@ namespace paper_toolkit
          * firing never flips the other hand's grabs. The per-part provider
          * targets only exist while armed, so ROCK itself resolves grips
          * into the right mode. Off = eligible parts are always attach-only
-         * (scrub on grab, the pre-selection behavior).
+         * (path guidance on grab).
          */
         bool requireTriggerUnlock = true;
         // spdlog level: 0=trace 1=debug 2=info 3=warn 4=error 5=critical 6=off.
@@ -63,10 +63,10 @@ namespace paper_toolkit
          * strokes learned AFTER the change):
          *  - co-timed followers: non-rigid parts temporally contained in
          *    the leader's stroke (P320 barrel tilt during the slide travel)
-         *    ride the scrub alongside the rigid tier;
+         *    follow the projected leader path alongside the rigid tier;
          *  - stage transitions: a stroke chaining onto the primary's end
          *    (mag-in after mag-out) is kept as a return stage, and the
-         *    scrub hands over between stages at the path extremes so each
+         *    drive hands over between stages at the path extremes so each
          *    direction keeps its own path and min/max.
          */
         bool coTimedFollowers = true;
@@ -84,7 +84,7 @@ namespace paper_toolkit
          */
         float travelExtremeTolerance = 0.10f;
         /*
-         * Shell-eject test (2026-07-05): reaching max travel on a scrubbed
+         * Shell-eject test (2026-07-05): reaching max travel on a driven
          * bolt/slide-class part fires the engine's own shell-casing ejection
          * for the equipped weapon (the P-Casing spawn a fired shot uses).
          * One eject per full stroke; weapons without a casing model no-op
@@ -92,30 +92,21 @@ namespace paper_toolkit
          */
         bool shellEjectOnMaxTravel = true;
         /*
-         * Clip-scrub sweep probe (milestone 1 of clip scrub mode): when
-         * true, the next activating animation clip whose path contains
-         * sClipScrubSweepClipFilter is frozen into Havok's user-controlled
-         * mode and its time is ramped 0 -> 1 over fClipScrubSweepSeconds
-         * while the game renders — validating that an engine-scrubbed
-         * reload moves only the weapon rig (FRIK keeps the arms on the
-         * controllers). Log-only: no ammo changes, no grips, one sweep at
-         * a time, mode restored afterwards. The filter also selects which
-         * clips dump their per-track bone names.
+         * Diagnostic-only substring filter for verbose live-clip track-name
+         * logs. Structured evidence capture remains unfiltered and passive.
          */
-        bool clipScrubSweepTest = false;
-        float clipScrubSweepSeconds = 6.0f;
-        std::string clipScrubSweepClipFilter = "Reload";
+        std::string clipTelemetryFilter = "Reload";
         /*
          * Re-record mode: while true, EVERY config (re)load wipes all
          * learner-held motion data (learned strokes AND drained authored
-         * strokes; authored re-harvests on the next equip / clip playback),
+         * strokes; authored preharvest rebuilds on the next equipped-weapon pass),
          * so reloads re-record from scratch under the current grouping
          * settings. With the motion library on, the wipe also deletes the
          * on-disk library files (curated files are kept). Leave true during
          * a re-record session, set false when done. The runtime performs
          * the wipe on the frame thread.
          */
-        bool resetLearnedPaths = false;
+        bool resetMotionData = false;
         /*
          * Motion library (phase 2): one human-editable JSON per weapon under
          * PAPER_Toolkit_Config\MotionLibrary — learning survives restarts, and
@@ -130,7 +121,7 @@ namespace paper_toolkit
          * Append-only mapping evidence beside each serving JSON. Captures a
          * complete ROCK/OMOD/node inventory, geometry clouds, every raw
          * learned recording (including rejected/replaced/interrupted data),
-         * and raw authored clip tracks/markers. The .capture.jsonl archive
+         * and raw passive clip tracks/markers. The .capture.jsonl archive
          * is never loaded by gameplay and is not erased by re-record wipes.
          */
         bool richMotionCapture = true;

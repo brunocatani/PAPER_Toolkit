@@ -3,39 +3,28 @@
 #include <array>
 #include <cstdint>
 
+#include "paper_toolkit/RichMotionCaptureFormat.h"
 #include "paper_toolkit/WeaponClipStrokePolicy.h"
 
-namespace paper_toolkit::weapon_clip_motion_harvest
+namespace paper_toolkit::weapon_clip_telemetry
 {
     /*
-     * Baked-animation stroke harvest. Weapon part motion (bolt, slide,
-     * magazine) is authored as clips whose rig bone names match the weapon's
-     * scene node names ('WeaponBolt' on vanilla, 'P320_Slide' on mods). The
-     * clips' bindings live in a graph's hkbAnimationBindingSet — but which
-     * graph carries them varies: the biped-slot weapon holders were verified
-     * in-game (2026-07-04) to run one-bone 'x_bone01' dummy rigs with empty
-     * sets, so the walk is manager-based and the caller offers every
-     * candidate BSAnimationGraphManager (weapon holders and the actor's own
-     * manager, where weapon subgraphs are activated on equip). This module
-     * walks the chosen manager's active-graph binding set on the MAIN THREAD
-     * after the weapon's colliders finish creation — no hook, no animation
-     * playback — and samples each clip with the engine's own hkaAnimation
-     * sampler, reducing the tracks to authored stroke groups queued for
-     * attribution to the weapon's evidence parts.
+     * Passive live-clip telemetry. Weapon part tracks, markers, triggers, and
+     * clip-time activity are copied into the append-only evidence plane. This
+     * module never produces serving MotionPaths and never writes clip mode,
+     * local time, or user-controlled fractions.
      *
      * Tracks are kept only when their bone name matches one of the caller's
      * weapon scene-node names, which on an actor graph filters out every
      * body clip.
      *
-     * All engine access below the holder pointer goes through offsets
-     * verified against the FO4VR binary — see
-     * docs/research/2026-07-03-baked-animation-motion-extraction.md
-     * (Addendum 2) for the evidence trail of every constant used here.
-     * Every pointer hop passes a plausibility gate and fails closed.
+     * All engine access below the holder pointer retains the existing
+     * FO4VR-verified offsets and plausibility gates; this refactor changes
+     * ownership and mutation policy, not those binary contracts.
      *
-     * Thread model: main thread only (PhysicsInteraction update). The walk is
-     * time-sliced (a few bindings per call) so a large clip set cannot hitch
-     * a frame; no engine pointer is retained between calls — the chain is
+     * Thread model: the graph lifecycle shims copy into fixed, locked packet
+     * storage; the frame-thread walk is time-sliced so a large clip set cannot
+     * hitch a frame. No walk pointer is retained between calls — the chain is
      * re-resolved from the holder every step.
      */
 
@@ -60,16 +49,16 @@ namespace paper_toolkit::weapon_clip_motion_harvest
     [[nodiscard]] const void* managerFromWeaponHolder(const void* weaponGraphHolder);
 
     /*
-     * Advance the walk over the manager's active graph bindings.
+     * Advance the passive evidence walk over active graph bindings.
      * `graphManager` is a live BSAnimationGraphManager (non-owning; must not
      * be retained). Only clip tracks whose rig bone name matches one of
      * `allowedNodeNames` (weapon scene-node names; ':N' instancing suffix on
      * the node side is tolerated, comparison is case-insensitive) are
-     * harvested — on an actor graph this filters out every body clip. A
+     * captured — on an actor graph this filters out every body clip. A
      * change of formId/generationKey, or of the underlying binding-set data
      * (graph swap mid-walk), resets the cursor automatically.
      */
-    StepResult stepHarvest(
+    StepResult stepCapture(
         const void* graphManager,
         std::uint32_t weaponFormId,
         std::uint64_t weaponGenerationKey,
@@ -86,7 +75,7 @@ namespace paper_toolkit::weapon_clip_motion_harvest
      * budget. Clip spline payloads stream in only while a clip is playing,
      * so the walk owner re-runs completed walks periodically — a reload
      * performed while the weapon is held makes its clips resident and the
-     * next pass harvests them.
+     * next pass captures them.
      */
     void restartWalkPass();
 
@@ -109,86 +98,38 @@ namespace paper_toolkit::weapon_clip_motion_harvest
      * are permanent stubs (headers only, no sampleable data — in-game
      * confirmed: firing/reloading never fills them), and the loaded binding
      * lives on the hkbClipGenerator while its clip plays. This hook swaps
-     * the hkbClipGenerator vtable's install-loaded-binding slot (an atomic
-     * pointer write) and harvests from the freshly installed binding — the
-     * one moment the payload is guaranteed resident. Idempotent; call from
-     * the main thread once the sandbox is active.
+     * the hkbClipGenerator lifecycle slots and passively copies the freshly
+     * resident binding plus per-frame activity time. Idempotent.
      */
-    void ensureClipActivationHookInstalled();
+    void ensureClipTelemetryHooksInstalled();
 
     /*
-     * Register what the hook may harvest: the characters of the candidate
+     * Register what the hook may capture: the characters of the candidate
      * managers' graphs (the hook fires for every actor, so anything else is
      * ignored) and the weapon's scene-node names (copied — the hook thread
      * never touches scene-graph memory). Refresh whenever the walk steps;
      * clear when the sandbox shuts down.
      */
-    void setClipActivationTargets(
+    void setClipTelemetryTargets(
         const void* const* graphManagers,
         std::uint32_t managerCount,
         const char* const* allowedNodeNames,
         std::uint32_t allowedNodeNameCount,
         std::uint32_t weaponFormId,
         std::uint64_t weaponGenerationKey);
-    void clearClipActivationTargets();
+    void clearClipTelemetryTargets();
 
     /*
-     * Clip-scrub sweep probe (milestone 1 of clip scrub mode, INI
-     * bClipScrubSweepTest): while enabled, the next activating clip on a
-     * registered character whose animation name contains `clipNameFilter`
-     * (case-insensitive) is flipped into Havok's native user-controlled
-     * mode (m_mode = 2) and its time fraction is ramped 0 -> 1 over
-     * `sweepSeconds` by the update hook; the saved mode is restored at
-     * ramp end (or on deactivation), letting the engine finish the clip
-     * normally. Log-only validation: in-game the arms must stay on the
-     * controllers while the weapon rig plays the reload. One sweep at a
-     * time; disabling mid-sweep lets the active sweep finish. The filter
-     * also selects which clips dump their per-track (bone) names in the
-     * stage-marker dump, independent of `enabled`.
+     * Optional case-insensitive diagnostic filter for verbose per-track name
+     * lines. It does not filter structured capture packets or alter clips.
      */
-    void setScrubSweepConfig(bool enabled, float sweepSeconds, const char* clipNameFilter);
+    void setDiagnosticClipFilter(const char* clipNameFilter);
 
     /*
-     * Clip-scrub SESSION machinery (sMotionPathMode = scrub): while armed,
-     * the first activating clip matching `clipNameFilter` is captured and
-     * FROZEN in Havok's user-controlled mode at its start; the runtime then
-     * feeds the desired time fraction each frame (from the player's hand on
-     * a reload part) and the update hook applies it — the ENGINE poses
-     * every part. Ending the session restores the saved mode so the engine
-     * finishes the reload natively (v1 commit semantics: the game's own
-     * sounds, transitions, and ammo refill). The session also ends itself
-     * on clip deactivation (weapon switch). One session at a time; the
-     * sweep probe takes precedence when both are enabled.
-     *
-     * Main-thread API; fraction traffic is atomic (the main thread never
-     * touches the clip object — all clip writes run inside the hooked
-     * update/deactivate on the graph thread).
-     */
-    struct ClipScrubSessionState
-    {
-        bool active{ false };
-        // Increments per capture; detects session turnover across frames.
-        std::uint64_t sessionId{ 0 };
-        std::uint32_t weaponFormId{ 0 };
-        std::uint64_t weaponGenerationKey{ 0 };
-        float durationSeconds{ 0.0f };
-        float cropStartSeconds{ 0.0f };
-        float croppedDurationSeconds{ 0.0f };
-        // Engine-observed fraction (feedback for the pursuit controller).
-        float fraction{ 0.0f };
-        std::array<char, weapon_clip_stroke::kMaxBoneName> clipName{};
-    };
-    void setClipScrubCaptureConfig(bool armed, const char* clipNameFilter);
-    [[nodiscard]] ClipScrubSessionState clipScrubSessionState();
-    void setClipScrubDesiredFraction(float fraction);
-    // Request release-to-native; applied by the graph thread next update.
-    void endClipScrubSession();
-
-    /*
-     * Raw authored-clip evidence for the append-only mapper archive. The
+     * Raw clip evidence for the append-only mapper archive. The
      * activation/walk code already owns the exact 64-sample weapon tracks;
-     * this queue preserves them before buildAuthoredGroups reduces them to
-     * selected 24-key serving paths. Annotation/trigger arrays are bounded
+     * this queue preserves them without reducing them into serving paths.
+     * Annotation/trigger arrays are bounded
      * and carry explicit truncation flags. Graph thread produces, main
      * thread drains; all storage is fixed-capacity.
      */
@@ -215,7 +156,9 @@ namespace paper_toolkit::weapon_clip_motion_harvest
         std::uint32_t weaponFormId{ 0 };
         std::uint64_t weaponGenerationKey{ 0 };
         std::uint64_t activityId{ 0 };
-        bool activatedClip{ false };
+        rich_capture::ClipAcquisition acquisition{
+            rich_capture::ClipAcquisition::LoadedGraphBinding
+        };
         std::array<char, weapon_clip_stroke::kMaxBoneName> animationName{};
         float durationSeconds{ 0.0f };
         std::uint32_t rawTransformTrackCount{ 0 };
@@ -278,27 +221,14 @@ namespace paper_toolkit::weapon_clip_motion_harvest
      */
     void logResolveDiagnostics(const void* graphManager, const char* label);
 
-    // Main-thread drain of harvested stroke groups (weapon-bone local space;
-    // attribution/space conversion is the caller's job). Returns the number
-    // of groups written to outGroups.
-    std::uint32_t drainGroups(
-        weapon_clip_stroke::AuthoredStrokeGroup* outGroups,
-        std::uint32_t maxGroups);
-
-    // Drop queued groups (weapon changed; pending strokes may belong to the
-    // previous weapon's graph).
-    void clearPending();
-
     struct Stats
     {
         std::uint64_t bindingsSeen{ 0 };
-        std::uint64_t bindingsHarvested{ 0 };
+        std::uint64_t bindingsCaptured{ 0 };
         std::uint64_t bindingsNoTargets{ 0 };
-        std::uint64_t groupsQueued{ 0 };
-        std::uint64_t groupsDropped{ 0 };
         std::uint64_t skippedNonSpline{ 0 };
         std::uint64_t walksCompleted{ 0 };
-        // Which harvestBinding gate rejected bindings (details are dumped,
+        // Which captureBindingEvidence gate rejected bindings (details are dumped,
         // capped per walk, as "binding bail" warnings).
         std::uint64_t bailAnimationPtr{ 0 };
         std::uint64_t bailClipParams{ 0 };

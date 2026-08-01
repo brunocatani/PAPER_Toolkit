@@ -45,9 +45,9 @@ namespace
         }
         s_runtimeWasEnabled = true;
         // Re-record mode: while the key stays true, every INI save wipes the
-        // learned data (game starts begin empty anyway).
-        if (configReloaded && g_paperToolkitConfig.resetLearnedPaths) {
-            s_runtime.wipeLearnedPaths();
+        // compact authored/learned serving data (game starts begin empty).
+        if (configReloaded && g_paperToolkitConfig.resetMotionData) {
+            s_runtime.wipeMotionData();
         }
         s_runtime.onFrame(*snapshot);
     }

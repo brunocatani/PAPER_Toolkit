@@ -12,9 +12,9 @@
  * uniform clip times (the harvest hook produces them by calling the engine's
  * own track sampler). Output is one stroke group per moving "leader" track:
  * the leader's rest→peak stroke resampled exactly like learner paths (so the
- * existing scrub consumes it unchanged), plus followers — tracks that move
+ * existing path drive consumes it unchanged), plus followers — tracks that move
  * RIGIDLY with the leader (constant pairwise distance, the learner's
- * co-movement criterion), driven off one scrub parameter. This is what
+ * co-movement criterion), driven from one shared path position. This is what
  * runtime observation could not give us: per-bone isolated tracks.
  */
 namespace paper_toolkit::weapon_clip_stroke
@@ -95,6 +95,9 @@ namespace paper_toolkit::weapon_clip_stroke
 
     enum class AuthoredClipSource : std::uint8_t
     {
+        // Legacy compact-library provenance values are retained so existing
+        // authored data keeps its V1 representation. Neither legacy tier is
+        // eligible for gameplay serving.
         // A binding found loaded on a graph without proof that it belongs to
         // the exact equipped weapon configuration.
         LoadedGraphFallback = 0,
@@ -107,8 +110,8 @@ namespace paper_toolkit::weapon_clip_stroke
 
     enum class AuthoredTrackSpace : std::uint8_t
     {
-        // Legacy clip tracks expressed in the old rig-bone frame and requiring
-        // PAPER's historical calibrated basis conversion.
+        // Legacy clip-track provenance retained for V1 data compatibility;
+        // the runtime no longer converts or serves this track space.
         RigBoneLocal = 0,
         // Bone hierarchy reconstructed relative to the animation Weapon bone.
         // This is the native preharvest contract and needs no learned basis.
@@ -545,7 +548,7 @@ namespace paper_toolkit::weapon_clip_stroke
         return groupCount;
     }
 
-    // Fractional key index for a scrub arc position; mirrors the scrub
+    // Fractional key index for a projected arc position; mirrors the drive
     // policy's uniform-arc key spacing so follower poses interpolate at the
     // same place the leader pose was produced.
     inline float keyPositionForArc(const MotionPath& path, float arcPosition)

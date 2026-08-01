@@ -3,11 +3,10 @@
 #include "api/ROCKProviderApi.h"
 #include "PaperToolkitLog.h"
 #include "paper_toolkit/WeaponPartMotionLearner.h"
-#include "paper_toolkit/WeaponPartMotionScrubPolicy.h"
+#include "paper_toolkit/WeaponPartPathProjectionPolicy.h"
 
 #include <algorithm>
 #include <array>
-#include <cmath>
 #include <cstring>
 
 namespace paper_toolkit
@@ -18,47 +17,6 @@ namespace paper_toolkit
         constexpr std::uint32_t kRegistrationRetryFrames = 300;
         constexpr std::uint32_t kDriveLeaseFrames = 2;
         constexpr std::uint32_t kDrivePriority = 10;
-
-        /*
-         * Clip-scrub pursuit controller tuning (weapon-root-local units,
-         * per-frame steps at the provider frame rate). Deliberately
-         * file-local constants, not INI — promote whichever ones Bruno's
-         * A/B feel testing actually needs.
-         */
-        // Fraction correction per unit of projected part error, after slope
-        // normalization (1.0 would try to close the whole error in one frame).
-        constexpr float kScrubPursuitGain = 0.35f;
-        // Hard per-frame fraction step cap: full clip in >= ~0.4s at 90fps.
-        constexpr float kScrubMaxFractionPerFrame = 0.03f;
-        // Below this observed travel per unit fraction the direction
-        // estimate is degenerate (dwell window / bootstrap).
-        constexpr float kScrubMinSlopeUnitsPerFraction = 0.05f;
-        // Dwell crawl: slow forward advance while the estimate is
-        // degenerate AND the hand has really pulled away from its anchor.
-        constexpr float kScrubCrawlFractionPerFrame = 0.005f;
-        constexpr float kScrubCrawlHandDeadzoneUnits = 1.0f;
-        // Projected-error deadzone so hand tremor cannot dither the time.
-        constexpr float kScrubErrorDeadzoneUnits = 0.15f;
-        // Minimum observed deltas for a trustworthy slope sample.
-        constexpr float kScrubMinFractionDelta = 1.0e-4f;
-        constexpr float kScrubMinTravelDelta = 1.0e-3f;
-
-        [[nodiscard]] weapon_part_motion_path::Vec3 vecSub(
-            const weapon_part_motion_path::Vec3& a, const weapon_part_motion_path::Vec3& b)
-        {
-            return weapon_part_motion_path::Vec3{ a.x - b.x, a.y - b.y, a.z - b.z };
-        }
-
-        [[nodiscard]] float vecDot(
-            const weapon_part_motion_path::Vec3& a, const weapon_part_motion_path::Vec3& b)
-        {
-            return a.x * b.x + a.y * b.y + a.z * b.z;
-        }
-
-        [[nodiscard]] float vecLength(const weapon_part_motion_path::Vec3& v)
-        {
-            return std::sqrt(vecDot(v, v));
-        }
 
         // Row-major 3x3 from a unit quaternion {w,x,y,z}; matches the
         // fillProviderTransform flattening consumed by providerTransformToNi.
@@ -341,15 +299,10 @@ namespace paper_toolkit
         const WeaponPartMotionLearner& learner,
         SentDrive* outSentDrives,
         MaxTravelEvent* outMaxTravelEvents,
-        std::uint32_t* outMaxTravelEventCount,
-        float* outClipScrubFraction,
-        bool* outClipScrubFractionValid)
+        std::uint32_t* outMaxTravelEventCount)
     {
         if (outMaxTravelEventCount) {
             *outMaxTravelEventCount = 0;
-        }
-        if (outClipScrubFractionValid) {
-            *outClipScrubFractionValid = false;
         }
         if (!ensureRegistered()) {
             _sessions = {};
@@ -382,7 +335,7 @@ namespace paper_toolkit
                 }
                 /*
                  * Trigger arming: the hand is already glued to the part
-                 * (ROCK's AttachOnly grip), but the part does not scrub
+                 * (ROCK's AttachOnly grip), but the part does not drive
                  * until the trigger unlocks it. Level semantics — a trigger
                  * already held at grab time unlocks immediately, a later
                  * press unlocks then; the session then seeds from the part
@@ -397,50 +350,6 @@ namespace paper_toolkit
                             handIndex == 1 ? "left" : "right",
                             hand.sourceName);
                     }
-                    continue;
-                }
-                /*
-                 * ClipScrub session start: no path lookup at all — the hand
-                 * drives the captured clip's time and the engine poses the
-                 * parts. Requires a live captured clip; a grip without one
-                 * glues (ROCK's AttachOnly) but cannot drive, and says so
-                 * once per grip.
-                 */
-                if (input.motionPathMode == MotionPathMode::ClipScrub) {
-                    if (!input.clipScrubSessionActive) {
-                        if (_lastNoPathGripSequence[handIndex] != hand.gripSequence) {
-                            _lastNoPathGripSequence[handIndex] = hand.gripSequence;
-                            PAPER_TOOLKIT_LOG_INFO(Weapon,
-                                "WeaponPartDriveSandbox: scrub grip on '{}' but no reload clip is captured — trigger a reload to scrub",
-                                hand.sourceName);
-                        }
-                        continue;
-                    }
-                    session.active = true;
-                    session.clipScrub = true;
-                    session.clipScrubSessionId = input.clipScrubSessionId;
-                    session.gripSequence = hand.gripSequence;
-                    session.bodyId = hand.bodyId;
-                    session.weaponGenerationKey = input.weaponGenerationKey;
-                    session.weaponFormId = input.weaponFormId;
-                    session.omodFormId = hand.omodFormId;
-                    session.mode = input.motionPathMode;
-                    session.sourceName = {};
-                    std::memcpy(session.sourceName.data(), hand.sourceName.data(),
-                        (std::min)(hand.sourceName.size(), session.sourceName.size() - 1));
-                    session.handStartTranslate = hand.handTranslate;
-                    session.scrubPartStartTranslate = hand.partTranslate;
-                    session.scrubPrevPartTranslate = hand.partTranslate;
-                    session.scrubPrevFraction = input.clipScrubFraction;
-                    session.scrubDirectionValid = false;
-                    session.scrubSlope = 0.0f;
-                    session.scrubLastLogDecile =
-                        static_cast<std::uint32_t>(input.clipScrubFraction * 10.0f);
-                    PAPER_TOOLKIT_LOG_INFO(Weapon,
-                        "WeaponPartDriveSandbox: CLIP-SCRUB grip hand={} part='{}' fraction={:.3f} (pursuit controller live)",
-                        handIndex == 1 ? "left" : "right",
-                        hand.sourceName,
-                        input.clipScrubFraction);
                     continue;
                 }
                 const auto group = learner.findGroup(
@@ -465,7 +374,7 @@ namespace paper_toolkit
                     }
                     continue;
                 }
-                const auto seeded = weapon_part_motion_scrub::initialScrubPosition(*group.leaderPath, hand.partTranslate);
+                const auto seeded = weapon_part_path_projection::seedPathPosition(*group.leaderPath, hand.partTranslate);
                 if (!seeded.valid) {
                     continue;
                 }
@@ -507,7 +416,7 @@ namespace paper_toolkit
                 const auto keptCount = chainFilterFollowers(
                     input, hand.sourceName, session.followers.data(), session.followerCount, keptAtStart);
                 PAPER_TOOLKIT_LOG_INFO(Weapon,
-                    "WeaponPartDriveSandbox: scrub session started hand={} part='{}' arc={:.2f}/{:.2f} mode={} source={} followers={} ({} chain-suppressed) returnStage={} maxTravelArc={:.2f} restArc={:.2f} peakDelta={:.2f} restRef={}",
+                    "WeaponPartDriveSandbox: path-drive session started hand={} part='{}' arc={:.2f}/{:.2f} mode={} source={} followers={} ({} chain-suppressed) returnStage={} maxTravelArc={:.2f} restArc={:.2f} peakDelta={:.2f} restRef={}",
                     handIndex == 1 ? "left" : "right",
                     hand.sourceName,
                     seeded.arcPosition,
@@ -526,95 +435,8 @@ namespace paper_toolkit
             if (!session.active || !hand.transformsValid) {
                 continue;
             }
-            if (session.clipScrub) {
-                // The captured clip is the session's substrate: gone (or a
-                // NEW capture) means this grip's time authority is over.
-                if (!input.clipScrubSessionActive ||
-                    input.clipScrubSessionId != session.clipScrubSessionId) {
-                    PAPER_TOOLKIT_LOG_INFO(Weapon,
-                        "WeaponPartDriveSandbox: CLIP-SCRUB grip ended hand={} part='{}' (clip session gone)",
-                        handIndex == 1 ? "left" : "right",
-                        sessionName(session.sourceName));
-                    endSession(session);
-                    continue;
-                }
-                // One hand owns time per frame (first session wins).
-                if (outClipScrubFractionValid && *outClipScrubFractionValid) {
-                    continue;
-                }
-                const float fraction = input.clipScrubFraction;
-
-                /*
-                 * Slope/direction estimate from what the engine-posed part
-                 * actually did since the last sample: dP/df observed in the
-                 * scene graph — the engine is the curve oracle, so the
-                 * broken authored basis conversion is never involved. The
-                 * direction carries the fraction sign, so a positive
-                 * projected error always means "advance time".
-                 */
-                const auto partDelta = vecSub(hand.partTranslate, session.scrubPrevPartTranslate);
-                const float fractionDelta = fraction - session.scrubPrevFraction;
-                const float travelDelta = vecLength(partDelta);
-                if (std::fabs(fractionDelta) > kScrubMinFractionDelta && travelDelta > kScrubMinTravelDelta) {
-                    const float slope = travelDelta / std::fabs(fractionDelta);
-                    if (slope > kScrubMinSlopeUnitsPerFraction) {
-                        const float sign = fractionDelta > 0.0f ? 1.0f : -1.0f;
-                        session.scrubDirection = weapon_part_motion_path::Vec3{
-                            partDelta.x / travelDelta * sign,
-                            partDelta.y / travelDelta * sign,
-                            partDelta.z / travelDelta * sign,
-                        };
-                        session.scrubSlope = slope;
-                        session.scrubDirectionValid = true;
-                    }
-                }
-                session.scrubPrevPartTranslate = hand.partTranslate;
-                session.scrubPrevFraction = fraction;
-
-                // The part chases the hand's displaced target, exactly the
-                // attach fantasy the learned scrub delivers by driving the
-                // node — here delivered by steering time instead.
-                const auto handDisplacement = vecSub(hand.handTranslate, session.handStartTranslate);
-                const weapon_part_motion_path::Vec3 targetPart{
-                    session.scrubPartStartTranslate.x + handDisplacement.x,
-                    session.scrubPartStartTranslate.y + handDisplacement.y,
-                    session.scrubPartStartTranslate.z + handDisplacement.z,
-                };
-                const auto error = vecSub(targetPart, hand.partTranslate);
-
-                float fractionStep = 0.0f;
-                if (session.scrubDirectionValid && session.scrubSlope > kScrubMinSlopeUnitsPerFraction) {
-                    const float projectedError = vecDot(error, session.scrubDirection);
-                    if (std::fabs(projectedError) > kScrubErrorDeadzoneUnits) {
-                        fractionStep = kScrubPursuitGain * projectedError / session.scrubSlope;
-                    }
-                } else if (vecLength(handDisplacement) > kScrubCrawlHandDeadzoneUnits) {
-                    // Bootstrap / dwell crawl: no usable direction yet, but
-                    // the hand is really pulling — creep time forward until
-                    // the part responds and the estimator takes over.
-                    fractionStep = kScrubCrawlFractionPerFrame;
-                }
-                fractionStep = std::clamp(fractionStep, -kScrubMaxFractionPerFrame, kScrubMaxFractionPerFrame);
-                const float desired = std::clamp(fraction + fractionStep, 0.0f, 1.0f);
-                if (outClipScrubFraction && outClipScrubFractionValid) {
-                    *outClipScrubFraction = desired;
-                    *outClipScrubFractionValid = true;
-                }
-                const auto decile = static_cast<std::uint32_t>(fraction * 10.0f);
-                if (decile != session.scrubLastLogDecile) {
-                    session.scrubLastLogDecile = decile;
-                    PAPER_TOOLKIT_LOG_INFO(Weapon,
-                        "CLIP-SCRUB drive part='{}' fraction={:.3f} slope={:.1f}u/f dirValid={} err={:.2f}u",
-                        sessionName(session.sourceName),
-                        fraction,
-                        session.scrubSlope,
-                        session.scrubDirectionValid,
-                        vecLength(error));
-                }
-                continue;
-            }
             // Session-pinned mode: a hot-reload switch never swaps the path
-            // under a hand mid-scrub.
+            // under a hand mid-drive.
             const auto liveGroup = learner.findGroup(
                 WeaponPartMotionLearner::PartKey{ session.weaponFormId, session.omodFormId, sessionName(session.sourceName) },
                 session.mode);
@@ -630,11 +452,12 @@ namespace paper_toolkit
                 session.pathAnchorTranslate.y + (hand.handTranslate.y - session.handStartTranslate.y),
                 session.pathAnchorTranslate.z + (hand.handTranslate.z - session.handStartTranslate.z),
             };
-            auto scrubbed = weapon_part_motion_scrub::scrub(*path, session.arcPosition, desired);
-            if (!scrubbed.valid) {
+            auto projected = weapon_part_path_projection::projectOntoPath(
+                *path, session.arcPosition, desired);
+            if (!projected.valid) {
                 continue;
             }
-            session.arcPosition = scrubbed.arcPosition;
+            session.arcPosition = projected.arcPosition;
 
             /*
              * DELTA CURVE anchor (Bruno, 2026-07-05): max-travel events and
@@ -651,17 +474,17 @@ namespace paper_toolkit
             const auto extreme = weapon_part_motion_path::travelExtremeFromRest(*path, restReference);
             /*
              * Percentage zones on the delta curve (Bruno, 2026-07-05): the
-             * scrub is "at max" / "at rest" when its displacement from rest
+             * projection is "at max" / "at rest" when its displacement from rest
              * is within a travel FRACTION of the respective extreme, so the
              * zones scale with each part's own stroke — a 4-unit pistol
              * slide and a 10-unit bolt pull behave identically.
              */
-            const float scrubDelta = weapon_part_motion_path::poseDistance(scrubbed.target, restReference);
+            const float pathDelta = weapon_part_motion_path::poseDistance(projected.target, restReference);
             const float travelRange = extreme.valid ? extreme.peakDelta - extreme.restDelta : 0.0f;
             const bool atMaxTravel = extreme.valid &&
-                scrubDelta >= extreme.restDelta + (1.0f - input.travelExtremeToleranceFraction) * travelRange;
+                pathDelta >= extreme.restDelta + (1.0f - input.travelExtremeToleranceFraction) * travelRange;
             const bool atRestPoint = extreme.valid &&
-                scrubDelta <= extreme.restDelta + input.travelExtremeToleranceFraction * travelRange;
+                pathDelta <= extreme.restDelta + input.travelExtremeToleranceFraction * travelRange;
 
             /*
              * Max-travel event (shell-eject test), checked BEFORE the stage
@@ -678,12 +501,12 @@ namespace paper_toolkit
                         auto& event = outMaxTravelEvents[(*outMaxTravelEventCount)++];
                         event.bodyId = session.bodyId;
                         event.sourceName = session.sourceName;
-                        event.arcPosition = scrubbed.arcPosition;
+                        event.arcPosition = projected.arcPosition;
                         event.extremeArcPosition = extreme.arcPosition;
                         event.peakDelta = extreme.peakDelta;
                     }
                 } else if (!atMaxTravel && session.maxTravelLatched &&
-                           scrubDelta <= extreme.restDelta + 0.5f * travelRange) {
+                           pathDelta <= extreme.restDelta + 0.5f * travelRange) {
                     session.maxTravelLatched = false;
                 }
             }
@@ -711,13 +534,14 @@ namespace paper_toolkit
             // arc-end trigger remains only as the no-delta-curve fallback.
             const bool atTransitionPoint = extreme.valid
                 ? (atMaxTravel || atRestPoint)
-                : scrubbed.arcPosition >= path->totalArcLength * (1.0f - input.travelExtremeToleranceFraction);
+                : projected.arcPosition >= path->totalArcLength * (1.0f - input.travelExtremeToleranceFraction);
             if (input.stageTransitionsEnabled && atTransitionPoint) {
                 const auto* nextPath = session.onReturnStage ? liveGroup.leaderPath : liveGroup.returnPath;
                 const auto* nextFollowers = session.onReturnStage ? liveGroup.followers : liveGroup.returnFollowers;
                 const auto nextFollowerCount = session.onReturnStage ? liveGroup.followerCount : liveGroup.returnFollowerCount;
                 if (nextPath && nextPath->valid) {
-                    const auto seeded = weapon_part_motion_scrub::initialScrubPosition(*nextPath, scrubbed.target.translate);
+                    const auto seeded = weapon_part_path_projection::seedPathPosition(
+                        *nextPath, projected.target.translate);
                     // Accept only near-start seeds (chained stages start at
                     // the previous stage's end by construction).
                     constexpr float kStageHandoffMaxSeedArcFraction = 0.25f;
@@ -738,7 +562,7 @@ namespace paper_toolkit
                             }
                         }
                         path = nextPath;
-                        scrubbed = seeded;
+                        projected = seeded;
                         PAPER_TOOLKIT_LOG_INFO(Weapon,
                             "WeaponPartDriveSandbox: stage handoff hand={} part='{}' -> {} stage (arc {:.2f}/{:.2f}, {} followers)",
                             handIndex == 1 ? "left" : "right",
@@ -772,10 +596,10 @@ namespace paper_toolkit
             drive.groupId = static_cast<std::uint32_t>(handIndex + 1);
             drive.priority = kDrivePriority;
             drive.leaseFrames = kDriveLeaseFrames;
-            quatToRotateRowMajor(scrubbed.target.rotate, drive.targetTransform.rotate);
-            drive.targetTransform.translate[0] = scrubbed.target.translate.x;
-            drive.targetTransform.translate[1] = scrubbed.target.translate.y;
-            drive.targetTransform.translate[2] = scrubbed.target.translate.z;
+            quatToRotateRowMajor(projected.target.rotate, drive.targetTransform.rotate);
+            drive.targetTransform.translate[0] = projected.target.translate.x;
+            drive.targetTransform.translate[1] = projected.target.translate.y;
+            drive.targetTransform.translate[2] = projected.target.translate.z;
             drive.targetTransform.scale = session.partScale;
 
             // Authored assembly followers move at the same stroke progress —

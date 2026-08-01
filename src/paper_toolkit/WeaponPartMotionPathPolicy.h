@@ -14,7 +14,7 @@
  * Model: a part rests at a stable pose; when an engine animation moves it, the
  * recorder captures the pose sequence until the part is still again, then the
  * path builder keeps the rest→peak-excursion half of that cycle (a bolt cycle
- * goes rest→open→rest; scrubbing wants the opening stroke). The largest
+ * goes rest→open→rest; path driving wants the opening stroke). The largest
  * completed stroke seen so far wins, so firing and reload animations both
  * contribute and the fullest one is kept. No authored per-weapon data.
  */

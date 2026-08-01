@@ -1,4 +1,4 @@
-#include "paper_toolkit/WeaponClipMotionHarvest.h"
+#include "paper_toolkit/WeaponClipTelemetry.h"
 
 #include "PaperToolkitLog.h"
 
@@ -10,7 +10,7 @@
 #include <mutex>
 #include <type_traits>
 
-namespace paper_toolkit::weapon_clip_motion_harvest
+namespace paper_toolkit::weapon_clip_telemetry
 {
     namespace
     {
@@ -146,11 +146,11 @@ namespace paper_toolkit::weapon_clip_motion_harvest
          *  - +0x40 update     (0x14192D0D0): per-frame time/trigger step;
          *  - +0x50 deactivate (0x14192D510): decrefs and NULLS +0xD0,
          *    restores +0x98 from the +0xD8 backup.
-         * The harvest hooks ACTIVATE with an atomic pointer swap and runs
+         * The telemetry hooks ACTIVATE with an atomic pointer swap and run
          * after the original. A 2026-07-04..05 regression had this hook on
          * +0x50 (then believed to be Bethesda's binding-install override):
          * the shim read [clip+0xD0] right after deactivate nulled it, so
-         * the activation path silently never harvested or dumped markers —
+         * the activation path silently never captured or dumped markers —
          * the equip-time walk masked it.
          */
         constexpr std::uintptr_t kClipGeneratorVtableModuleOffset = 0x2E0FB38;
@@ -158,28 +158,10 @@ namespace paper_toolkit::weapon_clip_motion_harvest
         constexpr std::uintptr_t kClipGeneratorUpdateSlotOffset = 0x40;
         constexpr std::uintptr_t kClipGeneratorDeactivateSlotOffset = 0x50;
         constexpr std::uintptr_t kClipGeneratorLoadedBindingOffset = 0xD0;
-        /*
-         * hkbClipGenerator native scrub interface, raw-disassembly verified
-         * 2026-07-05 with 2-3 agreeing sources per member (update
-         * 0x14192d0d0, computeLocalTime 0x14192f560, ctor 0x14192c520; see
-         * docs/research/2026-07-05-clip-scrub-hkbClipGenerator-verified-
-         * offsets.md): +0xA4/+0xA8 crop start/end amounts (local-time
-         * seconds), +0xB8 float m_userControlledTimeFraction (engine clamps
-         * to [0,1] while mode == 2), +0xBE byte m_mode (2 = user-controlled:
-         * localTime = fraction * croppedDuration + cropStart, timestep-
-         * independent; the trigger walker and echo/loop logic are skipped
-         * entirely), +0x140 float m_localTime, +0x148 float
-         * m_previousUserControlledTimeFraction — MUST be seeded together
-         * with +0xB8 before flipping the mode, or the first scrubbed update
-         * derives a bogus previous local time.
-         */
+        // Read-only clip timing fields used for activity correlation.
         constexpr std::uintptr_t kClipGeneratorCropStartOffset = 0xA4;
         constexpr std::uintptr_t kClipGeneratorCropEndOffset = 0xA8;
-        constexpr std::uintptr_t kClipGeneratorUserFractionOffset = 0xB8;
-        constexpr std::uintptr_t kClipGeneratorModeOffset = 0xBE;
         constexpr std::uintptr_t kClipGeneratorLocalTimeOffset = 0x140;
-        constexpr std::uintptr_t kClipGeneratorPrevUserFractionOffset = 0x148;
-        constexpr std::uint8_t kClipModeUserControlled = 2;
         // hkbClipGenerator::m_animationName (hkStringPtr — mask low bit).
         // Raw disassembly 0x141939911: [clip+0x90] & ~1 formatted into
         // "Animation loaded directly from clip's animationName".
@@ -279,10 +261,7 @@ namespace paper_toolkit::weapon_clip_motion_harvest
         constexpr float kMaxClipDurationSeconds = 300.0f;
         constexpr std::int32_t kMaxPlausibleTrackCount = 512;
         constexpr std::int32_t kMaxPlausibleBoneCount = 4096;
-        // Sized for a burst of consecutive weapon clips on an actor graph
-        // (several groups per clip between per-frame drains).
-        constexpr std::size_t kQueueCapacity = 64;
-        // Bindings sampled per stepHarvest call; bounds the per-frame cost of
+        // Bindings sampled per stepCapture call; bounds the per-frame cost of
         // the at-equip walk (each binding = up to kMaxTracksPerClip tracks x
         // kClipSampleCount engine sampler calls).
         constexpr std::int32_t kBindingsPerStep = 6;
@@ -299,10 +278,6 @@ namespace paper_toolkit::weapon_clip_motion_harvest
         // sampleTracks(this, time, transformTrackCount, transformsOut,
         // floatTrackCount, floatsOut) — MSVC x64: time lands in XMM1.
         using SampleTracks_t = void (*)(void*, float, std::uint32_t, HkQsTransform*, std::uint32_t, float*);
-
-        std::mutex s_queueMutex;
-        std::array<weapon_clip_stroke::AuthoredStrokeGroup, kQueueCapacity> s_queue{};
-        std::uint32_t s_queueCount = 0;
 
         constexpr std::size_t kRichClipQueueCapacity = 8;
         std::atomic<bool> s_richCaptureEnabled{ false };
@@ -331,28 +306,25 @@ namespace paper_toolkit::weapon_clip_motion_harvest
         MarkerCaptureScratch s_markerCaptureScratch{};
 
         /*
-         * Harvest scratch: at 32 tracks / 16 groups per clip these buffers
+         * Capture scratch: 32 raw tracks per clip are too large for engine-
          * are far too large for engine-thread stacks (the hook fires on the
          * animation thread). Shared by the hook and walk paths and
          * serialized by their own mutex — the hook already holds s_hookMutex
-         * through harvestBinding, the walk path does not. Lock order is
-         * always scratch → queue; neither path takes s_hookMutex while
+         * through captureBindingEvidence, the walk path does not. Lock order is
+         * always scratch → rich queue; neither path takes s_hookMutex while
          * holding the scratch lock.
          */
-        std::mutex s_harvestScratchMutex;
+        std::mutex s_captureScratchMutex;
         std::array<std::int16_t, weapon_clip_stroke::kMaxTracksPerClip> s_scratchTrackIndices{};
         std::array<weapon_clip_stroke::TrackSamples, weapon_clip_stroke::kMaxTracksPerClip> s_scratchTracks{};
-        std::array<weapon_clip_stroke::AuthoredStrokeGroup, weapon_clip_stroke::kMaxGroupsPerClip> s_scratchGroups{};
 
         std::atomic<std::uint64_t> s_bindingsSeen{ 0 };
-        std::atomic<std::uint64_t> s_bindingsHarvested{ 0 };
+        std::atomic<std::uint64_t> s_bindingsCaptured{ 0 };
         std::atomic<std::uint64_t> s_bindingsNoTargets{ 0 };
-        std::atomic<std::uint64_t> s_groupsQueued{ 0 };
-        std::atomic<std::uint64_t> s_groupsDropped{ 0 };
         std::atomic<std::uint64_t> s_skippedNonSpline{ 0 };
         std::atomic<std::uint64_t> s_walksCompleted{ 0 };
-        // Bail-reason counters: which harvestBinding gate rejected a binding
-        // (a binding that passes all gates lands in harvested/noTargets).
+        // Bail-reason counters: which captureBindingEvidence gate rejected a
+        // binding (a binding that passes all gates lands in captured/noTargets).
         std::atomic<std::uint64_t> s_bailAnimationPtr{ 0 };
         std::atomic<std::uint64_t> s_bailClipParams{ 0 };
         std::atomic<std::uint64_t> s_bailTrackMap{ 0 };
@@ -370,7 +342,7 @@ namespace paper_toolkit::weapon_clip_motion_harvest
 
         /*
          * Clip-activation hook targets. The hook fires on the engine's graph
-         * update thread for EVERY actor's clip generators, so it harvests
+         * update thread for EVERY actor's clip generators, so it captures
          * only when the character it receives is one of the registered
          * candidate-graph characters, and node names are COPIED here so the
          * hook never touches scene-graph memory. Guarded by s_hookMutex
@@ -390,7 +362,7 @@ namespace paper_toolkit::weapon_clip_motion_harvest
         std::uint64_t s_hookWeaponGenerationKey = 0;
 
         /*
-         * Bindings terminally processed this weapon generation (harvested or
+         * Bindings terminally processed this weapon generation (captured or
          * proven target-less): re-walk passes and repeat clip activations
          * skip them, so a part cannot be overwritten by a different clip on
          * every 2s pass. Bails (e.g. payload not loaded yet) are NOT marked
@@ -398,7 +370,7 @@ namespace paper_toolkit::weapon_clip_motion_harvest
          * assume the caller holds it (the hook already does).
          *
          * Dedup is per PROVENANCE: a binding the walk processed from the
-         * merely-LOADED set may still be re-harvested once when the weapon
+         * merely-LOADED set may still be captured once when the weapon
          * actually ACTIVATES it (the hook) — activation-provenance strokes
          * are the weapon's own animation and outrank walk fallback data, so
          * the upgrade must not be swallowed by the walk's earlier pass. An
@@ -428,74 +400,9 @@ namespace paper_toolkit::weapon_clip_motion_harvest
         // Guarded by s_hookMutex like the registry above.
         std::uint32_t s_stageMarkerLogBudget = kStageMarkerLogBudgetPerGeneration;
 
-        /*
-         * Clip-scrub sweep probe (milestone 1 of clip scrub mode, INI
-         * bClipScrubSweepTest): the first activating clip whose animation
-         * name contains the filter is flipped into Havok's user-controlled
-         * mode and its time fraction is ramped 0 -> 1 over the configured
-         * seconds; the saved mode byte is restored at ramp end or on
-         * deactivation. Log-only — validates in-game that an engine-scrubbed
-         * reload moves only the weapon rig while FRIK keeps the arms on the
-         * controllers.
-         *
-         * Thread model: the config fields are written by the main thread
-         * and read by the activation path, both under s_hookMutex. The
-         * active-sweep fields are seeded inside the activate shim (mutex
-         * held) BEFORE s_sweepClip is published with release order; after
-         * that only the update/deactivate shims of that same clip touch
-         * them (one clip's graph updates on one thread at a time), reading
-         * s_sweepClip with acquire order. The update shim's cost for every
-         * other clip in the game is a single relaxed load and compare.
-         * One sweep at a time; disabling the INI key mid-sweep lets the
-         * active sweep finish on its own (it restores itself).
-         */
-        bool s_sweepConfigEnabled = false;
-        float s_sweepConfigSeconds = 6.0f;
-        std::array<char, 48> s_sweepConfigFilter{};
-
-        std::atomic<std::uintptr_t> s_sweepClip{ 0 };
-        float s_sweepElapsedSeconds = 0.0f;
-        float s_sweepSeconds = 6.0f;
-        float s_sweepClipDuration = 0.0f;
-        std::uint8_t s_sweepSavedMode = 0;
-        std::uint32_t s_sweepNextLogDecile = 0;
-        std::array<char, 64> s_sweepClipName{};
-
-        /*
-         * Clip-scrub SESSION (sMotionPathMode = scrub, the real feature —
-         * the sweep above is the throwaway probe): while armed, the first
-         * activating clip matching the filter is captured and FROZEN in
-         * user-controlled mode at its start; the runtime's pursuit
-         * controller then feeds a desired time fraction (from the player's
-         * hand on a reload part) through s_scrubDesiredFraction, and the
-         * update shim applies it. Ending the session (completion, idle
-         * timeout, mode switch) restores the saved mode so the ENGINE
-         * finishes the reload natively — sounds, transitions, and the ammo
-         * commit are the game's own, which is v1's commit semantics.
-         *
-         * Thread model mirrors the sweep: capture config + hijack under
-         * s_hookMutex, non-atomic session fields seeded BEFORE s_scrubClip
-         * publishes (release), then touched only by the swept clip's own
-         * update/deactivate shims. Main thread <-> graph thread traffic is
-         * atomics only: desired fraction in, observed fraction out, end
-         * request in. Restore transitions run exclusively on the graph
-         * thread inside the shims — the main thread never touches the clip.
-         */
-        bool s_scrubCaptureArmed = false;
-        std::array<char, 48> s_scrubCaptureFilter{};
-
-        std::atomic<std::uintptr_t> s_scrubClip{ 0 };
-        std::atomic<std::uint64_t> s_scrubSessionId{ 0 };
-        std::atomic<float> s_scrubDesiredFraction{ 0.0f };
-        std::atomic<float> s_scrubObservedFraction{ 0.0f };
-        std::atomic<bool> s_scrubEndRequested{ false };
-        std::uint8_t s_scrubSavedMode = 0;
-        float s_scrubCropStart = 0.0f;
-        float s_scrubCroppedDuration = 0.0f;
-        float s_scrubClipDuration = 0.0f;
-        std::uint32_t s_scrubWeaponFormId = 0;
-        std::uint64_t s_scrubWeaponGenerationKey = 0;
-        std::array<char, 64> s_scrubClipName{};
+        // Diagnostic-only filter for verbose track-name lines. Structured
+        // packets are never filtered. Guarded by s_hookMutex.
+        std::array<char, 48> s_diagnosticClipFilter{};
 
         // Active weapon-track clips can overlap in a layered behavior graph.
         // Each slot's metadata is seeded under s_hookMutex before the clip
@@ -618,13 +525,13 @@ namespace paper_toolkit::weapon_clip_motion_harvest
             }
             if (s_processedBindingOverflowLogs++ < 3) {
                 PAPER_TOOLKIT_LOG_WARN(Weapon,
-                    "WeaponClipMotionHarvest: processed-binding table exhausted; binding {:#x} cannot retain a stable authored id",
+                    "WeaponClipTelemetry: processed-binding table exhausted; binding {:#x} cannot retain a stable evidence id",
                     binding);
             }
         }
 
         // Detailed bail dumps are claimed by both the main-thread walk and
-        // graph-thread activation harvest, then reset at a generation
+        // graph-thread activation capture, then reset at a generation
         // boundary. Atomic claim keeps the cap race-free without a hot lock.
         constexpr std::uint32_t kMaxBindingDetailLogsPerWalk = 8;
         std::atomic<std::uint32_t> s_bindingDetailLogs{ 0 };
@@ -658,9 +565,9 @@ namespace paper_toolkit::weapon_clip_motion_harvest
         bool s_walkDone = false;
         // Pass bookkeeping for periodic re-walks (clip payloads stream in
         // only while playing): completion is logged for the first pass and
-        // for any pass that harvested something new.
+        // for any pass that captured something new.
         std::uint32_t s_walkPassIndex = 0;
-        std::uint64_t s_walkPassStartHarvested = 0;
+        std::uint64_t s_walkPassStartCaptured = 0;
         // Deepest chain hop reached by the most recent resolve attempt;
         // reported by the caller when a walk gives up so the failing stage
         // is visible in the log instead of a generic timeout.
@@ -701,7 +608,7 @@ namespace paper_toolkit::weapon_clip_motion_harvest
                 return;
             }
             PAPER_TOOLKIT_LOG_WARN(Weapon,
-                "WeaponClipMotionHarvest: binding bail [{}] binding={:#x}(vt+{:#x}) anim={:#x}(vt+{:#x}) duration={} trackCount={} trackToBone={} bones={}",
+                "WeaponClipTelemetry: binding bail [{}] binding={:#x}(vt+{:#x}) anim={:#x}(vt+{:#x}) duration={} trackCount={} trackToBone={} bones={}",
                 reason,
                 binding,
                 objectVtableRel(binding),
@@ -757,14 +664,14 @@ namespace paper_toolkit::weapon_clip_motion_harvest
         }
 
         /*
-         * A rig bone is a harvest target when it matches one of the weapon's
+         * A rig bone is a telemetry target when it matches one of the weapon's
          * scene-node names: exact (case-insensitive, engine names are
          * case-insensitive) or with a ':N' instancing suffix on the node
          * side ('Bolt_Carrier' bone vs 'Bolt_Carrier:0' node). The filter is
          * what makes walking the ACTOR's graph safe — body-clip tracks never
          * match a weapon node name.
          */
-        bool isHarvestTargetBone(const char* boneName, const char* const* allowedNodeNames, std::uint32_t allowedNodeNameCount)
+        bool isTelemetryTargetBone(const char* boneName, const char* const* allowedNodeNames, std::uint32_t allowedNodeNameCount)
         {
             if (!boneName || boneName[0] == '\0' || !allowedNodeNames) {
                 return false;
@@ -930,16 +837,16 @@ namespace paper_toolkit::weapon_clip_motion_harvest
             }
             std::uint32_t annotationLines = 0;
             /*
-             * Per-track names for filter-matching clips (sweep filter,
-             * whether or not the sweep itself is enabled): annotation
+             * Per-track names for clips matching the diagnostic filter:
+             * annotation
              * tracks are one per transform track and their names are the
              * rig bone names — the cheap proof of whether hand bones are
              * addressable inside the animation data (authored hand-pose
-             * harvest feasibility). Compact, several names per line,
+             * capture feasibility). Compact, several names per line,
              * budget-gated like every detail line.
              */
             const bool dumpTrackNames =
-                s_sweepConfigFilter[0] != '\0' && nameContainsNoCase(clipName, s_sweepConfigFilter.data());
+                s_diagnosticClipFilter[0] != '\0' && nameContainsNoCase(clipName, s_diagnosticClipFilter.data());
             char trackNameLine[224];
             std::size_t trackNameLineLength = 0;
             std::int32_t trackNameLineStart = 0;
@@ -1113,10 +1020,10 @@ namespace paper_toolkit::weapon_clip_motion_harvest
             }
         }
 
-        // Returns true when the binding reached a terminal outcome (harvested
+        // Returns true when the binding reached a terminal outcome (captured
         // or target-less) and should not be revisited this generation; false
         // on bails that may succeed later.
-        bool harvestBinding(
+        bool captureBindingEvidence(
             std::uintptr_t binding,
             std::uintptr_t skeleton,
             const char* const* allowedNodeNames,
@@ -1182,7 +1089,7 @@ namespace paper_toolkit::weapon_clip_motion_harvest
                 s_bailSplineData.fetch_add(1, std::memory_order_relaxed);
                 if (claimBindingDetailLog()) {
                     PAPER_TOOLKIT_LOG_WARN(Weapon,
-                        "WeaponClipMotionHarvest: binding bail [spline-data] anim={:#x} duration={} tracks={} blocks={} maxFrames={} blockOffsets={:#x}({}) floatBlockOffsets={:#x}({}) data={:#x}({})",
+                        "WeaponClipTelemetry: binding bail [spline-data] anim={:#x} duration={} tracks={} blocks={} maxFrames={} blockOffsets={:#x}({}) floatBlockOffsets={:#x}({}) data={:#x}({})",
                         animation,
                         duration,
                         animationTrackCount,
@@ -1280,7 +1187,7 @@ namespace paper_toolkit::weapon_clip_motion_harvest
             // Collect the weapon-part tracks for this clip. Tracks beyond
             // the decode buffer cannot be sampled (slot 5 decodes
             // sequentially from track 0) and are skipped.
-            std::scoped_lock scratchLock(s_harvestScratchMutex);
+            std::scoped_lock scratchLock(s_captureScratchMutex);
             auto& trackIndices = s_scratchTrackIndices;
             auto& tracks = s_scratchTracks;
             std::uint32_t targetCount = 0;
@@ -1293,7 +1200,7 @@ namespace paper_toolkit::weapon_clip_motion_harvest
                     continue;
                 }
                 const char* name = skeletonBoneName(skeleton, boneIndex);
-                if (!isHarvestTargetBone(name, allowedNodeNames, allowedNodeNameCount)) {
+                if (!isTelemetryTargetBone(name, allowedNodeNames, allowedNodeNameCount)) {
                     continue;
                 }
                 ++matchingTargetCount;
@@ -1377,7 +1284,9 @@ namespace paper_toolkit::weapon_clip_motion_harvest
                         packet->weaponFormId = captureWeaponFormId;
                         packet->weaponGenerationKey = captureWeaponGenerationKey;
                         packet->activityId = captureActivityId;
-                        packet->activatedClip = fromActivation;
+                        packet->acquisition = fromActivation
+                            ? rich_capture::ClipAcquisition::LiveClipActivation
+                            : rich_capture::ClipAcquisition::LoadedGraphBinding;
                         packet->durationSeconds = duration;
                         packet->rawTransformTrackCount = static_cast<std::uint32_t>(animationTrackCount);
                         packet->capturedWeaponTrackCount = targetCount;
@@ -1408,23 +1317,14 @@ namespace paper_toolkit::weapon_clip_motion_harvest
                         const auto dropped = s_richClipCapturesDropped.fetch_add(1, std::memory_order_relaxed) + 1;
                         if (dropped <= 3) {
                             PAPER_TOOLKIT_LOG_WARN(Weapon,
-                                "WeaponClipMotionHarvest: rich clip capture queue full — raw authored clip evidence dropped ({})",
+                                "WeaponClipTelemetry: rich clip capture queue full — raw clip evidence dropped ({})",
                                 dropped);
                         }
                     }
                 }
             }
 
-            auto& groups = s_scratchGroups;
-            const auto groupCount = weapon_clip_stroke::buildAuthoredGroups(
-                tracks.data(),
-                targetCount,
-                groups.data(),
-                static_cast<std::uint32_t>(groups.size()));
-            if (groupCount == 0) {
-                return false;
-            }
-            s_bindingsHarvested.fetch_add(1, std::memory_order_relaxed);
+            s_bindingsCaptured.fetch_add(1, std::memory_order_relaxed);
 
             // Frame diagnostics (capped): the targets' rig parents plus the
             // lead target's raw sample endpoints. Compared against the
@@ -1449,7 +1349,7 @@ namespace paper_toolkit::weapon_clip_motion_harvest
                 const auto& rawStart = tracks[0].samples[0].translate;
                 const auto& rawEnd = tracks[0].samples[weapon_clip_stroke::kClipSampleCount - 1].translate;
                 PAPER_TOOLKIT_LOG_INFO(Weapon,
-                    "WeaponClipMotionHarvest: harvested clip duration={:.2f} targets={} lead {}(parent={}) next [{}(parent={}) {}(parent={})] lead raw start=({:.2f},{:.2f},{:.2f}) end=({:.2f},{:.2f},{:.2f})",
+                    "WeaponClipTelemetry: captured clip evidence duration={:.2f} targets={} lead {}(parent={}) next [{}(parent={}) {}(parent={})] lead raw start=({:.2f},{:.2f},{:.2f}) end=({:.2f},{:.2f},{:.2f})",
                     duration,
                     targetCount,
                     tracks[0].boneName.data(),
@@ -1466,53 +1366,6 @@ namespace paper_toolkit::weapon_clip_motion_harvest
                     rawEnd.z);
             }
 
-            // Provenance travels with each group: activation strokes are the
-            // weapon's own animation; walk strokes are loaded-set fallback.
-            for (std::uint32_t i = 0; i < groupCount; ++i) {
-                groups[i].source = fromActivation
-                    ? weapon_clip_stroke::AuthoredClipSource::ActivatedClip
-                    : weapon_clip_stroke::AuthoredClipSource::LoadedGraphFallback;
-                groups[i].trackSpace = weapon_clip_stroke::AuthoredTrackSpace::RigBoneLocal;
-                groups[i].clipAnimationName = {};
-                if (clipAnimationName) {
-                    std::size_t length = 0;
-                    while (length < groups[i].clipAnimationName.size() - 1 && clipAnimationName[length] != '\0') {
-                        groups[i].clipAnimationName[length] = clipAnimationName[length];
-                        ++length;
-                    }
-                }
-            }
-
-            std::scoped_lock lock(s_queueMutex);
-            for (std::uint32_t i = 0; i < groupCount; ++i) {
-                if (s_queueCount >= s_queue.size()) {
-                    /*
-                     * Activated groups outrank fallback data and must not be
-                     * lost to an equip-time walk flood (in-game 2026-07-04:
-                     * groupsDropped grew by exactly one clip per equip and no
-                     * activated stroke ever reached the store): evict a queued
-                     * fallback group instead of dropping the activated one.
-                     */
-                    bool evicted = false;
-                    if (groups[i].source == weapon_clip_stroke::AuthoredClipSource::ActivatedClip) {
-                        for (std::uint32_t slot = 0; slot < s_queueCount; ++slot) {
-                            if (s_queue[slot].source ==
-                                weapon_clip_stroke::AuthoredClipSource::LoadedGraphFallback) {
-                                s_queue[slot] = groups[i];
-                                s_groupsQueued.fetch_add(1, std::memory_order_relaxed);
-                                evicted = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (!evicted) {
-                        s_groupsDropped.fetch_add(1, std::memory_order_relaxed);
-                    }
-                    continue;
-                }
-                s_queue[s_queueCount++] = groups[i];
-                s_groupsQueued.fetch_add(1, std::memory_order_relaxed);
-            }
             return true;
         }
 
@@ -1624,148 +1477,6 @@ namespace paper_toolkit::weapon_clip_motion_harvest
         using ClipGeneratorDeactivateFn = void (*)(void*, void*);
         ClipGeneratorDeactivateFn s_originalClipDeactivate = nullptr;
 
-        /*
-         * Sweep hijack, called with s_hookMutex held right after the
-         * original activate returned (payload resident, m_localTime still
-         * at its start value). Recipe per the verified interface: save the
-         * mode byte, seed BOTH time fractions from the current local time,
-         * then flip to user-controlled — publication of s_sweepClip
-         * (release) is last so the update shim never sees a half-seeded
-         * sweep. Every read is plausibility-gated; a bail leaves the clip
-         * untouched.
-         */
-        void maybeBeginScrubSweepLocked(std::uintptr_t clipGenerator, std::uintptr_t binding, const char* clipName)
-        {
-            if (!s_sweepConfigEnabled || s_sweepClip.load(std::memory_order_relaxed) != 0 ||
-                s_scrubClip.load(std::memory_order_relaxed) != 0) {
-                return;
-            }
-            if (s_sweepConfigFilter[0] == '\0' || !nameContainsNoCase(clipName, s_sweepConfigFilter.data())) {
-                return;
-            }
-            const auto animation = *reinterpret_cast<std::uintptr_t*>(binding + kBindingAnimationOffset);
-            if (!plausiblePointer(animation)) {
-                return;
-            }
-            const float duration = *reinterpret_cast<float*>(animation + kAnimationDurationOffset);
-            if (!std::isfinite(duration) || duration < kMinClipDurationSeconds || duration > kMaxClipDurationSeconds) {
-                return;
-            }
-            const float cropStart = *reinterpret_cast<float*>(clipGenerator + kClipGeneratorCropStartOffset);
-            const float cropEnd = *reinterpret_cast<float*>(clipGenerator + kClipGeneratorCropEndOffset);
-            const float localTime = *reinterpret_cast<float*>(clipGenerator + kClipGeneratorLocalTimeOffset);
-            float croppedDuration = duration;
-            if (std::isfinite(cropStart) && std::isfinite(cropEnd) && cropStart >= 0.0f && cropEnd >= 0.0f &&
-                cropStart + cropEnd < duration) {
-                croppedDuration = duration - cropStart - cropEnd;
-            }
-            float seedFraction = 0.0f;
-            if (std::isfinite(localTime) && croppedDuration > kMinClipDurationSeconds) {
-                seedFraction = localTime - (std::isfinite(cropStart) && cropStart > 0.0f ? cropStart : 0.0f);
-                seedFraction = seedFraction / croppedDuration;
-                seedFraction = seedFraction < 0.0f ? 0.0f : (seedFraction > 1.0f ? 1.0f : seedFraction);
-            }
-
-            s_sweepSavedMode = *reinterpret_cast<std::uint8_t*>(clipGenerator + kClipGeneratorModeOffset);
-            *reinterpret_cast<float*>(clipGenerator + kClipGeneratorUserFractionOffset) = seedFraction;
-            *reinterpret_cast<float*>(clipGenerator + kClipGeneratorPrevUserFractionOffset) = seedFraction;
-            *reinterpret_cast<std::uint8_t*>(clipGenerator + kClipGeneratorModeOffset) = kClipModeUserControlled;
-
-            s_sweepElapsedSeconds = 0.0f;
-            s_sweepSeconds = s_sweepConfigSeconds;
-            s_sweepClipDuration = duration;
-            s_sweepNextLogDecile = 1;
-            s_sweepClipName = {};
-            if (clipName) {
-                std::size_t length = 0;
-                while (length < s_sweepClipName.size() - 1 && clipName[length] != '\0') {
-                    s_sweepClipName[length] = clipName[length];
-                    ++length;
-                }
-            }
-            s_sweepClip.store(clipGenerator, std::memory_order_release);
-            PAPER_TOOLKIT_LOG_INFO(Weapon,
-                "CLIP-SWEEP start clip='{}' duration={:.2f}s cropped={:.2f}s sweep={:.1f}s seed={:.3f} savedMode={} (mode 2 hijack; watch arms vs weapon rig)",
-                s_sweepClipName.data(),
-                duration,
-                croppedDuration,
-                s_sweepSeconds,
-                seedFraction,
-                s_sweepSavedMode);
-        }
-
-        /*
-         * Scrub-session capture, called with s_hookMutex held right after
-         * the original activate. Same verified hijack recipe as the sweep,
-         * but frozen at the seed — the runtime's controller owns the
-         * fraction from here. The sweep probe takes precedence when both
-         * are enabled; one session at a time.
-         */
-        void maybeBeginClipScrubSessionLocked(std::uintptr_t clipGenerator, std::uintptr_t binding, const char* clipName)
-        {
-            if (!s_scrubCaptureArmed || s_sweepConfigEnabled ||
-                s_scrubClip.load(std::memory_order_relaxed) != 0 ||
-                s_sweepClip.load(std::memory_order_relaxed) != 0) {
-                return;
-            }
-            if (s_scrubCaptureFilter[0] == '\0' || !nameContainsNoCase(clipName, s_scrubCaptureFilter.data())) {
-                return;
-            }
-            const auto animation = *reinterpret_cast<std::uintptr_t*>(binding + kBindingAnimationOffset);
-            if (!plausiblePointer(animation)) {
-                return;
-            }
-            const float duration = *reinterpret_cast<float*>(animation + kAnimationDurationOffset);
-            if (!std::isfinite(duration) || duration < kMinClipDurationSeconds || duration > kMaxClipDurationSeconds) {
-                return;
-            }
-            const float cropStart = *reinterpret_cast<float*>(clipGenerator + kClipGeneratorCropStartOffset);
-            const float cropEnd = *reinterpret_cast<float*>(clipGenerator + kClipGeneratorCropEndOffset);
-            const float localTime = *reinterpret_cast<float*>(clipGenerator + kClipGeneratorLocalTimeOffset);
-            float croppedDuration = duration;
-            float effectiveCropStart = 0.0f;
-            if (std::isfinite(cropStart) && std::isfinite(cropEnd) && cropStart >= 0.0f && cropEnd >= 0.0f &&
-                cropStart + cropEnd < duration) {
-                croppedDuration = duration - cropStart - cropEnd;
-                effectiveCropStart = cropStart;
-            }
-            float seedFraction = 0.0f;
-            if (std::isfinite(localTime) && croppedDuration > kMinClipDurationSeconds) {
-                seedFraction = (localTime - effectiveCropStart) / croppedDuration;
-                seedFraction = seedFraction < 0.0f ? 0.0f : (seedFraction > 1.0f ? 1.0f : seedFraction);
-            }
-
-            s_scrubSavedMode = *reinterpret_cast<std::uint8_t*>(clipGenerator + kClipGeneratorModeOffset);
-            *reinterpret_cast<float*>(clipGenerator + kClipGeneratorUserFractionOffset) = seedFraction;
-            *reinterpret_cast<float*>(clipGenerator + kClipGeneratorPrevUserFractionOffset) = seedFraction;
-            *reinterpret_cast<std::uint8_t*>(clipGenerator + kClipGeneratorModeOffset) = kClipModeUserControlled;
-
-            s_scrubCropStart = effectiveCropStart;
-            s_scrubCroppedDuration = croppedDuration;
-            s_scrubClipDuration = duration;
-            s_scrubWeaponFormId = s_hookWeaponFormId;
-            s_scrubWeaponGenerationKey = s_hookWeaponGenerationKey;
-            s_scrubClipName = {};
-            if (clipName) {
-                std::size_t length = 0;
-                while (length < s_scrubClipName.size() - 1 && clipName[length] != '\0') {
-                    s_scrubClipName[length] = clipName[length];
-                    ++length;
-                }
-            }
-            s_scrubDesiredFraction.store(seedFraction, std::memory_order_relaxed);
-            s_scrubObservedFraction.store(seedFraction, std::memory_order_relaxed);
-            s_scrubEndRequested.store(false, std::memory_order_relaxed);
-            s_scrubSessionId.fetch_add(1, std::memory_order_relaxed);
-            s_scrubClip.store(clipGenerator, std::memory_order_release);
-            PAPER_TOOLKIT_LOG_INFO(Weapon,
-                "CLIP-SCRUB session start clip='{}' duration={:.2f}s cropped={:.2f}s seed={:.3f} (frozen; grab a reload part to drive it)",
-                s_scrubClipName.data(),
-                duration,
-                croppedDuration,
-                seedFraction);
-        }
-
         void beginRichClipActivityLocked(
             std::uintptr_t clipGenerator,
             std::uintptr_t binding,
@@ -1807,7 +1518,7 @@ namespace paper_toolkit::weapon_clip_motion_harvest
             if (!slot) {
                 if (s_richActiveClipOverflowLogs.fetch_add(1, std::memory_order_relaxed) < 3) {
                     PAPER_TOOLKIT_LOG_WARN(Weapon,
-                        "WeaponClipMotionHarvest: active rich clip registry full; clip {:#x} has no learner correlation slot",
+                        "WeaponClipTelemetry: active clip registry full; clip {:#x} has no learner correlation slot",
                         clipGenerator);
                 }
                 return;
@@ -1880,7 +1591,7 @@ namespace paper_toolkit::weapon_clip_motion_harvest
          * degrades into a counted skip. The character filter keeps NPC clip
          * activations out.
          */
-        void harvestFromClipGenerator(void* clipGeneratorRaw, void* contextRaw)
+        void captureFromClipGenerator(void* clipGeneratorRaw, void* contextRaw)
         {
             s_hookFires.fetch_add(1, std::memory_order_relaxed);
             const auto clipGenerator = reinterpret_cast<std::uintptr_t>(clipGeneratorRaw);
@@ -1915,7 +1626,7 @@ namespace paper_toolkit::weapon_clip_motion_harvest
                 if (s_hookCharacterCount > 0 &&
                     s_hookUnmatchedLogs.fetch_add(1, std::memory_order_relaxed) < kMaxHookUnmatchedLogs) {
                     PAPER_TOOLKIT_LOG_WARN(Weapon,
-                        "WeaponClipMotionHarvest: hook fired, no registered character in context {:#x} slots=[{:#x}|{:#x}|{:#x}|{:#x}] clipGen={:#x}; registered[0]={:#x}",
+                        "WeaponClipTelemetry: hook fired, no registered character in context {:#x} slots=[{:#x}|{:#x}|{:#x}|{:#x}] clipGen={:#x}; registered[0]={:#x}",
                         context,
                         contextSlots[0],
                         contextSlots[1],
@@ -1950,9 +1661,7 @@ namespace paper_toolkit::weapon_clip_motion_harvest
              * [clip+0x90] & ~1 appended to "Animation loaded directly from
              * clip's animationName"; the AND -2 is the hkStringPtr
              * owned-bit convention). Copied under plausibility + printable
-             * gates — a bad read degrades into an unnamed harvest. Copied
-             * BEFORE the processed-binding dedup: the sweep probe below
-             * must see every activation, not just the first per binding.
+             * gates — a bad read degrades into an unnamed capture.
              */
             std::array<char, 64> animationName{};
             const auto namePointer =
@@ -1972,8 +1681,6 @@ namespace paper_toolkit::weapon_clip_motion_harvest
                 }
                 animationName[length] = '\0';
             }
-            maybeBeginScrubSweepLocked(clipGenerator, binding, animationName.data());
-            maybeBeginClipScrubSessionLocked(clipGenerator, binding, animationName.data());
             const bool richCaptureEnabled = s_richCaptureEnabled.load(std::memory_order_relaxed);
             const bool alreadyProcessed = bindingProcessedLocked(binding, /*fromActivation=*/true);
             std::uint64_t activityId = alreadyProcessed
@@ -2014,15 +1721,15 @@ namespace paper_toolkit::weapon_clip_motion_harvest
                     REL::Module::get().base() + kBehaviorGraphVtableModuleOffset) {
                 behaviorGraph = 0;
             }
-            // Stage markers dump BEFORE the harvest so the names/times land
-            // in the log even when the stroke harvest itself bails.
+            // Stage markers dump before track capture so names/times remain
+            // available even when raw track sampling bails.
             auto* markerCapture = s_richCaptureEnabled.load(std::memory_order_relaxed)
                 ? &s_markerCaptureScratch
                 : nullptr;
             dumpClipStageMarkers(clipGenerator, binding, animationName.data(), behaviorGraph, markerCapture);
             bool hadWeaponTracks = false;
             bool richPacketQueued = false;
-            const bool terminal = harvestBinding(
+            const bool terminal = captureBindingEvidence(
                     binding,
                     skeleton,
                     s_hookNodeNamePointers.data(),
@@ -2054,103 +1761,18 @@ namespace paper_toolkit::weapon_clip_motion_harvest
             if (s_originalClipActivate) {
                 s_originalClipActivate(clipGenerator, context);
             }
-            harvestFromClipGenerator(clipGenerator, context);
+            captureFromClipGenerator(clipGenerator, context);
         }
 
-        /*
-         * Sweep driver. Fires for EVERY clip generator in the game each
-         * frame; the non-swept path is one relaxed load and a compare. For
-         * the swept clip: advance the ramp by the engine's own timestep,
-         * write the fraction BEFORE the original update (mode 2 computes
-         * localTime from it this same call), then log the engine-computed
-         * localTime as the probe's evidence. The clip is only ever touched
-         * inside its own engine update/deactivate, so its lifetime is
-         * guaranteed by the caller — no retained-pointer dereference risk.
-         */
+        // Passive update: preserve native behavior, then publish read-only
+        // local-time telemetry for registered weapon-track clips.
         void clipGeneratorUpdateShim(void* clipGeneratorRaw, void* context, float timestep)
         {
             const auto clipGenerator = reinterpret_cast<std::uintptr_t>(clipGeneratorRaw);
-            /*
-             * Scrub-session branch: apply the runtime's desired fraction,
-             * publish the engine-computed fraction back, and perform the
-             * restore-to-native transition here (graph thread) when the
-             * runtime requested the session end. The clip is alive by
-             * construction inside its own update.
-             */
-            if (s_scrubClip.load(std::memory_order_acquire) == clipGenerator) {
-                if (s_scrubEndRequested.load(std::memory_order_relaxed)) {
-                    *reinterpret_cast<std::uint8_t*>(clipGenerator + kClipGeneratorModeOffset) = s_scrubSavedMode;
-                    s_scrubClip.store(0, std::memory_order_release);
-                    PAPER_TOOLKIT_LOG_INFO(Weapon,
-                        "CLIP-SCRUB session released to native clip='{}' at fraction {:.3f} (mode {} restored; engine finishes the reload)",
-                        s_scrubClipName.data(),
-                        s_scrubObservedFraction.load(std::memory_order_relaxed),
-                        s_scrubSavedMode);
-                    if (s_originalClipUpdate) {
-                        s_originalClipUpdate(clipGeneratorRaw, context, timestep);
-                    }
-                    publishRichClipActivityTime(clipGenerator);
-                    return;
-                }
-                float desired = s_scrubDesiredFraction.load(std::memory_order_relaxed);
-                desired = desired < 0.0f ? 0.0f : (desired > 1.0f ? 1.0f : desired);
-                *reinterpret_cast<float*>(clipGenerator + kClipGeneratorUserFractionOffset) = desired;
-                if (s_originalClipUpdate) {
-                    s_originalClipUpdate(clipGeneratorRaw, context, timestep);
-                }
-                publishRichClipActivityTime(clipGenerator);
-                if (s_scrubCroppedDuration > kMinClipDurationSeconds) {
-                    const float localTime =
-                        *reinterpret_cast<float*>(clipGenerator + kClipGeneratorLocalTimeOffset);
-                    if (std::isfinite(localTime)) {
-                        float observed = (localTime - s_scrubCropStart) / s_scrubCroppedDuration;
-                        observed = observed < 0.0f ? 0.0f : (observed > 1.0f ? 1.0f : observed);
-                        s_scrubObservedFraction.store(observed, std::memory_order_relaxed);
-                    }
-                }
-                return;
-            }
-            if (s_sweepClip.load(std::memory_order_acquire) != clipGenerator) {
-                if (s_originalClipUpdate) {
-                    s_originalClipUpdate(clipGeneratorRaw, context, timestep);
-                }
-                publishRichClipActivityTime(clipGenerator);
-                return;
-            }
-            if (std::isfinite(timestep) && timestep > 0.0f && timestep < 1.0f) {
-                s_sweepElapsedSeconds += timestep;
-            }
-            const float fraction =
-                s_sweepSeconds > 0.0f ? (std::min)(s_sweepElapsedSeconds / s_sweepSeconds, 1.0f) : 1.0f;
-            *reinterpret_cast<float*>(clipGenerator + kClipGeneratorUserFractionOffset) = fraction;
             if (s_originalClipUpdate) {
                 s_originalClipUpdate(clipGeneratorRaw, context, timestep);
             }
             publishRichClipActivityTime(clipGenerator);
-            const auto decile = static_cast<std::uint32_t>(fraction * 10.0f);
-            if (decile >= s_sweepNextLogDecile) {
-                s_sweepNextLogDecile = decile + 1;
-                PAPER_TOOLKIT_LOG_INFO(Weapon,
-                    "CLIP-SWEEP clip='{}' fraction={:.2f} engineLocalTime={:.3f}/{:.2f}s",
-                    s_sweepClipName.data(),
-                    fraction,
-                    *reinterpret_cast<float*>(clipGenerator + kClipGeneratorLocalTimeOffset),
-                    s_sweepClipDuration);
-            }
-            if (fraction >= 1.0f) {
-                // Restore AFTER the fraction-1.0 update posed the clip end;
-                // native mode resumes from there and finishes the reload
-                // normally (missed triggers may fire in a burst — expected
-                // probe artifact, commit semantics are ours in the real
-                // feature).
-                *reinterpret_cast<std::uint8_t*>(clipGenerator + kClipGeneratorModeOffset) = s_sweepSavedMode;
-                s_sweepClip.store(0, std::memory_order_release);
-                PAPER_TOOLKIT_LOG_INFO(Weapon,
-                    "CLIP-SWEEP done clip='{}' swept {:.1f}s, mode {} restored",
-                    s_sweepClipName.data(),
-                    s_sweepSeconds,
-                    s_sweepSavedMode);
-            }
         }
 
         void clipGeneratorDeactivateShim(void* clipGeneratorRaw, void* context)
@@ -2166,25 +1788,6 @@ namespace paper_toolkit::weapon_clip_motion_harvest
                         break;
                     }
                 }
-            }
-            if (s_scrubClip.load(std::memory_order_acquire) == clipGenerator) {
-                *reinterpret_cast<std::uint8_t*>(clipGenerator + kClipGeneratorModeOffset) = s_scrubSavedMode;
-                s_scrubClip.store(0, std::memory_order_release);
-                PAPER_TOOLKIT_LOG_INFO(Weapon,
-                    "CLIP-SCRUB session ended clip='{}' deactivated at fraction {:.3f} (mode restored)",
-                    s_scrubClipName.data(),
-                    s_scrubObservedFraction.load(std::memory_order_relaxed));
-            }
-            if (s_sweepClip.load(std::memory_order_acquire) == clipGenerator) {
-                // Restore before the original tears the payload down; the
-                // mode byte survives on the clone for its next activation.
-                *reinterpret_cast<std::uint8_t*>(clipGenerator + kClipGeneratorModeOffset) = s_sweepSavedMode;
-                s_sweepClip.store(0, std::memory_order_release);
-                PAPER_TOOLKIT_LOG_INFO(Weapon,
-                    "CLIP-SWEEP aborted clip='{}' deactivated at {:.2f}s of {:.1f}s sweep (mode restored)",
-                    s_sweepClipName.data(),
-                    s_sweepElapsedSeconds,
-                    s_sweepSeconds);
             }
             if (s_originalClipDeactivate) {
                 s_originalClipDeactivate(clipGeneratorRaw, context);
@@ -2207,7 +1810,7 @@ namespace paper_toolkit::weapon_clip_motion_harvest
         return plausiblePointer(manager) ? reinterpret_cast<const void*>(manager) : nullptr;
     }
 
-    void ensureClipActivationHookInstalled()
+    void ensureClipTelemetryHooksInstalled()
     {
         static bool s_installed = false;
         if (s_installed) {
@@ -2217,8 +1820,8 @@ namespace paper_toolkit::weapon_clip_motion_harvest
         const auto vtableBase = REL::Module::get().base() + kClipGeneratorVtableModuleOffset;
         // 8-byte aligned pointer stores are atomic on x64, so concurrent
         // graph updates dispatching through the slots stay safe during the
-        // swaps. Activate feeds the harvest + sweep hijack; update drives
-        // an active sweep's ramp; deactivate restores an interrupted sweep.
+        // swaps. Activate copies evidence, update publishes read-only timing,
+        // and deactivate clears the matching activity slot.
         const auto activateSlot = vtableBase + kClipGeneratorActivateSlotOffset;
         s_originalClipActivate =
             reinterpret_cast<ClipGeneratorActivateFn>(*reinterpret_cast<std::uintptr_t*>(activateSlot));
@@ -2232,84 +1835,26 @@ namespace paper_toolkit::weapon_clip_motion_harvest
             reinterpret_cast<ClipGeneratorDeactivateFn>(*reinterpret_cast<std::uintptr_t*>(deactivateSlot));
         REL::safe_write(deactivateSlot, reinterpret_cast<std::uintptr_t>(&clipGeneratorDeactivateShim));
         PAPER_TOOLKIT_LOG_INFO(Weapon,
-            "WeaponClipMotionHarvest: clip lifecycle hooks installed (activate +{:#x}, update +{:#x}, deactivate +{:#x})",
+            "WeaponClipTelemetry: passive clip lifecycle hooks installed (activate +{:#x}, update +{:#x}, deactivate +{:#x})",
             moduleRelative(reinterpret_cast<std::uintptr_t>(s_originalClipActivate)),
             moduleRelative(reinterpret_cast<std::uintptr_t>(s_originalClipUpdate)),
             moduleRelative(reinterpret_cast<std::uintptr_t>(s_originalClipDeactivate)));
     }
 
-    void setScrubSweepConfig(bool enabled, float sweepSeconds, const char* clipNameFilter)
+    void setDiagnosticClipFilter(const char* clipNameFilter)
     {
         std::scoped_lock lock(s_hookMutex);
-        s_sweepConfigEnabled = enabled;
-        if (std::isfinite(sweepSeconds)) {
-            s_sweepConfigSeconds = sweepSeconds < 1.0f ? 1.0f : (sweepSeconds > 60.0f ? 60.0f : sweepSeconds);
-        }
-        s_sweepConfigFilter = {};
+        s_diagnosticClipFilter = {};
         if (clipNameFilter) {
             std::size_t length = 0;
-            while (length < s_sweepConfigFilter.size() - 1 && clipNameFilter[length] != '\0') {
-                s_sweepConfigFilter[length] = clipNameFilter[length];
+            while (length < s_diagnosticClipFilter.size() - 1 && clipNameFilter[length] != '\0') {
+                s_diagnosticClipFilter[length] = clipNameFilter[length];
                 ++length;
             }
         }
     }
 
-    void setClipScrubCaptureConfig(bool armed, const char* clipNameFilter)
-    {
-        std::scoped_lock lock(s_hookMutex);
-        // Disarming does not end an active session — the runtime owns that
-        // decision through endClipScrubSession (mode switch, idle timeout).
-        s_scrubCaptureArmed = armed;
-        s_scrubCaptureFilter = {};
-        if (clipNameFilter) {
-            std::size_t length = 0;
-            while (length < s_scrubCaptureFilter.size() - 1 && clipNameFilter[length] != '\0') {
-                s_scrubCaptureFilter[length] = clipNameFilter[length];
-                ++length;
-            }
-        }
-    }
-
-    ClipScrubSessionState clipScrubSessionState()
-    {
-        ClipScrubSessionState state{};
-        // acquire pairs with the capture's release publish, so the
-        // graph-thread-seeded duration fields below are visible whenever
-        // active reads true.
-        state.active = s_scrubClip.load(std::memory_order_acquire) != 0;
-        state.sessionId = s_scrubSessionId.load(std::memory_order_relaxed);
-        state.fraction = s_scrubObservedFraction.load(std::memory_order_relaxed);
-        if (state.active) {
-            state.weaponFormId = s_scrubWeaponFormId;
-            state.weaponGenerationKey = s_scrubWeaponGenerationKey;
-            state.durationSeconds = s_scrubClipDuration;
-            state.cropStartSeconds = s_scrubCropStart;
-            state.croppedDurationSeconds = s_scrubCroppedDuration;
-            state.clipName = s_scrubClipName;
-        }
-        return state;
-    }
-
-    void setClipScrubDesiredFraction(float fraction)
-    {
-        if (!std::isfinite(fraction)) {
-            return;
-        }
-        s_scrubDesiredFraction.store(
-            fraction < 0.0f ? 0.0f : (fraction > 1.0f ? 1.0f : fraction), std::memory_order_relaxed);
-    }
-
-    void endClipScrubSession()
-    {
-        // Flag only; the swept clip's own update shim performs the restore
-        // on the graph thread (the main thread never touches the clip).
-        if (s_scrubClip.load(std::memory_order_acquire) != 0) {
-            s_scrubEndRequested.store(true, std::memory_order_relaxed);
-        }
-    }
-
-    void setClipActivationTargets(
+    void setClipTelemetryTargets(
         const void* const* graphManagers,
         std::uint32_t managerCount,
         const char* const* allowedNodeNames,
@@ -2351,7 +1896,7 @@ namespace paper_toolkit::weapon_clip_motion_harvest
         }
     }
 
-    void clearClipActivationTargets()
+    void clearClipTelemetryTargets()
     {
         std::scoped_lock lock(s_hookMutex);
         s_hookCharacterCount = 0;
@@ -2388,7 +1933,7 @@ namespace paper_toolkit::weapon_clip_motion_harvest
         GraphArrayView graphs{};
         const bool haveArray = resolveGraphArray(manager, graphs);
         PAPER_TOOLKIT_LOG_WARN(Weapon,
-            "WeaponClipMotionHarvest diagnostics [{}]: mgr={:#x}(vt+{:#x}) graphsFlags={:#010x} activeIdx={} slots={}",
+            "WeaponClipTelemetry diagnostics [{}]: mgr={:#x}(vt+{:#x}) graphsFlags={:#010x} activeIdx={} slots={}",
             label ? label : "?",
             manager,
             objectVtableRel(manager),
@@ -2449,7 +1994,7 @@ namespace paper_toolkit::weapon_clip_motion_harvest
                 }
             }
             PAPER_TOOLKIT_LOG_WARN(Weapon,
-                "WeaponClipMotionHarvest diagnostics [{}] graph[{}]{}: graph={:#x}(vt+{:#x}) charVt=+{:#x} "
+                "WeaponClipTelemetry diagnostics [{}] graph[{}]{}: graph={:#x}(vt+{:#x}) charVt=+{:#x} "
                 "setup={:#x}(vt+{:#x}) skel={:#x}(vt+{:#x}) bones={} first=[{}|{}|{}] last=[{}] "
                 "setSrc={} set={:#x}(vt+{:#x}) data={:#x} count={}",
                 label ? label : "?",
@@ -2475,7 +2020,7 @@ namespace paper_toolkit::weapon_clip_motion_harvest
         }
     }
 
-    StepResult stepHarvest(
+    StepResult stepCapture(
         const void* graphManager,
         std::uint32_t weaponFormId,
         std::uint64_t weaponGenerationKey,
@@ -2492,7 +2037,7 @@ namespace paper_toolkit::weapon_clip_motion_harvest
             s_walkDone = false;
             s_bindingDetailLogs.store(0, std::memory_order_relaxed);
             s_walkPassIndex = 0;
-            s_walkPassStartHarvested = s_bindingsHarvested.load(std::memory_order_relaxed);
+            s_walkPassStartCaptured = s_bindingsCaptured.load(std::memory_order_relaxed);
             std::scoped_lock lock(s_hookMutex);
             advanceProcessedBindingEpochLocked();
             s_stageMarkerLogBudget = kStageMarkerLogBudgetPerGeneration;
@@ -2521,16 +2066,16 @@ namespace paper_toolkit::weapon_clip_motion_harvest
                 }
                 s_walkDone = true;
                 s_walksCompleted.fetch_add(1, std::memory_order_relaxed);
-                const auto harvested = s_bindingsHarvested.load(std::memory_order_relaxed);
+                const auto captured = s_bindingsCaptured.load(std::memory_order_relaxed);
                 // Periodic re-walk passes only log when something new landed.
-                if (s_walkPassIndex == 0 || harvested != s_walkPassStartHarvested) {
+                if (s_walkPassIndex == 0 || captured != s_walkPassStartCaptured) {
                     PAPER_TOOLKIT_LOG_INFO(Weapon,
-                        "WeaponClipMotionHarvest: walked weapon {:08X} pass {} — {} graph slot(s), {} binding(s) visited, {} harvested, {} without part tracks (cumulative)",
+                        "WeaponClipTelemetry: walked weapon {:08X} pass {} — {} graph slot(s), {} binding(s) visited, {} captured, {} without part tracks (cumulative)",
                         weaponFormId,
                         s_walkPassIndex,
                         graphs.capacity,
                         s_walkBindingsVisited,
-                        harvested,
+                        captured,
                         s_bindingsNoTargets.load(std::memory_order_relaxed));
                 }
                 ++s_walkPassIndex;
@@ -2582,7 +2127,7 @@ namespace paper_toolkit::weapon_clip_motion_harvest
             // provenance; the clip name lives on the hkbClipGenerator, which
             // only the activation hook sees.
             bool hadWeaponTracks = false;
-            if (harvestBinding(
+            if (captureBindingEvidence(
                     binding,
                     resolved.skeleton,
                     allowedNodeNames,
@@ -2613,7 +2158,7 @@ namespace paper_toolkit::weapon_clip_motion_harvest
         s_walkDone = false;
         s_bindingDetailLogs.store(0, std::memory_order_relaxed);
         s_walkPassIndex = 0;
-        s_walkPassStartHarvested = s_bindingsHarvested.load(std::memory_order_relaxed);
+        s_walkPassStartCaptured = s_bindingsCaptured.load(std::memory_order_relaxed);
         std::scoped_lock lock(s_hookMutex);
         advanceProcessedBindingEpochLocked();
         s_stageMarkerLogBudget = kStageMarkerLogBudgetPerGeneration;
@@ -2631,7 +2176,7 @@ namespace paper_toolkit::weapon_clip_motion_harvest
         s_walkBindingsData = 0;
         s_walkBindingsVisited = 0;
         s_walkDone = false;
-        s_walkPassStartHarvested = s_bindingsHarvested.load(std::memory_order_relaxed);
+        s_walkPassStartCaptured = s_bindingsCaptured.load(std::memory_order_relaxed);
         // The detail-log budget is intentionally NOT reset: bail dumps stay
         // capped per weapon generation so periodic re-walks cannot spam.
     }
@@ -2724,39 +2269,12 @@ namespace paper_toolkit::weapon_clip_motion_harvest
         return info;
     }
 
-    std::uint32_t drainGroups(weapon_clip_stroke::AuthoredStrokeGroup* outGroups, std::uint32_t maxGroups)
-    {
-        if (!outGroups || maxGroups == 0) {
-            return 0;
-        }
-        std::scoped_lock lock(s_queueMutex);
-        const auto count = (std::min)(maxGroups, s_queueCount);
-        for (std::uint32_t i = 0; i < count; ++i) {
-            outGroups[i] = s_queue[i];
-        }
-        if (count < s_queueCount) {
-            for (std::uint32_t i = count; i < s_queueCount; ++i) {
-                s_queue[i - count] = s_queue[i];
-            }
-        }
-        s_queueCount -= count;
-        return count;
-    }
-
-    void clearPending()
-    {
-        std::scoped_lock lock(s_queueMutex);
-        s_queueCount = 0;
-    }
-
     Stats snapshotStats()
     {
         return Stats{
             .bindingsSeen = s_bindingsSeen.load(std::memory_order_relaxed),
-            .bindingsHarvested = s_bindingsHarvested.load(std::memory_order_relaxed),
+            .bindingsCaptured = s_bindingsCaptured.load(std::memory_order_relaxed),
             .bindingsNoTargets = s_bindingsNoTargets.load(std::memory_order_relaxed),
-            .groupsQueued = s_groupsQueued.load(std::memory_order_relaxed),
-            .groupsDropped = s_groupsDropped.load(std::memory_order_relaxed),
             .skippedNonSpline = s_skippedNonSpline.load(std::memory_order_relaxed),
             .walksCompleted = s_walksCompleted.load(std::memory_order_relaxed),
             .bailAnimationPtr = s_bailAnimationPtr.load(std::memory_order_relaxed),

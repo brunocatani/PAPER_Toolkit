@@ -22,26 +22,20 @@ namespace paper_toolkit
 
         constexpr const char* kDefaultIniContent =
             "[PAPER_Toolkit]\n"
-            "; Master switch for exact authored preharvest, learned observation, and\n"
-            "; part guidance through ROCK's provider API.\n"
+            "; Master switch for exact authored preharvest, learned observation, passive\n"
+            "; clip telemetry, and path drives through ROCK's provider API.\n"
             "; Hot-reloadable: toggling while in game shuts the runtime down/brings it back.\n"
             "bEnabled = true\n"
             "\n"
-            "; Which independent motion source may DRIVE a grabbed part. There is no\n"
-            "; mixed fallback between authored and learned data.\n"
+            "; Which independent motion source may DRIVE a grabbed part. Collection is\n"
+            "; independent: both exact authored preharvest and learned observation remain\n"
+            "; active, but selection never falls back across sources.\n"
             ";   authored - only exact equipped-weapon animation preharvest drives parts\n"
             ";   learned  - only runtime-learned paths drive parts\n"
-            ";   scrub    - the hand drives the live reload ANIMATION's time and the\n"
-            ";              engine poses every part: trigger a reload (it freezes at\n"
-            ";              the start), grab a reload part and move it — the whole\n"
-            ";              gun follows the animation at your pace; release near the\n"
-            ";              end (or let it time out) and the engine finishes the\n"
-            ";              reload natively. Uses sClipScrubSweepClipFilter to pick\n"
-            ";              which clips are scrubbable.\n"
             "sMotionPathMode = authored\n"
             "\n"
             "; Log verbosity: 0=trace 1=debug 2=info 3=warn 4=error 5=critical 6=off.\n"
-            "; Hot-reloadable; drop to 1 or 0 when collecting harvest/scrub diagnostics.\n"
+            "; Hot-reloadable; drop to 1 or 0 when collecting capture/drive diagnostics.\n"
             "iLogLevel = 2\n"
             "\n"
             "; Trigger selects the grip type on eligible parts, PER HAND: grab alone =\n"
@@ -49,12 +43,12 @@ namespace paper_toolkit
             "; hold, part-carry included) = attach-only manipulation, sticky until the\n"
             "; part is released. A hand's trigger does nothing here while it owns the\n"
             "; firing grip, so firing never flips the other hand's grabs.\n"
-            "; false = eligible parts are always attach-only (scrub on grab).\n"
+            "; false = eligible parts are always attach-only (path guidance on grab).\n"
             "bRequireTriggerUnlock = true\n"
             "\n"
             "; Learner grouping (mapper side, hot-reloadable; applies to strokes learned\n"
             "; AFTER a change). Co-timed followers: parts that move NON-rigidly but only\n"
-            "; during the leader's stroke window ride the scrub (P320 barrel tilting\n"
+            "; during the leader's stroke window ride the projected path (P320 barrel tilting\n"
             "; while the slide travels, a bullet advancing during the bolt pull).\n"
             "; fCoTimedMinOverlap = fraction of the part's total motion that must fall\n"
             "; inside the leader's window (keeps separate reload phases apart);\n"
@@ -64,7 +58,7 @@ namespace paper_toolkit
             "fCoTimedMaxArcRatio = 1.50\n"
             "\n"
             "; Stage transitions: a learned stroke that starts where the primary stroke\n"
-            "; ends (mag-in after mag-out) is kept as a RETURN stage, and the scrub\n"
+            "; ends (mag-in after mag-out) is kept as a RETURN stage, and the drive\n"
             "; hands over between stages at the physical travel extremes — each\n"
             "; direction keeps its own path and min/max. Chain tolerance = how close\n"
             "; the return stroke's start must be to the primary's end to count chained.\n"
@@ -78,32 +72,25 @@ namespace paper_toolkit
             "; (shell eject) AND stage-transition triggers. 0.02 - 0.45.\n"
             "fTravelExtremeTolerance = 0.10\n"
             "\n"
-            "; Shell-eject test: reaching max travel on a scrubbed bolt/slide-class part\n"
+            "; Shell-eject test: reaching max travel on a driven bolt/slide-class part\n"
             "; (bolt, slide, charging handle, pump) fires the engine's own shell-casing\n"
             "; ejection for the equipped weapon — the same P-Casing debris spawn used\n"
             "; when firing. One eject per full stroke (re-arms once the part comes\n"
             "; halfway back toward rest); weapons without a casing model do nothing.\n"
             "bShellEjectOnMaxTravel = true\n"
             "\n"
-            "; Clip-scrub sweep probe (log-only test): when true, the next animation\n"
-            "; clip whose path contains sClipScrubSweepClipFilter is frozen into the\n"
-            "; engine's user-controlled mode and its time is swept 0 -> 1 over\n"
-            "; fClipScrubSweepSeconds — trigger a reload and watch: the weapon rig\n"
-            "; should play the reload in slow motion while the arms stay on the\n"
-            "; controllers. No ammo changes, one sweep at a time, everything is\n"
-            "; restored afterwards. Hot-reloadable; leave false during normal play.\n"
-            "bClipScrubSweepTest = false\n"
-            "fClipScrubSweepSeconds = 6.0\n"
-            "sClipScrubSweepClipFilter = Reload\n"
+            "; Diagnostic-only substring filter for verbose live-clip track-name logs.\n"
+            "; Structured .capture.jsonl evidence remains unfiltered and passive.\n"
+            "sClipTelemetryFilter = Reload\n"
             "\n"
             "; Re-record mode: while true, EVERY save of this INI (and every game\n"
-            "; start) wipes all learned motion data so reloads re-record from scratch\n"
-            "; under the current grouping settings (drained authored strokes are wiped\n"
-            "; too and re-harvest on the next equip / clip playback). With the motion\n"
+            "; start) wipes compact learned and authored serving data so both sources\n"
+            "; rebuild from scratch; exact authored preharvest resumes on the next\n"
+            "; equipped-weapon pass. With the motion\n"
             "; library on, the wipe also deletes the on-disk library files (files\n"
             "; marked \"curated\": true are kept). Leave true during a re-record\n"
             "; session, set false when done.\n"
-            "bResetLearnedPaths = false\n"
+            "bResetMotionData = false\n"
             "\n"
             "; Motion library: one human-editable JSON per weapon in\n"
             "; PAPER_Toolkit_Config\\MotionLibrary — mapped reloads survive game restarts\n"
@@ -119,7 +106,7 @@ namespace paper_toolkit
             "; Rich mapping capture: append immutable evidence to one sibling\n"
             "; <weapon>.capture.jsonl file in MotionLibrary. Includes the full\n"
             "; ROCK/OMOD/node inventory and geometry, every raw learned stroke\n"
-            "; (even rejected/replaced/interrupted), and authored clip tracks plus\n"
+            "; (even rejected/replaced/interrupted), and passive clip tracks plus\n"
             "; markers. Gameplay never loads this forensic archive, so richer data\n"
             "; cannot add weapon-equip parse hitches. Re-record wipes intentionally\n"
             "; keep it. bMotionLibraryReadOnly disables every disk write, including\n"
@@ -134,7 +121,7 @@ namespace paper_toolkit
             "\n"
             "; AttachOnly allowlist — which part classes MAY become attach-only grips.\n"
             "; Hot-reloadable. The class switch is only half the gate: a part must ALSO\n"
-            "; have a motion path (clip-harvested or learned, under the active mode) to\n"
+            "; have an exact-authored or learned motion path under the active source to\n"
             "; actually be attach-only. A part that does not move keeps its normal grip\n"
             "; no matter what is enabled here — e.g. with bAttachOnlyReceiver=true, a\n"
             "; receiver nif that the animation moves glues to the hand, a static one on\n"
@@ -249,10 +236,8 @@ namespace paper_toolkit
         const float previousExtremeTolerance = travelExtremeTolerance;
         const float previousChainTolerance = stageChainToleranceGameUnits;
         const bool previousShellEject = shellEjectOnMaxTravel;
-        const bool previousSweepTest = clipScrubSweepTest;
-        const float previousSweepSeconds = clipScrubSweepSeconds;
-        const std::string previousSweepFilter = clipScrubSweepClipFilter;
-        const bool previousResetLearned = resetLearnedPaths;
+        const std::string previousTelemetryFilter = clipTelemetryFilter;
+        const bool previousResetMotionData = resetMotionData;
         const bool previousMotionLibrary = motionLibrary;
         const bool previousLibraryReadOnly = motionLibraryReadOnly;
         const bool previousRichCapture = richMotionCapture;
@@ -267,7 +252,7 @@ namespace paper_toolkit
         if (modeText && parseMotionPathMode(modeText, parsedMode)) {
             motionPathMode = parsedMode;
         } else {
-            PAPER_TOOLKIT_LOG_WARN(Config, "Invalid sMotionPathMode='{}' — keeping '{}' (valid: authored, learned, scrub; hybrid was removed)",
+            PAPER_TOOLKIT_LOG_WARN(Config, "Invalid sMotionPathMode='{}' — keeping '{}' (valid: authored, learned)",
                 modeText ? modeText : "",
                 motionPathModeName(motionPathMode));
         }
@@ -298,12 +283,10 @@ namespace paper_toolkit
         // Cap keeps the max/rest zones clear of the 50%-of-travel re-arm point.
         travelExtremeTolerance = readClampedFloat("fTravelExtremeTolerance", travelExtremeTolerance, 0.02f, 0.45f);
         shellEjectOnMaxTravel = ini.GetBoolValue(kSection, "bShellEjectOnMaxTravel", shellEjectOnMaxTravel);
-        clipScrubSweepTest = ini.GetBoolValue(kSection, "bClipScrubSweepTest", clipScrubSweepTest);
-        clipScrubSweepSeconds = readClampedFloat("fClipScrubSweepSeconds", clipScrubSweepSeconds, 1.0f, 60.0f);
-        if (const char* sweepFilter = ini.GetValue(kSection, "sClipScrubSweepClipFilter", clipScrubSweepClipFilter.c_str())) {
-            clipScrubSweepClipFilter = sweepFilter;
+        if (const char* telemetryFilter = ini.GetValue(kSection, "sClipTelemetryFilter", clipTelemetryFilter.c_str())) {
+            clipTelemetryFilter = telemetryFilter;
         }
-        resetLearnedPaths = ini.GetBoolValue(kSection, "bResetLearnedPaths", resetLearnedPaths);
+        resetMotionData = ini.GetBoolValue(kSection, "bResetMotionData", resetMotionData);
         motionLibrary = ini.GetBoolValue(kSection, "bMotionLibrary", motionLibrary);
         motionLibraryReadOnly = ini.GetBoolValue(kSection, "bMotionLibraryReadOnly", motionLibraryReadOnly);
         richMotionCapture = ini.GetBoolValue(kSection, "bRichMotionCapture", richMotionCapture);
@@ -332,7 +315,7 @@ namespace paper_toolkit
             }
             if (motionPathMode != previousMode) {
                 PAPER_TOOLKIT_LOG_INFO(Config,
-                    "sMotionPathMode: {} -> {} (stored-path sessions stay pinned until release; leaving scrub releases its live clip)",
+                    "sMotionPathMode: {} -> {} (active path-drive sessions stay pinned until release)",
                     motionPathModeName(previousMode),
                     motionPathModeName(motionPathMode));
             }
@@ -351,20 +334,18 @@ namespace paper_toolkit
                     previousShellEject,
                     shellEjectOnMaxTravel);
             }
-            const bool sweepChanged = clipScrubSweepTest != previousSweepTest ||
-                clipScrubSweepSeconds != previousSweepSeconds || clipScrubSweepClipFilter != previousSweepFilter;
-            if (sweepChanged) {
+            const bool telemetryFilterChanged = clipTelemetryFilter != previousTelemetryFilter;
+            if (telemetryFilterChanged) {
                 PAPER_TOOLKIT_LOG_INFO(Config,
-                    "Clip-scrub sweep probe: enabled={} seconds={:.1f} filter='{}' (next matching clip activation sweeps)",
-                    clipScrubSweepTest,
-                    clipScrubSweepSeconds,
-                    clipScrubSweepClipFilter);
+                    "sClipTelemetryFilter: '{}' -> '{}' (verbose track-name logs only)",
+                    previousTelemetryFilter,
+                    clipTelemetryFilter);
             }
-            if (resetLearnedPaths != previousResetLearned) {
+            if (resetMotionData != previousResetMotionData) {
                 PAPER_TOOLKIT_LOG_INFO(Config,
-                    "bResetLearnedPaths: {} -> {} (while true, every reload wipes learned motion data)",
-                    previousResetLearned,
-                    resetLearnedPaths);
+                    "bResetMotionData: {} -> {} (while true, every reload wipes compact learned and authored serving data)",
+                    previousResetMotionData,
+                    resetMotionData);
             }
             if (motionLibrary != previousMotionLibrary || motionLibraryReadOnly != previousLibraryReadOnly) {
                 PAPER_TOOLKIT_LOG_INFO(Config,
@@ -411,7 +392,7 @@ namespace paper_toolkit
             }
             if (enabled == previousEnabled && motionPathMode == previousMode && logLevel == previousLogLevel &&
                 requireTriggerUnlock == previousRequireTriggerUnlock && !allowListChangedKeys && !groupingChanged &&
-                shellEjectOnMaxTravel == previousShellEject && !sweepChanged && resetLearnedPaths == previousResetLearned &&
+                shellEjectOnMaxTravel == previousShellEject && !telemetryFilterChanged && resetMotionData == previousResetMotionData &&
                 motionLibrary == previousMotionLibrary && motionLibraryReadOnly == previousLibraryReadOnly &&
                 richMotionCapture == previousRichCapture && fullSubtreeObservation == previousFullSubtree) {
                 PAPER_TOOLKIT_LOG_INFO(Config, "Reload applied, no value changes (enabled={} mode={} logLevel={})",

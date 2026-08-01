@@ -111,7 +111,6 @@ namespace paper_toolkit
         const auto previousScale = recorder->lastScale;
         const auto previousRockFrame = recorder->lastRockFrameIndex;
         const auto previousClipActivity = recorder->lastClipActivityId;
-        const auto previousClipScrubSession = recorder->lastClipScrubSessionId;
         const auto previousConcurrentClipCount = recorder->lastClipConcurrentActivityCount;
         const auto previousClipFraction = recorder->lastClipFraction;
         const auto previousClipTime = recorder->lastClipLocalTimeSeconds;
@@ -131,8 +130,6 @@ namespace paper_toolkit
             recorder->scales[1] = observation.scale;
             recorder->clipActivityIds[0] = previousClipActivity;
             recorder->clipActivityIds[1] = observation.clipActivityId;
-            recorder->clipScrubSessionIds[0] = previousClipScrubSession;
-            recorder->clipScrubSessionIds[1] = observation.clipScrubSessionId;
             recorder->clipConcurrentActivityCounts[0] = previousConcurrentClipCount;
             recorder->clipConcurrentActivityCounts[1] = observation.clipConcurrentActivityCount;
             recorder->clipFractions[0] = previousClipFraction;
@@ -150,7 +147,6 @@ namespace paper_toolkit
             recorder->rockFrameIndices[previousSampleCount] = observation.rockFrameIndex;
             recorder->scales[previousSampleCount] = observation.scale;
             recorder->clipActivityIds[previousSampleCount] = observation.clipActivityId;
-            recorder->clipScrubSessionIds[previousSampleCount] = observation.clipScrubSessionId;
             recorder->clipConcurrentActivityCounts[previousSampleCount] =
                 observation.clipConcurrentActivityCount;
             recorder->clipFractions[previousSampleCount] = observation.clipFraction;
@@ -177,7 +173,6 @@ namespace paper_toolkit
         recorder->lastScale = observation.scale;
         recorder->lastRockFrameIndex = observation.rockFrameIndex;
         recorder->lastClipActivityId = observation.clipActivityId;
-        recorder->lastClipScrubSessionId = observation.clipScrubSessionId;
         recorder->lastClipConcurrentActivityCount = observation.clipConcurrentActivityCount;
         recorder->lastClipFraction = observation.clipFraction;
         recorder->lastClipLocalTimeSeconds = observation.clipLocalTimeSeconds;
@@ -541,7 +536,7 @@ namespace paper_toolkit
          * stage (mag-in observed after mag-out) and gets its own path and
          * min/max instead of competing with — and losing to — the larger
          * primary. Which motion becomes "primary" is simply whichever was
-         * learned first; the scrub stage machine is symmetric.
+         * learned first; the drive stage machine is symmetric.
          */
         auto* target = findOrClaimSlot(
             PartKey{ recorder.weaponFormId, recorder.omodFormId, slotName(recorder.sourceName) }, false);
@@ -820,7 +815,6 @@ namespace paper_toolkit
             .rockFrameIndices = recorder.rockFrameIndices.data(),
             .scales = recorder.scales.data(),
             .clipActivityIds = recorder.clipActivityIds.data(),
-            .clipScrubSessionIds = recorder.clipScrubSessionIds.data(),
             .clipConcurrentActivityCounts = recorder.clipConcurrentActivityCounts.data(),
             .clipFractions = recorder.clipFractions.data(),
             .clipLocalTimesSeconds = recorder.clipLocalTimesSeconds.data(),

@@ -9,7 +9,7 @@
 #include "api/ROCKProviderApi.h"
 #include "paper_toolkit/MotionLibraryStore.h"
 #include "paper_toolkit/WeaponAnimationPreharvest.h"
-#include "paper_toolkit/WeaponClipMotionHarvest.h"
+#include "paper_toolkit/WeaponClipTelemetry.h"
 #include "paper_toolkit/WeaponClipStrokePolicy.h"
 #include "paper_toolkit/WeaponPartDriveSandbox.h"
 #include "paper_toolkit/WeaponPartMotionLearner.h"
@@ -35,12 +35,12 @@ namespace paper_toolkit
      *  - independent authored lane: loads the equipped instance's exact
      *    first-person AnimationFileData off-screen, samples full clips, and
      *    reconstructs Weapon-relative part paths without playback or hooks;
-     *  - learned lane: when selected, samples every cached part's live
-     *    weapon-root-local pose; our own recent drives arrive untrusted;
-     *  - legacy live clip harvest/scrub remains isolated to its explicit
-     *    non-authored modes and can never serve AuthoredOnly;
+     *  - learned lane: samples every cached part's live weapon-root-local
+     *    pose in either serving mode; our own recent drives arrive untrusted;
+     *  - passive live-clip telemetry captures raw tracks, markers, triggers,
+     *    and timing into evidence only; it never creates serving paths;
      *  - drive sandbox input: assembles grip/hand/part state from ROCK's
-     *    grip-state API for the scrub-and-drive loop.
+     *    grip-state API for the common authored/learned path-drive loop.
      *
      * Engine access: snapshot.weaponNode and evidence sourceRoot pointers are
      * non-owning engine pointers valid only while the snapshot's
@@ -55,14 +55,15 @@ namespace paper_toolkit
     public:
         void onFrame(const rock::provider::RockProviderFrameSnapshot& snapshot);
 
-        // Full teardown: unregister the consumer, drop learner/harvest state.
+        // Full teardown: unregister the consumer and drop learner, exact
+        // preharvest, and passive telemetry state.
         // Used when the config disables the runtime and on session resets.
         void shutdown();
 
-        // Re-record mode (bResetLearnedPaths): wipe all learner-held motion
+        // Re-record mode (bResetMotionData): wipe all compact serving motion
         // data; exact authored preharvest restarts for the equipped weapon.
         // Frame thread only; the revision bump re-resolves eligible parts.
-        void wipeLearnedPaths();
+        void wipeMotionData();
 
     private:
         struct DrivePartCacheEntry
@@ -153,11 +154,8 @@ namespace paper_toolkit
             RE::NiNode* weaponNode,
             std::uint64_t generationKey,
             std::uint32_t weaponFormId);
-        void updateWeaponClipHarvestWalk(RE::NiNode* weaponNode, std::uint64_t generationKey, std::uint32_t weaponFormId);
-        void drainWeaponClipHarvest(RE::NiNode* weaponNode, std::uint64_t generationKey, std::uint32_t weaponFormId);
-        // Returns true when the drained batch filled the buffer (more queued).
-        bool drainWeaponClipHarvestBatch(RE::NiNode* weaponNode, std::uint64_t generationKey, std::uint32_t weaponFormId);
-        void adoptWeaponClipHarvestBatch(
+        void updateWeaponClipTelemetry(RE::NiNode* weaponNode, std::uint64_t generationKey, std::uint32_t weaponFormId);
+        void adoptAuthoredPreharvestBatch(
             RE::NiNode* weaponNode,
             std::uint64_t generationKey,
             std::uint32_t weaponFormId,
@@ -228,11 +226,6 @@ namespace paper_toolkit
         // Once-per-grip proof that ROCK reported a normal grip even though a
         // PAPER scene-source target was already installed for that part.
         std::array<std::uint64_t, 2> _lastUnmatchedEligibleGripSequence{};
-        // Clip-scrub session bookkeeping: frames with a live frozen clip
-        // but no hand driving it (idle release), and the last session id
-        // seen (resets the idle counter on capture turnover).
-        std::uint32_t _scrubIdleFrames{ 0 };
-        std::uint64_t _scrubLastSessionId{ 0 };
         // Parts held by a hand last frame (any grip kind): a held part is
         // not at rest, so its rest-pose capture pauses. One-frame lag is
         // absorbed by the stationary-frame requirement.
@@ -251,11 +244,11 @@ namespace paper_toolkit
         std::uint64_t _librarySyncedRevision{ 0 };
         std::uint64_t _libraryLastRevision{ 0 };
         std::uint32_t _libraryStableFrames{ 0 };
-        // Scratch for the per-frame harvest drain; member storage because one
+        // Scratch for exact authored preharvest; member storage because one
         // full batch of stroke groups is far too large for the stack.
-        std::array<weapon_clip_stroke::AuthoredStrokeGroup, weapon_clip_stroke::kMaxGroupsPerClip> _clipHarvestDrainGroups{};
+        std::array<weapon_clip_stroke::AuthoredStrokeGroup, weapon_clip_stroke::kMaxGroupsPerClip> _authoredPreharvestGroups{};
         // One packet is ~100 KiB; member storage avoids the main-thread stack.
-        std::array<weapon_clip_motion_harvest::RichClipCapturePacket, 8> _richClipDrainPackets{};
+        std::array<weapon_clip_telemetry::RichClipCapturePacket, 8> _richClipDrainPackets{};
 
         bool _richCaptureActive{ false };
         std::uint32_t _recorderWeaponFormId{ 0 };
@@ -307,18 +300,14 @@ namespace paper_toolkit
         std::array<PendingCaptureGap, 16> _pendingCaptureGaps{};
 
         bool _active{ false };
-        // True only while AuthoredOnly owns the independent off-screen
-        // preharvest lane. Used to make mode transitions one-shot cleanup,
-        // never a per-frame hook/queue operation.
-        bool _authoredPreharvestModeActive{ false };
-        std::uint32_t _lastClipHarvestWeaponFormId{ 0 };
-        std::uint64_t _clipHarvestWalkGenerationKey{ 0 };
-        std::uint32_t _clipHarvestWalkAttempts{ 0 };
-        bool _clipHarvestWalkCompleted{ false };
-        bool _clipHarvestWalkGaveUp{ false };
-        bool _clipHarvestWalkHolderSeen{ false };
-        bool _clipHarvestWalkCandidateLogged{ false };
-        bool _clipHarvestRewalkActive{ false };
-        std::uint32_t _clipHarvestRewalkCooldownFrames{ 0 };
+        std::uint32_t _lastClipTelemetryWeaponFormId{ 0 };
+        std::uint64_t _clipTelemetryWalkGenerationKey{ 0 };
+        std::uint32_t _clipTelemetryWalkAttempts{ 0 };
+        bool _clipTelemetryWalkCompleted{ false };
+        bool _clipTelemetryWalkGaveUp{ false };
+        bool _clipTelemetryWalkHolderSeen{ false };
+        bool _clipTelemetryWalkCandidateLogged{ false };
+        bool _clipTelemetryRewalkActive{ false };
+        std::uint32_t _clipTelemetryRewalkCooldownFrames{ 0 };
     };
 }

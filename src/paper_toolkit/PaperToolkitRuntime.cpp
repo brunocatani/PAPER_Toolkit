@@ -6,9 +6,9 @@
 #include "paper_toolkit/TransformMath.h"
 #include "paper_toolkit/WeaponAnimationPreharvest.h"
 #include "paper_toolkit/WeaponAnimationPreharvestPolicy.h"
-#include "paper_toolkit/WeaponClipMotionHarvest.h"
+#include "paper_toolkit/WeaponClipTelemetry.h"
 #include "paper_toolkit/WeaponPartEligibility.h"
-#include "paper_toolkit/WeaponPartMotionScrubPolicy.h"
+#include "paper_toolkit/WeaponPartPathProjectionPolicy.h"
 
 #include <algorithm>
 #include <array>
@@ -42,15 +42,6 @@ namespace paper_toolkit
         // (axis-button base 32 + axis 1 — see ROCK's InputRemapPolicy
         // kOpenVrSteamVrTriggerButtonId). Level state only by API design.
         constexpr std::uint32_t kOpenVrTriggerButtonId = 33;
-        /*
-         * Clip-scrub session lifecycle: complete (release to native, engine
-         * finishes the reload) once the hand has scrubbed this close to the
-         * end; a frozen session nobody drives for this long also releases,
-         * so an untouched reload cannot stay frozen forever.
-         */
-        constexpr float kClipScrubCompleteFraction = 0.985f;
-        constexpr std::uint32_t kClipScrubIdleTimeoutFrames = 1080;
-
         // Shell-eject test: the "racking" classifications whose full
         // rearward travel should eject a casing — bolt/slide-class by part
         // kind or by action role (parts like an 'Other'-kind bolt handle
@@ -424,43 +415,9 @@ namespace paper_toolkit
         }
         ageDrivenPartLeases();
         _lastRockFrameIndex = snapshot.frameIndex;
-        const bool authoredMode =
-            g_paperToolkitConfig.motionPathMode == MotionPathMode::AuthoredOnly;
-        if (authoredMode && !_authoredPreharvestModeActive) {
-            // Authored is an independent offline lane. Purge every live-clip
-            // producer/target before starting it; no activation, update, or
-            // scrub callback is required to discover the weapon's files.
-            weapon_clip_motion_harvest::setRichCaptureEnabled(false);
-            weapon_clip_motion_harvest::setClipScrubCaptureConfig(false, nullptr);
-            weapon_clip_motion_harvest::endClipScrubSession();
-            weapon_clip_motion_harvest::clearPending();
-            weapon_clip_motion_harvest::resetWalk();
-            weapon_clip_motion_harvest::clearClipActivationTargets();
-            weapon_animation_preharvest::reset();
-            _learner.resetRecorders(rich_capture::StrokeTermination::CaptureDisabled);
-            _authoredPreharvestModeActive = true;
-            PAPER_TOOLKIT_LOG_INFO(Weapon,
-                "AuthoredOnly entered: exact off-screen weapon-animation preharvest active; live clip harvest/scrub disabled");
-        } else if (!authoredMode && _authoredPreharvestModeActive) {
-            weapon_animation_preharvest::reset();
-            _authoredPreharvestModeActive = false;
-        }
         updateRichCaptureState(snapshot);
-
-        // Live clip time control is isolated to the explicit ClipScrub mode;
-        // AuthoredOnly never arms or installs this interception path.
-        const bool clipScrubMode =
-            g_paperToolkitConfig.motionPathMode == MotionPathMode::ClipScrub;
-        weapon_clip_motion_harvest::setScrubSweepConfig(
-            clipScrubMode && g_paperToolkitConfig.clipScrubSweepTest,
-            g_paperToolkitConfig.clipScrubSweepSeconds,
-            g_paperToolkitConfig.clipScrubSweepClipFilter.c_str());
-        // Scrub mode arms the session capture: the next activating clip
-        // matching the filter freezes and waits for a hand. Same filter as
-        // the sweep probe (the probe wins when both are enabled).
-        weapon_clip_motion_harvest::setClipScrubCaptureConfig(
-            clipScrubMode,
-            g_paperToolkitConfig.clipScrubSweepClipFilter.c_str());
+        weapon_clip_telemetry::setDiagnosticClipFilter(
+            g_paperToolkitConfig.clipTelemetryFilter.c_str());
 
         auto* weaponNode = reinterpret_cast<RE::NiNode*>(snapshot.weaponNode);
         const auto generationKey = snapshot.weaponGenerationKey;
@@ -468,8 +425,8 @@ namespace paper_toolkit
 
         /*
          * Same call order as the stack had inside ROCK's update: observe the
-         * engine-animated poses first, then adopt/drain harvested strokes,
-         * then step the graph walk, then run the drive loop off this frame's
+         * engine-animated poses first, then advance both independent data
+         * collectors, then run the drive loop off this frame's
          * fresh grip reports. Every step fails closed on a null weapon node
          * or zero generation, so holstered/transition frames only end the
          * drive sessions.
@@ -479,31 +436,26 @@ namespace paper_toolkit
         updateMotionLibrary(weaponFormId);
         observeWeaponPartMotion(weaponNode, generationKey, weaponFormId);
         drainRichClipCaptures(generationKey, weaponFormId, snapshot.frameIndex);
-        if (authoredMode) {
-            updateAuthoredAnimationPreharvest(
-                weaponNode, generationKey, weaponFormId);
-        } else {
-            drainWeaponClipHarvest(weaponNode, generationKey, weaponFormId);
-            updateWeaponClipHarvestWalk(weaponNode, generationKey, weaponFormId);
+        updateAuthoredAnimationPreharvest(
+            weaponNode, generationKey, weaponFormId);
+        if (_richCaptureActive) {
+            updateWeaponClipTelemetry(weaponNode, generationKey, weaponFormId);
         }
         updateWeaponPartDriveSandbox(weaponNode, generationKey, weaponFormId, snapshot);
     }
 
     void PaperToolkitRuntime::updateRichCaptureState(const rock::provider::RockProviderFrameSnapshot& snapshot)
     {
-        const bool wanted = g_paperToolkitConfig.motionPathMode != MotionPathMode::AuthoredOnly &&
-            g_paperToolkitConfig.motionLibrary && !g_paperToolkitConfig.motionLibraryReadOnly &&
+        const bool wanted = g_paperToolkitConfig.motionLibrary && !g_paperToolkitConfig.motionLibraryReadOnly &&
             g_paperToolkitConfig.richMotionCapture;
         const bool recorderGenerationChanged = snapshot.weaponFormId != _recorderWeaponFormId ||
             snapshot.weaponGenerationKey != _recorderGenerationKey;
         if (recorderGenerationChanged) {
             // Close the old graph attribution boundary before any part of
             // this frame can observe/drain the new weapon. resetWalk also
-            // clears hook targets, processed binding ids, and rich activity
-            // slots under one hook lock; the serving queue is then purged of
-            // any groups an in-flight old activation completed first.
-            weapon_clip_motion_harvest::resetWalk();
-            weapon_clip_motion_harvest::clearPending();
+            // clears telemetry targets, processed binding ids, and activity
+            // slots under one hook lock.
+            weapon_clip_telemetry::resetWalk();
         }
         if (recorderGenerationChanged && !_richCaptureActive && !wanted) {
             // Recorder identity is generation-local even without disk
@@ -531,8 +483,8 @@ namespace paper_toolkit
             _richSnapshotGenerationKey = 0;
             _pendingRichGeometry = {};
             _learner.setRawCaptureSink(&PaperToolkitRuntime::rawCaptureSink, this);
-            weapon_clip_motion_harvest::clearRichClipActivities();
-            weapon_clip_motion_harvest::setRichCaptureEnabled(true);
+            weapon_clip_telemetry::resetWalk();
+            weapon_clip_telemetry::setRichCaptureEnabled(true);
             PAPER_TOOLKIT_LOG_INFO(Weapon,
                 "Rich motion capture active: session '{}' (append-only per-weapon .capture.jsonl)",
                 _richCaptureSessionId);
@@ -542,13 +494,14 @@ namespace paper_toolkit
             cancelPendingRichGeometryCapture(
                 "rich capture disabled before all deferred geometry chunks were queued",
                 snapshot.frameIndex);
-            weapon_clip_motion_harvest::setRichCaptureEnabled(false);
+            weapon_clip_telemetry::setRichCaptureEnabled(false);
             drainRichClipCaptures(
                 _richCaptureGenerationKey,
                 _richCaptureWeaponFormId,
                 snapshot.frameIndex);
             _learner.resetRecorders(rich_capture::StrokeTermination::CaptureDisabled);
             _learner.setRawCaptureSink(nullptr, nullptr);
+            weapon_clip_telemetry::resetWalk();
             _richCaptureActive = false;
             _richCaptureWeaponFormId = 0;
             _richCaptureGenerationKey = 0;
@@ -565,7 +518,7 @@ namespace paper_toolkit
             snapshot.weaponGenerationKey != _richCaptureGenerationKey) {
             // Packets already queued by the old graph belong to the old
             // loadout. Drain before changing attribution.
-            weapon_clip_motion_harvest::clearRichClipActivities();
+            weapon_clip_telemetry::clearRichClipActivities();
             cancelPendingRichGeometryCapture(
                 "weapon generation changed before all deferred geometry chunks were queued",
                 snapshot.frameIndex);
@@ -608,7 +561,7 @@ namespace paper_toolkit
     rich_capture::CaptureSettings PaperToolkitRuntime::captureSettings() const
     {
         return rich_capture::CaptureSettings{
-            .motionPathMode = motionPathModeName(g_paperToolkitConfig.motionPathMode),
+            .servingSource = motionPathModeName(g_paperToolkitConfig.motionPathMode),
             .fullSubtreeObservation = g_paperToolkitConfig.fullSubtreeObservation,
             .coTimedFollowers = g_paperToolkitConfig.coTimedFollowers,
             .coTimedMinOverlap = g_paperToolkitConfig.coTimedMinOverlap,
@@ -819,9 +772,6 @@ namespace paper_toolkit
                 .trusted = true,
                 .clip = rich_capture::ClipSampleContext{
                     .activityId = capture.clipActivityIds ? capture.clipActivityIds[i] : 0,
-                    .scrubSessionId = capture.clipScrubSessionIds
-                        ? capture.clipScrubSessionIds[i]
-                        : 0,
                     .concurrentActivityCount = capture.clipConcurrentActivityCounts
                         ? capture.clipConcurrentActivityCounts[i]
                         : 0,
@@ -839,7 +789,6 @@ namespace paper_toolkit
                 .trusted = capture.terminalSample.trusted,
                 .clip = rich_capture::ClipSampleContext{
                     .activityId = capture.terminalSample.clipActivityId,
-                    .scrubSessionId = capture.terminalSample.clipScrubSessionId,
                     .concurrentActivityCount =
                         capture.terminalSample.clipConcurrentActivityCount,
                     .fraction = capture.terminalSample.clipFraction,
@@ -858,7 +807,7 @@ namespace paper_toolkit
         if (!_richCaptureActive) {
             return;
         }
-        const auto dropInfo = weapon_clip_motion_harvest::drainRichClipDropInfo();
+        const auto dropInfo = weapon_clip_telemetry::drainRichClipDropInfo();
         if (dropInfo.count > 0) {
             const auto droppedWeapon = dropInfo.weaponFormId != 0 ? dropInfo.weaponFormId : weaponFormId;
             const auto droppedGeneration = dropInfo.weaponGenerationKey != 0
@@ -874,12 +823,12 @@ namespace paper_toolkit
                     .droppedEventCount = static_cast<std::uint32_t>((std::min)(
                         dropInfo.count,
                         static_cast<std::uint64_t>((std::numeric_limits<std::uint32_t>::max)()))),
-                    .reason = "raw authored clip capture queue overflow",
+                    .reason = "raw passive clip capture queue overflow",
                 };
                 (void)enqueueRichCapture(rich_capture::Event{ std::move(gap) });
             }
         }
-        const auto packetCount = weapon_clip_motion_harvest::drainRichClipCaptures(
+        const auto packetCount = weapon_clip_telemetry::drainRichClipCaptures(
             _richClipDrainPackets.data(), static_cast<std::uint32_t>(_richClipDrainPackets.size()));
         for (std::uint32_t drained = 0; drained < packetCount; ++drained) {
             const auto& packet = _richClipDrainPackets[drained];
@@ -889,13 +838,13 @@ namespace paper_toolkit
                 : generationKey;
             if (packetWeaponFormId == 0) {
                 PAPER_TOOLKIT_LOG_WARN(Weapon,
-                    "Rich motion capture: authored clip packet had no weapon identity and was skipped");
+                    "Rich motion capture: clip evidence packet had no weapon identity and was skipped");
                 continue;
             }
-            rich_capture::AuthoredClipEvent event{};
+            rich_capture::ClipEvidenceEvent event{};
             event.context = makeCaptureContext(packetWeaponFormId, packetGenerationKey, rockFrameIndex);
             event.activityId = packet.activityId;
-            event.activatedClip = packet.activatedClip;
+            event.acquisition = packet.acquisition;
             event.animationName.assign(
                 providerFixedStringView(packet.animationName.data(), packet.animationName.size()));
             event.durationSeconds = packet.durationSeconds;
@@ -1601,7 +1550,7 @@ namespace paper_toolkit
             skippedOmods > 0 ? ", some omods unresolvable and skipped" : "");
     }
 
-    void PaperToolkitRuntime::wipeLearnedPaths()
+    void PaperToolkitRuntime::wipeMotionData()
     {
         _learner.reset();
         weapon_animation_preharvest::reset();
@@ -1616,7 +1565,7 @@ namespace paper_toolkit
         _libraryWeaponRef = {};
         _libraryStableFrames = 0;
         PAPER_TOOLKIT_LOG_INFO(Weapon,
-            "Motion data WIPED (bResetLearnedPaths) — {} library file(s) deleted (curated kept); learned paths re-record and exact authored animations preharvest again for the equipped weapon",
+            "Motion data WIPED (bResetMotionData) — {} library file(s) deleted (curated kept); learned paths re-record and exact authored animations preharvest again for the equipped weapon",
             deletedFiles);
     }
 
@@ -1628,13 +1577,13 @@ namespace paper_toolkit
         weapon_animation_preharvest::reset();
         // Preserve partial raw evidence and graph-thread clip packets before
         // the writer is drained and before any recorder/queue storage dies.
+        // Disabling takes the clip-queue mutex and is a producer barrier; no
+        // graph-thread packet can appear after the following drain.
+        weapon_clip_telemetry::setRichCaptureEnabled(false);
         if (_richCaptureActive) {
             cancelPendingRichGeometryCapture(
                 "runtime shutdown before all deferred geometry chunks were queued",
                 _lastRockFrameIndex);
-            // Disabling takes the clip-queue mutex and is a producer barrier;
-            // no graph-thread packet can appear after the following drain.
-            weapon_clip_motion_harvest::setRichCaptureEnabled(false);
             drainRichClipCaptures(
                 _richCaptureGenerationKey,
                 _richCaptureWeaponFormId,
@@ -1686,22 +1635,17 @@ namespace paper_toolkit
         _eligibleResolvedOnce = false;
         _lastAttachModeArmed = false;
         _lastUnmatchedEligibleGripSequence = {};
-        _scrubIdleFrames = 0;
-        _scrubLastSessionId = 0;
-        weapon_clip_motion_harvest::setClipScrubCaptureConfig(false, nullptr);
-        weapon_clip_motion_harvest::endClipScrubSession();
-        weapon_clip_motion_harvest::clearPending();
-        weapon_clip_motion_harvest::resetWalk();
-        weapon_clip_motion_harvest::clearClipActivationTargets();
-        _lastClipHarvestWeaponFormId = 0;
-        _clipHarvestWalkGenerationKey = 0;
-        _clipHarvestWalkAttempts = 0;
-        _clipHarvestWalkCompleted = false;
-        _clipHarvestWalkGaveUp = false;
-        _clipHarvestWalkHolderSeen = false;
-        _clipHarvestWalkCandidateLogged = false;
-        _clipHarvestRewalkActive = false;
-        _clipHarvestRewalkCooldownFrames = 0;
+        weapon_clip_telemetry::resetWalk();
+        weapon_clip_telemetry::clearClipTelemetryTargets();
+        _lastClipTelemetryWeaponFormId = 0;
+        _clipTelemetryWalkGenerationKey = 0;
+        _clipTelemetryWalkAttempts = 0;
+        _clipTelemetryWalkCompleted = false;
+        _clipTelemetryWalkGaveUp = false;
+        _clipTelemetryWalkHolderSeen = false;
+        _clipTelemetryWalkCandidateLogged = false;
+        _clipTelemetryRewalkActive = false;
+        _clipTelemetryRewalkCooldownFrames = 0;
         _richCaptureActive = false;
         _recorderWeaponFormId = 0;
         _recorderGenerationKey = 0;
@@ -1713,7 +1657,6 @@ namespace paper_toolkit
         _richCaptureSessionId.clear();
         _richCaptureSequence = 0;
         _pendingCaptureGaps = {};
-        _authoredPreharvestModeActive = false;
         _active = false;
     }
 
@@ -1964,17 +1907,8 @@ namespace paper_toolkit
                 const WeaponPartMotionLearner::PartKey partKey{
                     weaponFormId, entry.omodFormId, sourceName
                 };
-                bool hasMotionPath = false;
-                if (g_paperToolkitConfig.motionPathMode == MotionPathMode::ClipScrub) {
-                    // ClipScrub does not replay either store. Any recorded
-                    // source can prove only that the part moves; this is an
-                    // explicit existence query, not a removed hybrid drive.
-                    const auto available = _learner.sourceAvailability(partKey);
-                    hasMotionPath = available.learned || available.authored;
-                } else {
-                    hasMotionPath =
-                        _learner.findPath(partKey, g_paperToolkitConfig.motionPathMode) != nullptr;
-                }
+                const bool hasMotionPath =
+                    _learner.findPath(partKey, g_paperToolkitConfig.motionPathMode) != nullptr;
                 if (!hasMotionPath) {
                     appendName(unmappedNames, unmappedLength, sourceName);
                     ++unmappedCount;
@@ -2009,7 +1943,7 @@ namespace paper_toolkit
         }
 
         // Log only when the resolved set actually changed (revision bumps
-        // are frequent during harvest bursts; the set usually is not).
+        // are frequent during collection bursts; the set usually is not).
         const bool setChanged = previousCount != _eligiblePartCount ||
             std::memcmp(previousParts.data(), _eligibleParts.data(),
                 sizeof(WeaponPartDriveSandbox::EligiblePart) * _eligiblePartCount) != 0;
@@ -2048,16 +1982,10 @@ namespace paper_toolkit
         }
 
         const RE::NiTransform weaponWorldInverse = transform_math::invertTransform(weaponNode->world);
-        const auto richClipContext = weapon_clip_motion_harvest::richClipActivityState();
-        const auto scrubClipContext = weapon_clip_motion_harvest::clipScrubSessionState();
+        const auto richClipContext = weapon_clip_telemetry::richClipActivityState();
         const bool hasRichClipContext = richClipContext.active && richClipContext.activityId != 0 &&
             richClipContext.weaponFormId == weaponFormId &&
             richClipContext.weaponGenerationKey == generationKey;
-        const bool hasScrubClipContext = !hasRichClipContext && scrubClipContext.active &&
-            scrubClipContext.weaponFormId == weaponFormId &&
-            scrubClipContext.weaponGenerationKey == generationKey;
-        const bool collectLearnedMotion =
-            g_paperToolkitConfig.motionPathMode != MotionPathMode::AuthoredOnly;
         // Hot-reloadable grouping/staging tuning; cheap by-value refresh so
         // an INI change applies to the very next completed stroke.
         _learner.setGroupingTuning(WeaponPartMotionLearner::GroupingTuning{
@@ -2069,9 +1997,7 @@ namespace paper_toolkit
         });
         // Frame-align every recorder before this frame's observations so
         // concurrent recordings can be compared for co-movement grouping.
-        if (collectLearnedMotion) {
-            _learner.beginObservationFrame();
-        }
+        _learner.beginObservationFrame();
         for (std::uint32_t i = 0; i < _drivePartCache.count; ++i) {
             auto& entry = _drivePartCache.entries[i];
             if (!entry.node || !nodeContainsNode(weaponNode, entry.node, 64)) {
@@ -2086,8 +2012,7 @@ namespace paper_toolkit
                 continue;
             }
             const auto pose = poseFromNiTransform(partWeaponLocal);
-            if (collectLearnedMotion) {
-                _learner.observe(WeaponPartMotionLearner::Observation{
+            _learner.observe(WeaponPartMotionLearner::Observation{
                     .weaponFormId = weaponFormId,
                     .omodFormId = entry.omodFormId,
                     .sourceName = providerFixedStringView(entry.sourceName.data(), entry.sourceName.size()),
@@ -2103,34 +2028,26 @@ namespace paper_toolkit
                     .clipActivityId = hasRichClipContext
                         ? richClipContext.activityId
                         : 0,
-                    .clipScrubSessionId = hasScrubClipContext ? scrubClipContext.sessionId : 0,
                     .clipConcurrentActivityCount = hasRichClipContext
                         ? richClipContext.concurrentActivityCount
-                        : (hasScrubClipContext ? 1u : 0u),
+                        : 0,
                     .clipFraction = hasRichClipContext
                         ? richClipContext.fraction
-                        : (hasScrubClipContext ? scrubClipContext.fraction : 0.0f),
+                        : 0.0f,
                     .clipLocalTimeSeconds = hasRichClipContext
                         ? richClipContext.localTimeSeconds
-                        : (hasScrubClipContext
-                                ? scrubClipContext.cropStartSeconds +
-                                      scrubClipContext.fraction * scrubClipContext.croppedDurationSeconds
-                                : 0.0f),
+                        : 0.0f,
                     .clipName = hasRichClipContext
                         ? providerFixedStringView(
                               richClipContext.animationName.data(), richClipContext.animationName.size())
-                        : (hasScrubClipContext
-                                ? providerFixedStringView(
-                                      scrubClipContext.clipName.data(), scrubClipContext.clipName.size())
-                                : std::string_view{}),
+                        : std::string_view{},
                     .clipDurationSeconds = hasRichClipContext
                         ? richClipContext.durationSeconds
-                        : (hasScrubClipContext ? scrubClipContext.durationSeconds : 0.0f),
+                        : 0.0f,
                     .clipCroppedDurationSeconds = hasRichClipContext
                         ? richClipContext.croppedDurationSeconds
-                        : (hasScrubClipContext ? scrubClipContext.croppedDurationSeconds : 0.0f),
+                        : 0.0f,
                 });
-            }
 
             // Rest-pose capture for the delta-curve anchors (see the cache
             // entry declaration): a driven or hand-held part is not resting.
@@ -2211,10 +2128,10 @@ namespace paper_toolkit
             generationKey,
             allowedNodeNames.data(),
             allowedNodeNameCount,
-            _clipHarvestDrainGroups.data(),
-            static_cast<std::uint32_t>(_clipHarvestDrainGroups.size()));
+            _authoredPreharvestGroups.data(),
+            static_cast<std::uint32_t>(_authoredPreharvestGroups.size()));
         if (result.groupsProduced > 0) {
-            adoptWeaponClipHarvestBatch(
+            adoptAuthoredPreharvestBatch(
                 weaponNode,
                 generationKey,
                 weaponFormId,
@@ -2222,48 +2139,68 @@ namespace paper_toolkit
         }
     }
 
-    void PaperToolkitRuntime::updateWeaponClipHarvestWalk(RE::NiNode* weaponNode, std::uint64_t generationKey, std::uint32_t weaponFormId)
+    void PaperToolkitRuntime::updateWeaponClipTelemetry(RE::NiNode* weaponNode, std::uint64_t generationKey, std::uint32_t weaponFormId)
     {
         // Bounded retry window (frames with colliders ready) while the weapon
         // graph's bindings finish loading; weapons without a behavior graph
         // (some melee) give up quietly after this.
-        static constexpr std::uint32_t kClipHarvestWalkMaxAttempts = 900;
+        static constexpr std::uint32_t kClipTelemetryWalkMaxAttempts = 900;
         // Completed walks re-run at this cadence while the weapon stays
         // equipped: clip spline payloads stream in only while a clip plays
         // (in-game confirmed 2026-07-04 — headers resident, payload pointers
-        // null), so a reload performed in-hand makes its clips harvestable
+        // null), so a reload performed in-hand makes its clips capturable
         // on the next pass. A pass is a few pointer-gated reads per binding;
         // sampling happens only for clips that became resident.
-        static constexpr std::uint32_t kClipHarvestRewalkIntervalFrames = 180;
+        static constexpr std::uint32_t kClipTelemetryRewalkIntervalFrames = 180;
 
         if (!weaponNode || generationKey == 0 || weaponFormId == 0) {
             return;
         }
-        if (_clipHarvestWalkGenerationKey != generationKey) {
-            _clipHarvestWalkGenerationKey = generationKey;
-            _clipHarvestWalkAttempts = 0;
-            _clipHarvestWalkCompleted = false;
-            _clipHarvestWalkGaveUp = false;
-            _clipHarvestWalkHolderSeen = false;
-            _clipHarvestWalkCandidateLogged = false;
-            _clipHarvestRewalkActive = false;
-            _clipHarvestRewalkCooldownFrames = 0;
+        if (weaponFormId != _lastClipTelemetryWeaponFormId) {
+            _lastClipTelemetryWeaponFormId = weaponFormId;
+            const auto stats = weapon_clip_telemetry::snapshotStats();
+            PAPER_TOOLKIT_LOG_INFO(Weapon,
+                "WeaponClipTelemetry: stats at weapon {:08X} equip: bindingsSeen={} captured={} noTargets={} skippedNonSpline={} walksCompleted={} hookFires={} hookActivations={} bail=[anim={} clip={} splineData={} map={} bone={} sampler={}]",
+                weaponFormId,
+                stats.bindingsSeen,
+                stats.bindingsCaptured,
+                stats.bindingsNoTargets,
+                stats.skippedNonSpline,
+                stats.walksCompleted,
+                stats.hookFires,
+                stats.hookActivations,
+                stats.bailAnimationPtr,
+                stats.bailClipParams,
+                stats.bailSplineData,
+                stats.bailTrackMap,
+                stats.bailBoneCount,
+                stats.bailSampler);
         }
-        if (_clipHarvestWalkGaveUp) {
+        if (_clipTelemetryWalkGenerationKey != generationKey) {
+            _clipTelemetryWalkGenerationKey = generationKey;
+            _clipTelemetryWalkAttempts = 0;
+            _clipTelemetryWalkCompleted = false;
+            _clipTelemetryWalkGaveUp = false;
+            _clipTelemetryWalkHolderSeen = false;
+            _clipTelemetryWalkCandidateLogged = false;
+            _clipTelemetryRewalkActive = false;
+            _clipTelemetryRewalkCooldownFrames = 0;
+        }
+        if (_clipTelemetryWalkGaveUp) {
             return;
         }
-        if (_clipHarvestWalkCompleted && !_clipHarvestRewalkActive) {
-            if (++_clipHarvestRewalkCooldownFrames < kClipHarvestRewalkIntervalFrames) {
+        if (_clipTelemetryWalkCompleted && !_clipTelemetryRewalkActive) {
+            if (++_clipTelemetryRewalkCooldownFrames < kClipTelemetryRewalkIntervalFrames) {
                 return;
             }
-            _clipHarvestRewalkCooldownFrames = 0;
-            _clipHarvestRewalkActive = true;
-            weapon_clip_motion_harvest::restartWalkPass();
+            _clipTelemetryRewalkCooldownFrames = 0;
+            _clipTelemetryRewalkActive = true;
+            weapon_clip_telemetry::restartWalkPass();
         }
 
         // The walk starts only after the weapon's colliders finished creation
-        // (evidence snapshot committed for the current generation) so the
-        // drain always attributes strokes against the final part set.
+        // (evidence snapshot committed for the current generation) so clip
+        // evidence is always attributed against the final part set.
         refreshDrivePartCache(weaponNode, generationKey);
         if (_drivePartCache.generationKey != generationKey) {
             return;
@@ -2273,8 +2210,8 @@ namespace paper_toolkit
         // one-shot chain diagnostics can dump the live pointers of the
         // failing hop before the walk closes out. Re-walk passes never give
         // up — the first pass already proved bindings exist.
-        const bool givingUp = !_clipHarvestWalkCompleted &&
-                              ++_clipHarvestWalkAttempts > kClipHarvestWalkMaxAttempts;
+        const bool givingUp = !_clipTelemetryWalkCompleted &&
+                              ++_clipTelemetryWalkAttempts > kClipTelemetryWalkMaxAttempts;
 
         /*
          * Weapon clips can live on several graph managers, and the copies
@@ -2286,7 +2223,7 @@ namespace paper_toolkit
          * holders first (a weapon with a real own graph wins), the player's
          * manager last — and the first whose active graph has a non-empty
          * binding set is walked. The clip-track name filter (weapon subtree
-         * node names) keeps the actor-graph walk from harvesting body clips.
+         * node names) keeps the actor-graph walk from capturing body clips.
          * Non-owning pointers, used only within this call; the actor manager
          * reference is scoped by AcquiredGraphManager.
          */
@@ -2318,7 +2255,7 @@ namespace paper_toolkit
                     continue;
                 }
                 weaponHolderFound = true;
-                if (const void* manager = weapon_clip_motion_harvest::managerFromWeaponHolder(holder)) {
+                if (const void* manager = weapon_clip_telemetry::managerFromWeaponHolder(holder)) {
                     candidateManagers[candidateCount] = manager;
                     candidateLabels[candidateCount] = firstPerson ? "weapon-holder-1st" : "weapon-holder-3rd";
                     ++candidateCount;
@@ -2332,13 +2269,13 @@ namespace paper_toolkit
             ++candidateCount;
         }
         if (candidateCount > 0) {
-            _clipHarvestWalkHolderSeen = true;
+            _clipTelemetryWalkHolderSeen = true;
         }
 
         const void* chosenManager = nullptr;
         const char* chosenLabel = "?";
         for (std::uint32_t i = 0; i < candidateCount; ++i) {
-            if (weapon_clip_motion_harvest::probeBindings(candidateManagers[i])) {
+            if (weapon_clip_telemetry::probeBindings(candidateManagers[i])) {
                 chosenManager = candidateManagers[i];
                 chosenLabel = candidateLabels[i];
                 break;
@@ -2347,13 +2284,13 @@ namespace paper_toolkit
         // One-shot chain dump of the candidate the walk locks onto, so the
         // walked skeleton and binding-set contents are visible on success
         // paths too (not only at give-up).
-        if (chosenManager && !_clipHarvestWalkCandidateLogged) {
-            _clipHarvestWalkCandidateLogged = true;
+        if (chosenManager && !_clipTelemetryWalkCandidateLogged) {
+            _clipTelemetryWalkCandidateLogged = true;
             PAPER_TOOLKIT_LOG_INFO(Weapon,
-                "WeaponClipMotionHarvest: weapon {:08X} walking candidate [{}]",
+                "WeaponClipTelemetry: weapon {:08X} walking candidate [{}]",
                 weaponFormId,
                 chosenLabel);
-            weapon_clip_motion_harvest::logResolveDiagnostics(chosenManager, chosenLabel);
+            weapon_clip_telemetry::logResolveDiagnostics(chosenManager, chosenLabel);
         }
 
         if (!chosenManager) {
@@ -2361,15 +2298,15 @@ namespace paper_toolkit
             // only dummy-rig copies); retry until the attempt budget runs
             // out, then dump the chain of every candidate.
             if (givingUp) {
-                _clipHarvestWalkGaveUp = true;
+                _clipTelemetryWalkGaveUp = true;
                 PAPER_TOOLKIT_LOG_WARN(Weapon,
-                    "WeaponClipMotionHarvest: weapon {:08X} graph bindings never became available (holderSeen={} candidates={} lastStage={}); no authored strokes for this weapon",
+                    "WeaponClipTelemetry: weapon {:08X} graph bindings never became available (holderSeen={} candidates={} lastStage={}); passive clip evidence unavailable",
                     weaponFormId,
-                    _clipHarvestWalkHolderSeen,
+                    _clipTelemetryWalkHolderSeen,
                     candidateCount,
-                    weapon_clip_motion_harvest::lastResolveStage());
+                    weapon_clip_telemetry::lastResolveStage());
                 for (std::uint32_t i = 0; i < candidateCount; ++i) {
-                    weapon_clip_motion_harvest::logResolveDiagnostics(candidateManagers[i], candidateLabels[i]);
+                    weapon_clip_telemetry::logResolveDiagnostics(candidateManagers[i], candidateLabels[i]);
                 }
                 if (!weaponHolderFound) {
                     // One-shot slot dump so a weapon whose slot never matches
@@ -2386,7 +2323,7 @@ namespace paper_toolkit
                                 continue;
                             }
                             PAPER_TOOLKIT_LOG_WARN(Weapon,
-                                "WeaponClipMotionHarvest diagnostics: biped {} slot {} form {:08X} holder={}",
+                                "WeaponClipTelemetry diagnostics: biped {} slot {} form {:08X} holder={}",
                                 firstPerson ? "1st" : "3rd",
                                 slot,
                                 itemForm->GetFormID(),
@@ -2399,7 +2336,7 @@ namespace paper_toolkit
         }
 
         // Clip tracks are matched against the weapon's scene-node names, so
-        // an actor-graph walk only ever harvests this weapon's part clips.
+        // an actor-graph walk only ever captures this weapon's part clips.
         std::array<const char*, 128> allowedNodeNames{};
         std::uint32_t allowedNodeNameCount = 0;
         auto& weaponChildren = weaponNode->GetRuntimeData().children;
@@ -2413,11 +2350,11 @@ namespace paper_toolkit
         }
 
         // Prime/reset the walk identity before publishing the new hook
-        // targets. On a generation boundary stepHarvest clears its processed
+        // targets. On a generation boundary stepCapture clears its processed
         // registry; doing that after target publication could erase an
         // activation that raced through the narrow setTargets->step window.
-        weapon_clip_motion_harvest::ensureClipActivationHookInstalled();
-        const auto harvestResult = weapon_clip_motion_harvest::stepHarvest(
+        weapon_clip_telemetry::ensureClipTelemetryHooksInstalled();
+        const auto captureResult = weapon_clip_telemetry::stepCapture(
             chosenManager,
             weaponFormId,
             generationKey,
@@ -2425,10 +2362,9 @@ namespace paper_toolkit
             allowedNodeNameCount);
 
         // Streamed clips never land in the walked binding sets, so the
-        // activation hook harvests them the moment their loaded binding is
-        // installed on a clip generator of one of these graphs (a reload
-        // performed in-hand teaches the weapon its authored curves).
-        weapon_clip_motion_harvest::setClipActivationTargets(
+        // activation hook captures passive evidence the moment a loaded
+        // binding is installed on a clip generator of one of these graphs.
+        weapon_clip_telemetry::setClipTelemetryTargets(
             candidateManagers.data(),
             candidateCount,
             allowedNodeNames.data(),
@@ -2436,77 +2372,13 @@ namespace paper_toolkit
             weaponFormId,
             generationKey);
 
-        if (harvestResult == weapon_clip_motion_harvest::StepResult::Completed) {
-            _clipHarvestWalkCompleted = true;
-            _clipHarvestRewalkActive = false;
+        if (captureResult == weapon_clip_telemetry::StepResult::Completed) {
+            _clipTelemetryWalkCompleted = true;
+            _clipTelemetryRewalkActive = false;
         }
     }
 
-    void PaperToolkitRuntime::drainWeaponClipHarvest(RE::NiNode* weaponNode, std::uint64_t generationKey, std::uint32_t weaponFormId)
-    {
-        /*
-         * Empty the queue every frame (bounded): an equip-time hook/walk
-         * burst queues far more than one batch, and a full queue makes the
-         * harvest drop groups (in-game 2026-07-04: one whole clip's groups —
-         * the activated-tier upgrade — lost per equip).
-         */
-        for (std::uint32_t pass = 0; pass < 8; ++pass) {
-            if (!drainWeaponClipHarvestBatch(weaponNode, generationKey, weaponFormId)) {
-                break;
-            }
-        }
-    }
-
-    bool PaperToolkitRuntime::drainWeaponClipHarvestBatch(RE::NiNode* weaponNode, std::uint64_t generationKey, std::uint32_t weaponFormId)
-    {
-        if (!weaponNode || generationKey == 0 || weaponFormId == 0) {
-            return false;
-        }
-        if (weaponFormId != _lastClipHarvestWeaponFormId) {
-            // Strokes still queued belong to the previous weapon's graph;
-            // shared bone names would misattribute them.
-            weapon_clip_motion_harvest::clearPending();
-            _lastClipHarvestWeaponFormId = weaponFormId;
-            // Once per weapon swap: cumulative harvest counters distinguish
-            // graph-never-walked (seen=0) from track-filter rejection
-            // (seen>0, harvested=0, nonSpline=0) from compression gaps
-            // (nonSpline>0) without any per-binding hot-path logging.
-            const auto stats = weapon_clip_motion_harvest::snapshotStats();
-            PAPER_TOOLKIT_LOG_INFO(Weapon,
-                "WeaponClipMotionHarvest: stats at weapon {:08X} equip: bindingsSeen={} harvested={} noTargets={} groupsQueued={} groupsDropped={} skippedNonSpline={} walksCompleted={} hookFires={} hookActivations={} bail=[anim={} clip={} splineData={} map={} bone={} sampler={}]",
-                weaponFormId,
-                stats.bindingsSeen,
-                stats.bindingsHarvested,
-                stats.bindingsNoTargets,
-                stats.groupsQueued,
-                stats.groupsDropped,
-                stats.skippedNonSpline,
-                stats.walksCompleted,
-                stats.hookFires,
-                stats.hookActivations,
-                stats.bailAnimationPtr,
-                stats.bailClipParams,
-                stats.bailSplineData,
-                stats.bailTrackMap,
-                stats.bailBoneCount,
-                stats.bailSampler);
-            return false;
-        }
-
-        auto& drainedGroups = _clipHarvestDrainGroups;
-        const auto drainedCount = weapon_clip_motion_harvest::drainGroups(
-            drainedGroups.data(),
-            static_cast<std::uint32_t>(drainedGroups.size()));
-        if (drainedCount == 0) {
-            return false;
-        }
-
-        adoptWeaponClipHarvestBatch(
-            weaponNode, generationKey, weaponFormId, drainedCount);
-        return drainedCount == static_cast<std::uint32_t>(drainedGroups.size());
-    }
-
-    void PaperToolkitRuntime::adoptWeaponClipHarvestBatch(
+    void PaperToolkitRuntime::adoptAuthoredPreharvestBatch(
         RE::NiNode* weaponNode,
         const std::uint64_t generationKey,
         const std::uint32_t weaponFormId,
@@ -2516,7 +2388,7 @@ namespace paper_toolkit
             groupCount == 0) {
             return;
         }
-        auto& drainedGroups = _clipHarvestDrainGroups;
+        auto& drainedGroups = _authoredPreharvestGroups;
         const auto drainedCount = (std::min)(
             groupCount, static_cast<std::uint32_t>(drainedGroups.size()));
 
@@ -2527,18 +2399,6 @@ namespace paper_toolkit
             pose.rotate = weapon_part_motion_path::Quat{ quaternion[3], quaternion[0], quaternion[1], quaternion[2] };
             pose.translate = weapon_part_motion_path::Vec3{ transform.translate.x, transform.translate.y, transform.translate.z };
             return pose;
-        };
-        const auto authoredSourceLabel = [](
-            const weapon_clip_stroke::AuthoredClipSource source) {
-            switch (source) {
-            case weapon_clip_stroke::AuthoredClipSource::ExactWeaponPreharvest:
-                return "exact-preharvest";
-            case weapon_clip_stroke::AuthoredClipSource::ActivatedClip:
-                return "activated-legacy";
-            case weapon_clip_stroke::AuthoredClipSource::LoadedGraphFallback:
-            default:
-                return "loaded-fallback";
-            }
         };
         /*
          * Exact tracks already carry the complete target bone transform in
@@ -2555,159 +2415,21 @@ namespace paper_toolkit
             return transform_math::rebaseParentFrameMotion(
                 sourceFirstTransform, sourceKeyTransform, liveAnchor);
         };
-        /*
-         * Clip keys are RIG-bone-local under the rig 'Weapon' bone: their
-         * rest value differs from the scene node's (in-game A/B 2026-07-04:
-         * authored bolt paths started at the rig rest (0, 4.44, 0) instead
-         * of the part's weapon-local rest — grabbing teleported the part).
-         * Paths are therefore REBASED onto the node's weapon-local rest:
-         * translation rest + R·(t_i - t_0), rotation as the track's key
-         * delta relative to key 0 conjugated into the scene frame and
-         * applied about the bone origin (evidence nodes offset inside the
-         * bone orbit it, which is the true motion — the earlier "orbit"
-         * bug was this lever under a WRONG basis).
-         *
-         * R is the fixed rig-Weapon-root → scene-weapon-node-local basis
-         * rotation, calibrated 2026-07-04 from learner ground truth: the
-         * template bolt track's rig stroke (-8.05, 0, -3.88) is a straight
-         * back pull (0,-1,0) on five learned weapons (AK/hunting rifle/
-         * P320/10mm/handmade AR), which fixes R up to a spin about the
-         * pull axis; requiring the mag track (-6.61, 0, 3.88) to exit
-         * DOWNWARD (-Z) pins the spin uniquely (det +1, angle-preservation
-         * then forces the mag's 34-degree back-tilt — rock-and-lock; the
-         * in-game 2026-07-04 retest confirmed both predictions). The
-         * rig-Y ↦ scene-X consequence also matches: the template mag
-         * track's 45-degree key rotation about rig Y becomes a rock about
-         * the weapon's lateral axis.
-         * Result: scene = (rig.y, c*rig.x + s*rig.z, s*rig.x - c*rig.z)
-         * with (c, s) = normalized bolt-track direction.
-         */
-        constexpr float kRigBasisC = 0.900823f;  // 8.05 / |(-8.05, 0, -3.88)|
-        constexpr float kRigBasisS = 0.434185f;  // 3.88 / |(-8.05, 0, -3.88)|
-        const auto rigDeltaToScene = [](float dx, float dy, float dz) {
-            return RE::NiPoint3{
-                dy,
-                kRigBasisC * dx + kRigBasisS * dz,
-                kRigBasisS * dx - kRigBasisC * dz
-            };
-        };
-        /*
-         * The same basis as a raw column-vector matrix (v_scene = B·v_rig).
-         * Two matrix conventions meet here and MUST NOT be mixed (first
-         * rotation attempt mixed them — every authored rotation came out
-         * wrong): havokQuaternionToNiRows yields the standard COLUMN-vector
-         * matrix of the quaternion (M·v rotates v), while engine node
-         * matrices composed by transform_math are the TRANSPOSE of that
-         * (composeTransforms/localPointToWorld compute Mᵀ·v). All delta
-         * math below stays in column form; the transpose happens exactly
-         * once, where a delta composes onto an engine rest matrix.
-         */
-        RE::NiMatrix3 rigBasis{};
-        rigBasis.entry[0][1] = 1.0f;
-        rigBasis.entry[1][0] = kRigBasisC;
-        rigBasis.entry[1][2] = kRigBasisS;
-        rigBasis.entry[2][0] = kRigBasisS;
-        rigBasis.entry[2][2] = -kRigBasisC;
-        const RE::NiMatrix3 rigBasisTransposed = transform_math::transposeRotation(rigBasis);
-        const auto quatToColumnRotate = [](const weapon_part_motion_path::Quat& q) {
-            const float quaternion[4]{ q.x, q.y, q.z, q.w };
-            return transform_math::havokQuaternionToNiRows<RE::NiMatrix3>(quaternion);
-        };
-        // Rotation of a track key relative to the track's key 0, mapped into
-        // the scene weapon-node frame; column-vector form. The delta must be
-        // the PARENT-frame (left) delta key·key0ᵀ — the basis conjugation
-        // maps parent-frame rotations — not the body-frame key0ᵀ·key (key 0
-        // sits 135° from rest on the template rig, so the wrong frame is
-        // wrong by a lot, not subtly).
-        const auto sceneRotationDelta = [&](const weapon_part_motion_path::PoseSample& key0,
-                                            const weapon_part_motion_path::PoseSample& keyN) {
-            const auto rigDelta = transform_math::multiplyStoredRotations(
-                quatToColumnRotate(keyN.rotate),
-                transform_math::transposeRotation(quatToColumnRotate(key0.rotate)));
-            return transform_math::multiplyStoredRotations(
-                transform_math::multiplyStoredRotations(rigBasis, rigDelta),
-                rigBasisTransposed);
-        };
-        // Column-form delta applied to an engine-convention rest matrix:
-        // true result = delta·restᵀ, stored back as the transpose —
-        // rest_s·deltaᵀ.
-        const auto applyDeltaToRest = [](const RE::NiMatrix3& restStored, const RE::NiMatrix3& deltaColumn) {
-            return transform_math::multiplyStoredRotations(
-                restStored,
-                transform_math::transposeRotation(deltaColumn));
-        };
-        /*
-         * Rotation is honored only for ACTIVATED-clip strokes — the weapon's
-         * own animation (bolt-action rotate-then-pull) — and learned paths.
-         * Fallback strokes keep translation only: fallback is another clip's
-         * motion, and while its translation direction provably generalizes
-         * (basis calibrated against five learned weapons), its rotation
-         * provably does not (in-game 2026-07-04 twice: 45° pitch on
-         * straight-pull slides, then zero-translation optics/trigger tracks
-         * whose 90° diagonal-axis spins became "valid" strokes purely via
-         * rotation arc and drove parts around random points).
-         */
         const auto convertLeaderPath = [&](const weapon_clip_stroke::AuthoredStrokeGroup& source,
                                            const RE::NiTransform& leaderRestWeaponLocal,
-                                           const RE::NiTransform* tail,
                                            weapon_part_motion_path::MotionPath& outPath) {
             outPath = weapon_part_motion_path::MotionPath{};
-            RE::NiTransform anchor = leaderRestWeaponLocal;
-            if (tail) {
-                anchor = transform_math::composeTransforms(anchor, *tail);
-            }
-            if (source.trackSpace ==
-                weapon_clip_stroke::AuthoredTrackSpace::WeaponRootLocal) {
-                const auto& firstKey = source.leaderPath.keys[0];
-                float arc = 0.0f;
-                for (std::uint32_t key = 0;
-                     key < weapon_part_motion_path::kResampledKeyCount;
-                     ++key) {
-                    const auto keyTransform = rebaseExactKey(
-                        firstKey, source.leaderPath.keys[key], anchor);
-                    outPath.keys[key] = niToPose(keyTransform);
-                    if (key > 0) {
-                        arc += weapon_part_motion_path::poseDistance(
-                            outPath.keys[key], outPath.keys[key - 1]);
-                    }
-                }
-                outPath.totalArcLength = arc;
-                outPath.valid = arc > 0.0f;
-                return outPath.valid;
-            }
-
-            const bool applyRotation = source.source ==
-                weapon_clip_stroke::AuthoredClipSource::ActivatedClip;
-            // The track rotates its bone about the bone origin; an evidence
-            // node offset inside the bone (tail) orbits that origin.
-            const RE::NiPoint3 lever{
-                anchor.translate.x - leaderRestWeaponLocal.translate.x,
-                anchor.translate.y - leaderRestWeaponLocal.translate.y,
-                anchor.translate.z - leaderRestWeaponLocal.translate.z
-            };
             const auto& firstKey = source.leaderPath.keys[0];
             float arc = 0.0f;
-            for (std::uint32_t key = 0; key < weapon_part_motion_path::kResampledKeyCount; ++key) {
-                const auto& clipKey = source.leaderPath.keys[key];
-                const auto sceneDelta = rigDeltaToScene(
-                    clipKey.translate.x - firstKey.translate.x,
-                    clipKey.translate.y - firstKey.translate.y,
-                    clipKey.translate.z - firstKey.translate.z);
-                RE::NiTransform keyTransform = anchor;
-                if (applyRotation) {
-                    const auto rotationDelta = sceneRotationDelta(firstKey, clipKey);
-                    // Column form: M·v — rotateWorldVectorToLocal computes
-                    // exactly that on the raw entries.
-                    const auto rotatedLever =
-                        transform_math::rotateWorldVectorToLocal<RE::NiMatrix3, RE::NiPoint3>(rotationDelta, lever);
-                    keyTransform.translate = leaderRestWeaponLocal.translate + sceneDelta + rotatedLever;
-                    keyTransform.rotate = applyDeltaToRest(anchor.rotate, rotationDelta);
-                } else {
-                    keyTransform.translate += sceneDelta;
-                }
+            for (std::uint32_t key = 0;
+                 key < weapon_part_motion_path::kResampledKeyCount;
+                 ++key) {
+                const auto keyTransform = rebaseExactKey(
+                    firstKey, source.leaderPath.keys[key], leaderRestWeaponLocal);
                 outPath.keys[key] = niToPose(keyTransform);
                 if (key > 0) {
-                    arc += weapon_part_motion_path::poseDistance(outPath.keys[key], outPath.keys[key - 1]);
+                    arc += weapon_part_motion_path::poseDistance(
+                        outPath.keys[key], outPath.keys[key - 1]);
                 }
             }
             outPath.totalArcLength = arc;
@@ -2773,101 +2495,21 @@ namespace paper_toolkit
         };
         for (std::uint32_t groupIndex = 0; groupIndex < drainedCount; ++groupIndex) {
             const auto& group = drainedGroups[groupIndex];
-            const auto leaderName = providerFixedStringView(group.leaderBoneName.data(), group.leaderBoneName.size());
-            const bool exactWeaponRootSpace =
-                group.source ==
-                    weapon_clip_stroke::AuthoredClipSource::ExactWeaponPreharvest &&
-                group.trackSpace ==
-                    weapon_clip_stroke::AuthoredTrackSpace::WeaponRootLocal;
-            auto* leaderNode = exactWeaponRootSpace
-                ? exactLeaderNodes[groupIndex]
-                : findWeaponNodeByBoneName(weaponNode, leaderName, 32);
-            if (!leaderNode || !leaderNode->parent || !group.leaderPath.valid) {
-                // Clip does not belong to this weapon (or the rig bone is not
-                // in the assembled tree) — normal for NPC/other-race clips.
+            if (group.source !=
+                    weapon_clip_stroke::AuthoredClipSource::ExactWeaponPreharvest ||
+                group.trackSpace !=
+                    weapon_clip_stroke::AuthoredTrackSpace::WeaponRootLocal) {
                 continue;
             }
-            /*
-             * Authored tier is CLIP PROVENANCE, not bone name (Bruno,
-             * 2026-07-04): modded weapons animate template-named bones with
-             * their OWN clips, so the bone-name heuristic misjudged real
-             * data as generic and let a merely-loaded shared clip drive
-             * modded parts. A stroke from a clip the weapon actually
-             * ACTIVATED is the weapon's animation; loaded-set walk strokes
-             * are fallback only, replaced the moment real data arrives.
-             */
-            const bool fallbackSource = group.source ==
-                weapon_clip_stroke::AuthoredClipSource::LoadedGraphFallback;
-            /*
-             * Fallback plausibility cap (in-game 2026-07-04): the 23-unit
-             * 'WeaponExtra2' carry track from the loaded shared clip mapped
-             * onto slide stops and drove them sideways across the weapon.
-             * No real reciprocating part travels that far; a fallback
-             * stroke past this cap is helper/carry animation, not part
-             * motion. Activated clips are the weapon's own data and are
-             * not second-guessed.
-             */
-            constexpr float kMaxFallbackStrokeArcGameUnits = 15.0f;
-            if (fallbackSource && group.leaderPath.totalArcLength > kMaxFallbackStrokeArcGameUnits) {
-                PAPER_TOOLKIT_LOG_INFO(Weapon,
-                    "WeaponClipHarvest: dropped fallback stroke '{}' (arc {:.1f} > {:.1f} cap)",
-                    leaderName,
-                    group.leaderPath.totalArcLength,
-                    kMaxFallbackStrokeArcGameUnits);
+            const auto leaderName = providerFixedStringView(group.leaderBoneName.data(), group.leaderBoneName.size());
+            auto* leaderNode = exactLeaderNodes[groupIndex];
+            if (!leaderNode || !leaderNode->parent || !group.leaderPath.valid) {
+                // The exact clip does not name a node in the assembled weapon
+                // tree, so it cannot safely serve this weapon instance.
                 continue;
             }
             const RE::NiTransform leaderRestWeaponLocal =
                 transform_math::composeTransforms(weaponWorldInverse, leaderNode->world);
-
-            // Basis evidence: raw rig-frame stroke vs the basis-corrected
-            // scene-frame stroke actually stored. sceneDeltaT for bolt/slide
-            // tracks must read as a straight -Y back pull, mags as -Z-biased
-            // down-and-back; any other shape means the calibration is off
-            // for this rig family.
-            if (group.trackSpace ==
-                weapon_clip_stroke::AuthoredTrackSpace::RigBoneLocal) {
-                const auto restPose = niToPose(leaderRestWeaponLocal);
-                const auto& key0 = group.leaderPath.keys[0];
-                const auto& keyLast = group.leaderPath.keys[weapon_part_motion_path::kResampledKeyCount - 1];
-                const auto sceneDelta = rigDeltaToScene(
-                    keyLast.translate.x - key0.translate.x,
-                    keyLast.translate.y - key0.translate.y,
-                    keyLast.translate.z - key0.translate.z);
-                // True scene-frame rotation delta of the stroke (column
-                // matrix → standard quat extraction).
-                float sceneRotQuat[4]{};
-                transform_math::niRowsToHavokQuaternion(sceneRotationDelta(key0, keyLast), sceneRotQuat);
-                PAPER_TOOLKIT_LOG_INFO(Weapon,
-                    "WeaponClipHarvest basis: leader '{}' src={} clip='{}' restT=({:.2f},{:.2f},{:.2f}) restQ=({:.3f},{:.3f},{:.3f},{:.3f}) key0Q=({:.3f},{:.3f},{:.3f},{:.3f}) keyLastQ=({:.3f},{:.3f},{:.3f},{:.3f}) rigDeltaT=({:.2f},{:.2f},{:.2f}) sceneDeltaT=({:.2f},{:.2f},{:.2f}) sceneDeltaQ=(w{:.3f},{:.3f},{:.3f},{:.3f})",
-                    leaderName,
-                    authoredSourceLabel(group.source),
-                    group.clipAnimationName.data(),
-                    restPose.translate.x,
-                    restPose.translate.y,
-                    restPose.translate.z,
-                    restPose.rotate.w,
-                    restPose.rotate.x,
-                    restPose.rotate.y,
-                    restPose.rotate.z,
-                    key0.rotate.w,
-                    key0.rotate.x,
-                    key0.rotate.y,
-                    key0.rotate.z,
-                    keyLast.rotate.w,
-                    keyLast.rotate.x,
-                    keyLast.rotate.y,
-                    keyLast.rotate.z,
-                    keyLast.translate.x - key0.translate.x,
-                    keyLast.translate.y - key0.translate.y,
-                    keyLast.translate.z - key0.translate.z,
-                    sceneDelta.x,
-                    sceneDelta.y,
-                    sceneDelta.z,
-                    sceneRotQuat[3],
-                    sceneRotQuat[0],
-                    sceneRotQuat[1],
-                    sceneRotQuat[2]);
-            }
 
             // Followers convert once (leader-tail-independent): each follower
             // stroke drives its own node in weapon-root-local space, rebased
@@ -2891,9 +2533,7 @@ namespace paper_toolkit
                 }
                 RE::NiTransform followerRestWeaponLocal =
                     transform_math::composeTransforms(weaponWorldInverse, followerNode->world);
-                if (group.trackSpace ==
-                        weapon_clip_stroke::AuthoredTrackSpace::WeaponRootLocal &&
-                    _drivePartCache.generationKey == generationKey) {
+                if (_drivePartCache.generationKey == generationKey) {
                     for (std::uint32_t entryIndex = 0;
                          entryIndex < _drivePartCache.count;
                          ++entryIndex) {
@@ -2910,28 +2550,10 @@ namespace paper_toolkit
                 slot.boneName = group.followers[follower].boneName;
                 for (std::uint32_t key = 0; key < weapon_part_motion_path::kResampledKeyCount; ++key) {
                     const auto& clipKey = group.followers[follower].keys[key];
-                    RE::NiTransform keyTransform{};
-                    if (group.trackSpace ==
-                        weapon_clip_stroke::AuthoredTrackSpace::WeaponRootLocal) {
-                        keyTransform = rebaseExactKey(
-                            followerFirstKey,
-                            clipKey,
-                            followerRestWeaponLocal);
-                    } else {
-                        const auto sceneDelta = rigDeltaToScene(
-                            clipKey.translate.x - followerFirstKey.translate.x,
-                            clipKey.translate.y - followerFirstKey.translate.y,
-                            clipKey.translate.z - followerFirstKey.translate.z);
-                        keyTransform = followerRestWeaponLocal;
-                        keyTransform.translate += sceneDelta;
-                    }
-                    if (group.source ==
-                            weapon_clip_stroke::AuthoredClipSource::ActivatedClip &&
-                        group.trackSpace ==
-                            weapon_clip_stroke::AuthoredTrackSpace::RigBoneLocal) {
-                        const auto rotationDelta = sceneRotationDelta(followerFirstKey, clipKey);
-                        keyTransform.rotate = applyDeltaToRest(followerRestWeaponLocal.rotate, rotationDelta);
-                    }
+                    const auto keyTransform = rebaseExactKey(
+                        followerFirstKey,
+                        clipKey,
+                        followerRestWeaponLocal);
                     slot.keys[key] = niToPose(keyTransform);
                 }
                 slot.restScale = followerRestWeaponLocal.scale;
@@ -2941,8 +2563,8 @@ namespace paper_toolkit
             /*
              * The leader stroke is stored once per matching evidence part so a
              * grip on the authored rig bone or a rigid collider node beneath it
-             * guides that part along the same authored path; tail carries the
-             * evidence node's static offset inside the leader bone's frame.
+             * guides that part along the same authored path, rebased onto the
+             * concrete part's stable weapon-local anchor.
              */
             bool storedForEvidence = false;
             if (_drivePartCache.generationKey == generationKey) {
@@ -2950,25 +2572,16 @@ namespace paper_toolkit
                     const auto& entry = _drivePartCache.entries[entryIndex];
                     if (!entry.node ||
                         (entry.node != leaderNode && !nodeContainsNode(leaderNode, entry.node, 16)) ||
-                        (exactWeaponRootSpace && crossesDifferentExactLeader(
-                            groupIndex, entry.node, leaderNode))) {
+                        crossesDifferentExactLeader(groupIndex, entry.node, leaderNode)) {
                         continue;
                     }
                     const RE::NiTransform currentEntryRest =
                         transform_math::composeTransforms(
                             weaponWorldInverse, entry.node->world);
-                    const RE::NiTransform tail = transform_math::composeTransforms(
-                        transform_math::invertTransform(leaderNode->world),
-                        entry.node->world);
-                    const RE::NiTransform entryAnchor = exactWeaponRootSpace
-                        ? stablePartAnchor(entry, currentEntryRest)
-                        : leaderRestWeaponLocal;
-                    const RE::NiTransform* tailPtr = !exactWeaponRootSpace &&
-                            entry.node != leaderNode
-                        ? &tail
-                        : nullptr;
+                    const RE::NiTransform entryAnchor =
+                        stablePartAnchor(entry, currentEntryRest);
                     if (!convertLeaderPath(
-                            group, entryAnchor, tailPtr, converted.leaderPath)) {
+                            group, entryAnchor, converted.leaderPath)) {
                         continue;
                     }
                     /*
@@ -2990,8 +2603,8 @@ namespace paper_toolkit
                         if (otherIndex == entryIndex || !other.node || other.node == entry.node ||
                             (other.node != leaderNode &&
                                 !nodeContainsNode(leaderNode, other.node, 16)) ||
-                            (exactWeaponRootSpace && crossesDifferentExactLeader(
-                                groupIndex, other.node, leaderNode))) {
+                            crossesDifferentExactLeader(
+                                groupIndex, other.node, leaderNode)) {
                             continue;
                         }
                         const auto otherName = providerFixedStringView(
@@ -3014,17 +2627,8 @@ namespace paper_toolkit
                         }
                         RE::NiTransform otherRestWeaponLocal =
                             transform_math::composeTransforms(weaponWorldInverse, other.node->world);
-                        if (exactWeaponRootSpace) {
-                            otherRestWeaponLocal = stablePartAnchor(
-                                other, otherRestWeaponLocal);
-                        }
-                        // Rigid with the leader bone: the sibling orbits the
-                        // bone origin under the leader's rotation delta.
-                        const RE::NiPoint3 siblingLever{
-                            otherRestWeaponLocal.translate.x - leaderRestWeaponLocal.translate.x,
-                            otherRestWeaponLocal.translate.y - leaderRestWeaponLocal.translate.y,
-                            otherRestWeaponLocal.translate.z - leaderRestWeaponLocal.translate.z
-                        };
+                        otherRestWeaponLocal = stablePartAnchor(
+                            other, otherRestWeaponLocal);
                         auto& slot = groupForEntry.followers[groupForEntry.followerCount];
                         slot = weapon_clip_stroke::AuthoredFollower{};
                         std::memcpy(
@@ -3033,34 +2637,10 @@ namespace paper_toolkit
                             (std::min)(slot.boneName.size() - 1, other.sourceName.size()));
                         for (std::uint32_t key = 0; key < weapon_part_motion_path::kResampledKeyCount; ++key) {
                             const auto& clipKey = group.leaderPath.keys[key];
-                            RE::NiTransform keyTransform{};
-                            RE::NiPoint3 sceneDelta{};
-                            if (group.trackSpace ==
-                                weapon_clip_stroke::AuthoredTrackSpace::WeaponRootLocal) {
-                                keyTransform = rebaseExactKey(
-                                    group.leaderPath.keys[0],
-                                    clipKey,
-                                    otherRestWeaponLocal);
-                            } else {
-                                sceneDelta = rigDeltaToScene(
-                                    clipKey.translate.x - group.leaderPath.keys[0].translate.x,
-                                    clipKey.translate.y - group.leaderPath.keys[0].translate.y,
-                                    clipKey.translate.z - group.leaderPath.keys[0].translate.z);
-                                keyTransform = otherRestWeaponLocal;
-                                keyTransform.translate += sceneDelta;
-                            }
-                            if (group.source ==
-                                    weapon_clip_stroke::AuthoredClipSource::ActivatedClip &&
-                                group.trackSpace ==
-                                    weapon_clip_stroke::AuthoredTrackSpace::RigBoneLocal) {
-                                const auto rotationDelta =
-                                    sceneRotationDelta(group.leaderPath.keys[0], clipKey);
-                                const auto rotatedLever = transform_math::rotateWorldVectorToLocal<RE::NiMatrix3, RE::NiPoint3>(
-                                    rotationDelta, siblingLever);
-                                keyTransform.translate =
-                                    leaderRestWeaponLocal.translate + sceneDelta + rotatedLever;
-                                keyTransform.rotate = applyDeltaToRest(otherRestWeaponLocal.rotate, rotationDelta);
-                            }
+                            const auto keyTransform = rebaseExactKey(
+                                group.leaderPath.keys[0],
+                                clipKey,
+                                otherRestWeaponLocal);
                             slot.keys[key] = niToPose(keyTransform);
                         }
                         slot.restScale = otherRestWeaponLocal.scale;
@@ -3082,7 +2662,7 @@ namespace paper_toolkit
                 // paired part appearing later looks up with ITS omod and
                 // will not see this record — strict keying accepts that
                 // authored-coverage gap over serving cross-part data.
-                if (convertLeaderPath(group, leaderRestWeaponLocal, nullptr, converted.leaderPath)) {
+                if (convertLeaderPath(group, leaderRestWeaponLocal, converted.leaderPath)) {
                     _learner.storeAuthoredGroup(
                         WeaponPartMotionLearner::PartKey{ weaponFormId, 0, leaderName },
                         converted);
@@ -3104,40 +2684,10 @@ namespace paper_toolkit
         input.stageTransitionsEnabled = g_paperToolkitConfig.stageTransitions;
         input.travelExtremeToleranceFraction = g_paperToolkitConfig.travelExtremeTolerance;
 
-        /*
-         * Clip-scrub session lifecycle (mode == scrub). The captured clip
-         * is queried before the sandbox update so this frame's grips see
-         * the live state; the end conditions run here because they are
-         * runtime policy, not clip mechanics: completion hands the clip
-         * back to the engine (native finish = v1 commit semantics), the
-         * idle timeout frees a frozen reload nobody is driving, and a mode
-         * hot-switch away from scrub must not leave a clip frozen.
-         */
-        auto scrubSession = weapon_clip_motion_harvest::clipScrubSessionState();
-        if (scrubSession.active) {
-            if (g_paperToolkitConfig.motionPathMode != MotionPathMode::ClipScrub) {
-                weapon_clip_motion_harvest::endClipScrubSession();
-                scrubSession.active = false;
-            } else if (scrubSession.fraction >= kClipScrubCompleteFraction) {
-                PAPER_TOOLKIT_LOG_INFO(Weapon,
-                    "CLIP-SCRUB complete at fraction {:.3f} — releasing to native (engine finishes the reload)",
-                    scrubSession.fraction);
-                weapon_clip_motion_harvest::endClipScrubSession();
-                scrubSession.active = false;
-            }
-        }
-        if (scrubSession.sessionId != _scrubLastSessionId) {
-            _scrubLastSessionId = scrubSession.sessionId;
-            _scrubIdleFrames = 0;
-        }
-        input.clipScrubSessionActive = scrubSession.active;
-        input.clipScrubSessionId = scrubSession.sessionId;
-        input.clipScrubFraction = scrubSession.fraction;
-
         const auto* api = ::rock::provider::RockProviderApi::inst;
         // Trigger-arming support probe, once: an older ROCK without raw wand
         // button reads must not dead-lock attach-only grips — fall back to
-        // always-armed (scrub-on-grab) with a one-time warning.
+        // always-armed path driving with a one-time warning.
         if (!_rawWandSupportChecked && g_paperToolkitConfig.requireTriggerUnlock && api) {
             _rawWandSupportChecked = true;
             _rawWandButtonsAvailable = ::rock::provider::supportsRawWandButtonStateV1();
@@ -3298,7 +2848,7 @@ namespace paper_toolkit
             handInput.bodyId = report.bodyId;
 
             // Session unlock, PER HAND (level state — press or already-held
-            // both count): each hand's scrub is enabled by its own trigger.
+            // both count): each hand's path drive is enabled by its trigger.
             handInput.triggerHeld = !triggerSelectionActive || triggerHeld[isLeft ? 1u : 0u];
 
             // Names and nodes come from the member cache (stable storage) so
@@ -3348,7 +2898,7 @@ namespace paper_toolkit
             if (hasWeaponInverse && node && nodeContainsNode(weaponNode, node, 64)) {
                 const RE::NiTransform partWeaponLocal = transform_math::composeTransforms(weaponWorldInverse, node->world);
                 // Hand anchor: the provider hand frame. Only hand DISPLACEMENT
-                // from grip start feeds the scrub, so any hand-rigid point is
+                // from grip start feeds the drive, so any hand-rigid point is
                 // equivalent to the grab anchor ROCK used internally.
                 const auto& handTransform = isLeft ? snapshot.leftHandTransform : snapshot.rightHandTransform;
                 const RE::NiPoint3 handWorld{
@@ -3373,25 +2923,8 @@ namespace paper_toolkit
         std::array<WeaponPartDriveSandbox::SentDrive, WeaponPartDriveSandbox::kMaxSentDrives> sentDrives{};
         std::array<WeaponPartDriveSandbox::MaxTravelEvent, WeaponPartDriveSandbox::kMaxMaxTravelEvents> maxTravelEvents{};
         std::uint32_t maxTravelEventCount = 0;
-        float scrubDesiredFraction = 0.0f;
-        bool scrubFractionValid = false;
         const auto sentCount = _sandbox.update(input, _learner, sentDrives.data(), maxTravelEvents.data(),
-            &maxTravelEventCount, &scrubDesiredFraction, &scrubFractionValid);
-
-        if (scrubSession.active) {
-            if (scrubFractionValid) {
-                weapon_clip_motion_harvest::setClipScrubDesiredFraction(scrubDesiredFraction);
-                _scrubIdleFrames = 0;
-            } else if (++_scrubIdleFrames >= kClipScrubIdleTimeoutFrames) {
-                _scrubIdleFrames = 0;
-                PAPER_TOOLKIT_LOG_INFO(Weapon,
-                    "CLIP-SCRUB idle timeout at fraction {:.3f} — releasing frozen reload to native",
-                    scrubSession.fraction);
-                weapon_clip_motion_harvest::endClipScrubSession();
-            }
-        } else {
-            _scrubIdleFrames = 0;
-        }
+            &maxTravelEventCount);
         // Refresh the untrusted-observation leases for everything we drove
         // this frame; the lease outlives the drive by the restore frame.
         for (std::uint32_t i = 0; i < sentCount; ++i) {
@@ -3421,7 +2954,7 @@ namespace paper_toolkit
         }
 
         /*
-         * Shell-eject test (Bruno, 2026-07-05): a scrubbed bolt/slide-class
+         * Shell-eject test (Bruno, 2026-07-05): a driven bolt/slide-class
          * part reaching max travel fires the engine's own shell-casing
          * ejection for the equipped weapon — the exact P-Casing debris spawn
          * a fired shot's "EjectShellCasing" anim event runs (see

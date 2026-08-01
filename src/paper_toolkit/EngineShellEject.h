@@ -17,7 +17,7 @@ namespace paper_toolkit
         // No weapon resolved at the weapon equip index.
         NoWeapon,
         // A weapon resolved but its formID is not the weapon the runtime is
-        // scrubbing — fail closed rather than eject the wrong thing.
+        // path driving — fail closed rather than eject the wrong thing.
         WeaponMismatch,
     };
 

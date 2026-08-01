@@ -10,7 +10,7 @@ namespace paper_toolkit
      * INI-selected allowlist of part CLASSES that may become AttachOnly
      * grips — one boolean per class (bAttachOnlyBolt, bAttachOnlyStock, ...).
      * This is only half the gate: a concrete part must ALSO have a motion
-     * path under the active MotionPathMode (mapped by the clip harvest or
+     * path under the active MotionPathMode (exact-authored preharvest or
      * taught to the learner) to be whitelisted with ROCK — a part that does
      * not move is never attach-only and never grouped, no matter what the
      * allowlist says. Eligibility is therefore resolved per PART, per

@@ -8,14 +8,14 @@
 
 /*
  * Pure policy that turns hand displacement into a position along a learned
- * weapon-part motion path ("scrubbing"). The hand never gets direct authority:
+ * weapon-part motion path. The hand never gets direct authority:
  * the caller computes a desired point (part translate at grip start plus hand
  * displacement, weapon-root-local), this policy projects it onto the path near
- * the current scrub position, and the resulting keyed pose becomes the drive
+ * the current path position, and the resulting keyed pose becomes the drive
  * target — so the part always moves exactly along the animation's own stroke,
  * including its rotation.
  */
-namespace paper_toolkit::weapon_part_motion_scrub
+namespace paper_toolkit::weapon_part_path_projection
 {
     using weapon_part_motion_path::MotionPath;
     using weapon_part_motion_path::PoseSample;
@@ -24,15 +24,15 @@ namespace paper_toolkit::weapon_part_motion_scrub
 
     // Segments searched on each side of the current position per frame; keeps
     // folded paths (bolt lift + pull share space) from snapping across folds.
-    inline constexpr std::uint32_t kScrubSearchWindowSegments = 3;
-    // Per-frame scrub travel clamp in arc units; generous for a 90 fps hand
+    inline constexpr std::uint32_t kProjectionSearchWindowSegments = 3;
+    // Per-frame path travel clamp in arc units; generous for a 90 fps hand
     // pull but blocks single-frame teleports from tracking spikes.
-    inline constexpr float kMaxScrubAdvancePerFrame = 2.0f;
+    inline constexpr float kMaxProjectionAdvancePerFrame = 2.0f;
     // Segments whose translation span is below this cannot be projected onto
     // and are skipped (pure-rotation stretches of the stroke).
     inline constexpr float kDegenerateSegmentLengthGameUnits = 1.0e-3f;
 
-    struct ScrubResult
+    struct ProjectionResult
     {
         bool valid{ false };
         float arcPosition{ 0.0f };
@@ -117,9 +117,9 @@ namespace paper_toolkit::weapon_part_motion_scrub
 
     /*
      * Global nearest projection over the whole path; used once at grip start
-     * to seed the scrub position from wherever the part currently sits.
+     * to seed the path position from wherever the part currently sits.
      */
-    inline ScrubResult initialScrubPosition(const MotionPath& path, const Vec3& partTranslate)
+    inline ProjectionResult seedPathPosition(const MotionPath& path, const Vec3& partTranslate)
     {
         if (!path.valid || !(path.totalArcLength > 0.0f)) {
             return {};
@@ -128,7 +128,7 @@ namespace paper_toolkit::weapon_part_motion_scrub
         if (!best.valid) {
             return {};
         }
-        return ScrubResult{
+        return ProjectionResult{
             .valid = true,
             .arcPosition = best.arcPosition,
             .target = poseAtArcPosition(path, best.arcPosition),
@@ -136,12 +136,12 @@ namespace paper_toolkit::weapon_part_motion_scrub
     }
 
     /*
-     * Per-frame scrub: window-limited projection around the current arc
+     * Per-frame projection around the current arc
      * position with a per-frame travel clamp. When every windowed segment is
      * degenerate the position holds (result stays valid at currentArc), so a
-     * pure-rotation stretch parks the scrub instead of snapping it.
+     * pure-rotation stretch parks the drive position instead of snapping it.
      */
-    inline ScrubResult scrub(const MotionPath& path, float currentArcPosition, const Vec3& desiredTranslate)
+    inline ProjectionResult projectOntoPath(const MotionPath& path, float currentArcPosition, const Vec3& desiredTranslate)
     {
         if (!path.valid || !(path.totalArcLength > 0.0f)) {
             return {};
@@ -151,21 +151,21 @@ namespace paper_toolkit::weapon_part_motion_scrub
         const std::uint32_t currentSegment = (std::min)(
             kResampledKeyCount - 2,
             keySpacing > 0.0f ? static_cast<std::uint32_t>(clampedCurrent / keySpacing) : 0u);
-        const std::uint32_t firstSegment = currentSegment >= kScrubSearchWindowSegments
-            ? currentSegment - kScrubSearchWindowSegments
+        const std::uint32_t firstSegment = currentSegment >= kProjectionSearchWindowSegments
+            ? currentSegment - kProjectionSearchWindowSegments
             : 0u;
         const std::uint32_t lastSegment = (std::min)(
             kResampledKeyCount - 2,
-            currentSegment + kScrubSearchWindowSegments);
+            currentSegment + kProjectionSearchWindowSegments);
 
         const auto best = detail::bestProjectionInRange(path, firstSegment, lastSegment, desiredTranslate);
         float newArc = clampedCurrent;
         if (best.valid) {
             const float advance = best.arcPosition - clampedCurrent;
-            const float clampedAdvance = (std::min)(kMaxScrubAdvancePerFrame, (std::max)(-kMaxScrubAdvancePerFrame, advance));
+            const float clampedAdvance = (std::min)(kMaxProjectionAdvancePerFrame, (std::max)(-kMaxProjectionAdvancePerFrame, advance));
             newArc = (std::min)(path.totalArcLength, (std::max)(0.0f, clampedCurrent + clampedAdvance));
         }
-        return ScrubResult{
+        return ProjectionResult{
             .valid = true,
             .arcPosition = newArc,
             .target = poseAtArcPosition(path, newArc),

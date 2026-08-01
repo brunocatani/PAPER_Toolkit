@@ -187,7 +187,7 @@ option(BUILD_PAPER_TOOLKIT_TESTS "Build PAPER Toolkit focused regression tests" 
 if(BUILD_PAPER_TOOLKIT_TESTS)
   enable_testing()
 
-  # Pure-policy tests: the motion path / scrub / clip stroke policies, the
+  # Pure-policy tests: the motion path / projection / clip stroke policies, the
   # learner, and the motion-library FORMAT are engine-free by design, so the
   # test binary needs no CommonLib or F4SE (the learner's logging compiles
   # out via the test define; nlohmann is header-only).

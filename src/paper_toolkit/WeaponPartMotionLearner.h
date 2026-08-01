@@ -19,14 +19,15 @@ namespace paper_toolkit
      * recorder never learns our own authority back.
      *
      * Storage keeps LEARNED and AUTHORED sources side by side per concrete
-     * part identity. They are independent: AuthoredOnly records no learned
-     * observations and serves only exact equipped-weapon preharvest, while
-     * LearnedOnly serves only runtime observation. Neither source can
-     * destroy or silently substitute for the other.
+     * part identity. Collection is independent of selection: live learning
+     * and exact preharvest continue in both modes. AuthoredOnly serves only
+     * exact equipped-weapon preharvest, while LearnedOnly serves only runtime
+     * observation. Neither source can destroy or silently substitute for the
+     * other.
      *
      * The learned source additionally keeps a RETURN STAGE per part: a
      * completed stroke whose start pose chains onto the primary stroke's
-     * end pose (mag-in observed after mag-out). The scrub consumer flips
+     * end pose (mag-in observed after mag-out). The drive consumer flips
      * between the stages at the path extremes, so extraction and insertion
      * keep their own paths and their own min/max instead of the insertion
      * stroke being discarded by the largest-stroke rule.
@@ -113,7 +114,6 @@ namespace paper_toolkit
             std::string_view nodePath{};
             bool nodePathTruncated{ false };
             std::uint64_t clipActivityId{ 0 };
-            std::uint64_t clipScrubSessionId{ 0 };
             std::uint32_t clipConcurrentActivityCount{ 0 };
             float clipFraction{ 0.0f };
             float clipLocalTimeSeconds{ 0.0f };
@@ -182,7 +182,6 @@ namespace paper_toolkit
             const std::uint64_t* rockFrameIndices{ nullptr };
             const float* scales{ nullptr };
             const std::uint64_t* clipActivityIds{ nullptr };
-            const std::uint64_t* clipScrubSessionIds{ nullptr };
             const std::uint32_t* clipConcurrentActivityCounts{ nullptr };
             const float* clipFractions{ nullptr };
             const float* clipLocalTimesSeconds{ nullptr };
@@ -251,12 +250,12 @@ namespace paper_toolkit
         [[nodiscard]] SourceAvailability sourceAvailability(const PartKey& key) const;
 
         /*
-         * Store a clip-harvested stroke group (already converted to
+         * Store an authored stroke group (already converted to
          * weapon-root-local and mapped to the evidence source name) into the
-         * AUTHORED record. Source authority is carried by the group itself:
-         * exact equipped-weapon preharvest outranks live activation evidence,
-         * which outranks a merely-loaded graph fallback. AuthoredOnly serves
-         * only the exact tier. Within one tier the largest leader stroke wins.
+         * AUTHORED record. Source authority is carried by the group itself.
+         * Legacy activation/fallback tiers remain representable so compact V1
+         * data round-trips, but AuthoredOnly serves only exact equipped-weapon
+         * preharvest. Within one tier the largest leader stroke wins.
          */
         void storeAuthoredGroup(
             const PartKey& key,
@@ -345,7 +344,6 @@ namespace paper_toolkit
             float lastScale{ 1.0f };
             std::uint64_t lastRockFrameIndex{ 0 };
             std::uint64_t lastClipActivityId{ 0 };
-            std::uint64_t lastClipScrubSessionId{ 0 };
             std::uint32_t lastClipConcurrentActivityCount{ 0 };
             float lastClipFraction{ 0.0f };
             float lastClipLocalTimeSeconds{ 0.0f };
@@ -365,7 +363,6 @@ namespace paper_toolkit
             std::array<std::uint64_t, weapon_part_motion_path::kMaxRecordingSamples> rockFrameIndices{};
             std::array<float, weapon_part_motion_path::kMaxRecordingSamples> scales{};
             std::array<std::uint64_t, weapon_part_motion_path::kMaxRecordingSamples> clipActivityIds{};
-            std::array<std::uint64_t, weapon_part_motion_path::kMaxRecordingSamples> clipScrubSessionIds{};
             std::array<std::uint32_t, weapon_part_motion_path::kMaxRecordingSamples>
                 clipConcurrentActivityCounts{};
             std::array<float, weapon_part_motion_path::kMaxRecordingSamples> clipFractions{};

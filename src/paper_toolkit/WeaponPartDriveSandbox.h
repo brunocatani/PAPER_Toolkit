@@ -56,7 +56,7 @@ namespace paper_toolkit
             bool gripActive{ false };
             /*
              * Trigger arming: true when this hand's trigger is currently
-             * held (or trigger selection is disabled/unavailable). A scrub
+             * held (or trigger selection is disabled/unavailable). A drive
              * session only STARTS while this is true; once started it runs
              * until the grip ends — the trigger is never rechecked, so
              * "press or hold to unlock, stays unlocked until the part is
@@ -86,9 +86,9 @@ namespace paper_toolkit
         };
 
         /*
-         * Emitted when a scrub session first reaches the far end of its
+         * Emitted when a path-drive session first reaches the far end of its
          * PRIMARY stage ("max travel" — slide fully back, bolt fully open);
-         * re-armed once the scrub retreats below half the path, so racking
+         * re-armed once the drive retreats below half the path, so racking
          * repeatedly emits once per full stroke while end-zone jitter cannot
          * spam. Sessions that START inside the end zone latch silently
          * (grabbing an already-out part is not a stroke), and the return
@@ -99,7 +99,7 @@ namespace paper_toolkit
         {
             std::uint32_t bodyId{ 0x7FFF'FFFFu };
             std::array<char, kMaxSourceName> sourceName{};
-            // Diagnostics for tuning: where the scrub was, where the delta
+            // Diagnostics for tuning: where the path projection was, where the delta
             // curve put the extreme, and how tall the curve is.
             float arcPosition{ 0.0f };
             float extremeArcPosition{ 0.0f };
@@ -151,7 +151,7 @@ namespace paper_toolkit
             std::uint64_t weaponGenerationKey{ 0 };
             // INI-selected path source. Pinned into each session at grip
             // start so a hot-reload mode switch never swaps the path under a
-            // hand mid-scrub; it applies to the next grip.
+            // hand mid-drive; it applies to the next grip.
             MotionPathMode motionPathMode{ MotionPathMode::AuthoredOnly };
             /*
              * Stage handoff at the physical travel extremes (delta-curve
@@ -162,23 +162,13 @@ namespace paper_toolkit
             bool stageTransitionsEnabled{ true };
             /*
              * Max/min trigger zone as a FRACTION of the part's full travel
-             * (the delta-curve height): the scrub counts as at-max / at-rest
+             * (the delta-curve height): the drive counts as at-max / at-rest
              * when its displacement from rest is within this fraction of the
              * extreme. Percentage-based so a short pistol slide and a long
              * bolt pull trigger identically (absolute arc units did not
              * scale — Bruno, 2026-07-05).
              */
             float travelExtremeToleranceFraction{ 0.10f };
-            /*
-             * Clip-scrub session feed (mode == ClipScrub): the harvest
-             * module's captured-and-frozen reload clip, when one is live.
-             * `clipScrubFraction` is the ENGINE-observed time fraction —
-             * the pursuit controller's feedback signal. No session means
-             * scrub grips glue but cannot drive (hint logged once per grip).
-             */
-            bool clipScrubSessionActive{ false };
-            std::uint64_t clipScrubSessionId{ 0 };
-            float clipScrubFraction{ 0.0f };
             // Per-part attach-only whitelist for the current weapon
             // generation; targets reinstall only when this set changes.
             std::uint32_t eligiblePartCount{ 0 };
@@ -193,17 +183,12 @@ namespace paper_toolkit
         // Returns the number of drives sent this update, written to
         // outSentDrives (capacity kMaxSentDrives). Max-travel events land in
         // outMaxTravelEvents (capacity kMaxMaxTravelEvents) when provided.
-        // In ClipScrub mode a gripped session emits a desired clip-time
-        // fraction instead of drives: written to outClipScrubFraction with
-        // outClipScrubFractionValid set (one hand owns time per frame).
         std::uint32_t update(
             const FrameInput& input,
             const WeaponPartMotionLearner& learner,
             SentDrive* outSentDrives,
             MaxTravelEvent* outMaxTravelEvents = nullptr,
-            std::uint32_t* outMaxTravelEventCount = nullptr,
-            float* outClipScrubFraction = nullptr,
-            bool* outClipScrubFractionValid = nullptr);
+            std::uint32_t* outMaxTravelEventCount = nullptr);
         void shutdown();
 
         [[nodiscard]] std::uint64_t ownerToken() const { return _ownerToken; }
@@ -236,7 +221,7 @@ namespace paper_toolkit
             std::uint32_t omodFormId{ 0 };
             // Path source pinned at grip start (see FrameInput).
             MotionPathMode mode{ MotionPathMode::AuthoredOnly };
-            // Which learned stage the session is scrubbing; flips at the
+            // Which learned stage the session is driving; flips at the
             // stage ends when a chained return stage exists.
             bool onReturnStage{ false };
             // Max-travel event latch (see MaxTravelEvent): true while inside
@@ -258,28 +243,6 @@ namespace paper_toolkit
              */
             std::uint32_t followerCount{ 0 };
             std::array<weapon_clip_stroke::AuthoredFollower, weapon_clip_stroke::kMaxFollowers> followers{};
-            /*
-             * Clip-scrub session (mode == ClipScrub): the hand drives the
-             * captured clip's TIME through a pursuit controller — no path
-             * lookup, no drives. The controller learns the part's local
-             * motion direction from what the engine-posed part actually did
-             * per unit fraction (the engine is the curve oracle), then
-             * steers the fraction so the part chases the hand's displaced
-             * target. Degenerate stretches (part not responding — stage
-             * dwells, bootstrap) fall back to a slow forward crawl gated on
-             * real hand pull, which carries the session across windows
-             * where the gripped part is authored to rest.
-             */
-            bool clipScrub{ false };
-            std::uint64_t clipScrubSessionId{ 0 };
-            weapon_part_motion_path::Vec3 scrubPartStartTranslate{};
-            weapon_part_motion_path::Vec3 scrubPrevPartTranslate{};
-            float scrubPrevFraction{ 0.0f };
-            bool scrubDirectionValid{ false };
-            weapon_part_motion_path::Vec3 scrubDirection{};
-            // Game units of part travel per unit fraction (local slope).
-            float scrubSlope{ 0.0f };
-            std::uint32_t scrubLastLogDecile{ 0 };
         };
 
         bool ensureRegistered();
