@@ -161,9 +161,13 @@ int main()
         ok &= expectFalse("truncated explicit hka map fails as a unit",
             buildTrackToBoneMap(
                 4, 4, explicitMap, {}, {}, mapping));
-        ok &= expectFalse("partial mapless animation cannot assume identity",
+        ok &= expectTrue("mapless animation uses Havok identity over its track prefix",
             buildTrackToBoneMap(
-                3, 4, {}, {}, {}, mapping));
+                3, 4, {}, {}, {}, mapping) &&
+                mapping[0] == 0 && mapping[1] == 1 && mapping[2] == 2);
+        ok &= expectFalse("mapless animation cannot exceed the skeleton",
+            buildTrackToBoneMap(
+                4, 3, {}, {}, {}, mapping));
 
         const std::array<std::int16_t, 6> parents{ -1, 0, 1, 2, 1, 4 };
         std::array<std::int16_t, 6> chain{};

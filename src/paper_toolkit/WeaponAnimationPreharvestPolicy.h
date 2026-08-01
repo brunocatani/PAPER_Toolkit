@@ -117,8 +117,10 @@ namespace paper_toolkit::weapon_animation_preharvest_policy
     /*
      * Resolve hkaAnimationBinding's three legal mapping forms into one
      * track->bone table: explicit shorts, selected skeleton partitions, or
-     * identity when both arrays are empty. Any truncated/out-of-range layout
-     * fails as a unit; partial maps must never silently drive the wrong bone.
+     * identity when both arrays are empty. Havok's empty-map identity covers
+     * the animation's track prefix; it does not require the clip to animate
+     * every bone in the graph skeleton. Any truncated/out-of-range explicit
+     * layout still fails as a unit so malformed maps never drive another bone.
      */
     [[nodiscard]] constexpr bool buildTrackToBoneMap(
         const std::uint32_t transformTrackCount,
@@ -171,10 +173,13 @@ namespace paper_toolkit::weapon_animation_preharvest_policy
             return track == transformTrackCount;
         }
 
-        // With no explicit/partition map, identity is only valid when the
-        // animation covers the complete skeleton. A prefix-sized animation
-        // does not prove track N belongs to bone N.
-        if (transformTrackCount != skeletonBoneCount) {
+        // Empty hkaAnimationBinding maps are identity by contract. Weapon
+        // clips commonly animate a 94-track prefix of the 135-bone first-
+        // person graph skeleton, so equality here rejects the exact clips
+        // while ROCK's established native preharvest samples them correctly.
+        // The initial bounds gate still rejects a prefix that exceeds the
+        // skeleton and therefore cannot be an identity mapping.
+        if (transformTrackCount > skeletonBoneCount) {
             return false;
         }
         for (std::uint32_t track = 0; track < transformTrackCount; ++track) {
