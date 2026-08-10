@@ -9,7 +9,7 @@ $telemetry = Get-Content -Raw -LiteralPath $telemetryPath
 $authoring = Get-Content -Raw -LiteralPath $authoringPath
 
 if ($bootstrap -notmatch 'REL::Module::IsVR\(\)') {
-    throw 'Bootstrap must reject non-VR modules with REL::Module::IsVR().' 
+    throw 'Bootstrap must reject non-VR modules with REL::Module::IsVR().'
 }
 if ($bootstrap -notmatch 'const\s+auto\s+executableVersion\s*=\s*REL::Module::get\(\)\.version\(\)') {
     throw 'Bootstrap must read the executable version from REL::Module.'
