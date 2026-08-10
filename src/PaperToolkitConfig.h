@@ -134,6 +134,25 @@ namespace paper_toolkit
          */
         bool fullSubtreeObservation = true;
         /*
+         * Standalone Prisma authoring workstation. These controls intentionally
+         * live in this Toolkit INI rather than ROCK Reload Prober's config: the
+         * two applications have independent ownership and lifecycles.
+         */
+        bool authoringPanelEnabled = true;
+        float authoringPanelScale = 3.0f;
+        float authoringPanelPositionX = 7.75f;
+        float authoringPanelPositionY = -29.0f;
+        float authoringPanelPositionZ = -16.5f;
+        float authoringPanelRotationXDegrees = 0.0f;
+        float authoringPanelRotationYDegrees = 90.0f;
+        float authoringPanelRotationZDegrees = 6.0f;
+        bool authoringPanelFlipRotationX = true;
+        bool authoringPanelFlipRotationY = true;
+        bool authoringPanelFlipRotationZ = false;
+        // Moves whenever panel geometry or enablement changes. The authoring
+        // runtime clears pointer/preview leases before adopting a new pose.
+        std::uint64_t authoringPanelRevision = 1;
+        /*
          * Bumped whenever a value that changes the eligible-part set changed
          * (mode or allowlist); the runtime recomputes per-part targets when
          * this moves. Starts at 1 so a zero-initialized consumer always

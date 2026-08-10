@@ -16,6 +16,7 @@ namespace paper_toolkit
     namespace
     {
         constexpr const char* kSection = "PAPER_Toolkit";
+        constexpr const char* kAuthoringPanelSection = "AuthoringPanel";
         // Editors fire several change events per save; the reload applies
         // once this long after the last event (frame-thread wait, no sleeps).
         constexpr std::int64_t kReloadDebounceMs = 200;
@@ -149,7 +150,27 @@ namespace paper_toolkit
             "bAttachOnlyGrip = false\n"
             "bAttachOnlySight = false\n"
             "bAttachOnlyAccessory = false\n"
-            "bAttachOnlyOther = false\n";
+            "bAttachOnlyOther = false\n"
+            "\n"
+            "[AuthoringPanel]\n"
+            "; Standalone PAPER Toolkit animation workstation. It reads PAPER's exact\n"
+            "; equipped-weapon clip catalog and previews selected WeaponRootLocal samples\n"
+            "; through ROCK part drives. Scrubbing never seeks or activates the native\n"
+            "; animation graph and cannot advance PAPER reload stages.\n"
+            "bEnabled = true\n"
+            "; Raster resolution is fixed; this scales only physical world size.\n"
+            "fPanelScale = 3.0\n"
+            "; Right-hand-local placement in game units. Negative Y keeps this separate\n"
+            "; from the existing Reload Prober's default panel position.\n"
+            "fPositionX = 7.75\n"
+            "fPositionY = -29.0\n"
+            "fPositionZ = -16.5\n"
+            "fRotationXDegrees = 0.0\n"
+            "fRotationYDegrees = 90.0\n"
+            "fRotationZDegrees = 6.0\n"
+            "bFlipRotationX = true\n"
+            "bFlipRotationY = true\n"
+            "bFlipRotationZ = false\n";
 
         std::string resolveIniPath()
         {
@@ -242,6 +263,21 @@ namespace paper_toolkit
         const bool previousLibraryReadOnly = motionLibraryReadOnly;
         const bool previousRichCapture = richMotionCapture;
         const bool previousFullSubtree = fullSubtreeObservation;
+        const bool previousAuthoringPanelEnabled = authoringPanelEnabled;
+        const std::array previousAuthoringPanelPose{
+            authoringPanelScale,
+            authoringPanelPositionX,
+            authoringPanelPositionY,
+            authoringPanelPositionZ,
+            authoringPanelRotationXDegrees,
+            authoringPanelRotationYDegrees,
+            authoringPanelRotationZDegrees,
+        };
+        const std::array previousAuthoringPanelFlips{
+            authoringPanelFlipRotationX,
+            authoringPanelFlipRotationY,
+            authoringPanelFlipRotationZ,
+        };
 
         const bool previousRequireTriggerUnlock = requireTriggerUnlock;
         enabled = ini.GetBoolValue(kSection, "bEnabled", enabled);
@@ -291,6 +327,60 @@ namespace paper_toolkit
         motionLibraryReadOnly = ini.GetBoolValue(kSection, "bMotionLibraryReadOnly", motionLibraryReadOnly);
         richMotionCapture = ini.GetBoolValue(kSection, "bRichMotionCapture", richMotionCapture);
         fullSubtreeObservation = ini.GetBoolValue(kSection, "bFullSubtreeObservation", fullSubtreeObservation);
+
+        const auto readPanelFloat = [&](const char* key, float current, float minValue, float maxValue) {
+            const auto value = static_cast<float>(
+                ini.GetDoubleValue(kAuthoringPanelSection, key, current));
+            if (!std::isfinite(value)) {
+                PAPER_TOOLKIT_LOG_WARN(Config,
+                    "Invalid [AuthoringPanel] {}={} — keeping {:.2f}",
+                    key,
+                    value,
+                    current);
+                return current;
+            }
+            return std::clamp(value, minValue, maxValue);
+        };
+        authoringPanelEnabled = ini.GetBoolValue(
+            kAuthoringPanelSection, "bEnabled", authoringPanelEnabled);
+        authoringPanelScale = readPanelFloat("fPanelScale", authoringPanelScale, 0.25f, 8.0f);
+        authoringPanelPositionX = readPanelFloat("fPositionX", authoringPanelPositionX, -250.0f, 250.0f);
+        authoringPanelPositionY = readPanelFloat("fPositionY", authoringPanelPositionY, -250.0f, 250.0f);
+        authoringPanelPositionZ = readPanelFloat("fPositionZ", authoringPanelPositionZ, -250.0f, 250.0f);
+        authoringPanelRotationXDegrees = readPanelFloat(
+            "fRotationXDegrees", authoringPanelRotationXDegrees, -360.0f, 360.0f);
+        authoringPanelRotationYDegrees = readPanelFloat(
+            "fRotationYDegrees", authoringPanelRotationYDegrees, -360.0f, 360.0f);
+        authoringPanelRotationZDegrees = readPanelFloat(
+            "fRotationZDegrees", authoringPanelRotationZDegrees, -360.0f, 360.0f);
+        authoringPanelFlipRotationX = ini.GetBoolValue(
+            kAuthoringPanelSection, "bFlipRotationX", authoringPanelFlipRotationX);
+        authoringPanelFlipRotationY = ini.GetBoolValue(
+            kAuthoringPanelSection, "bFlipRotationY", authoringPanelFlipRotationY);
+        authoringPanelFlipRotationZ = ini.GetBoolValue(
+            kAuthoringPanelSection, "bFlipRotationZ", authoringPanelFlipRotationZ);
+
+        const std::array currentAuthoringPanelPose{
+            authoringPanelScale,
+            authoringPanelPositionX,
+            authoringPanelPositionY,
+            authoringPanelPositionZ,
+            authoringPanelRotationXDegrees,
+            authoringPanelRotationYDegrees,
+            authoringPanelRotationZDegrees,
+        };
+        const std::array currentAuthoringPanelFlips{
+            authoringPanelFlipRotationX,
+            authoringPanelFlipRotationY,
+            authoringPanelFlipRotationZ,
+        };
+        const bool authoringPanelChanged =
+            authoringPanelEnabled != previousAuthoringPanelEnabled ||
+            currentAuthoringPanelPose != previousAuthoringPanelPose ||
+            currentAuthoringPanelFlips != previousAuthoringPanelFlips;
+        if (authoringPanelChanged) {
+            ++authoringPanelRevision;
+        }
 
         // AttachOnly allowlist booleans, composed into the class masks.
         for (std::size_t i = 0; i < std::size(kAttachOnlyPartKeys); ++i) {
@@ -365,6 +455,19 @@ namespace paper_toolkit
                     previousFullSubtree,
                     fullSubtreeObservation);
             }
+            if (authoringPanelChanged) {
+                PAPER_TOOLKIT_LOG_INFO(Config,
+                    "Authoring panel: enabled={} scale={:.2f} position=({:.2f}, {:.2f}, {:.2f}) rotation=({:.1f}, {:.1f}, {:.1f}) revision={}",
+                    authoringPanelEnabled,
+                    authoringPanelScale,
+                    authoringPanelPositionX,
+                    authoringPanelPositionY,
+                    authoringPanelPositionZ,
+                    authoringPanelRotationXDegrees,
+                    authoringPanelRotationYDegrees,
+                    authoringPanelRotationZDegrees,
+                    authoringPanelRevision);
+            }
             const bool groupingChanged = coTimedFollowers != previousCoTimed || coTimedMinOverlap != previousCoTimedOverlap ||
                 coTimedMaxArcRatio != previousCoTimedRatio || stageTransitions != previousStageTransitions ||
                 travelExtremeTolerance != previousExtremeTolerance || stageChainToleranceGameUnits != previousChainTolerance;
@@ -394,7 +497,8 @@ namespace paper_toolkit
                 requireTriggerUnlock == previousRequireTriggerUnlock && !allowListChangedKeys && !groupingChanged &&
                 shellEjectOnMaxTravel == previousShellEject && !telemetryFilterChanged && resetMotionData == previousResetMotionData &&
                 motionLibrary == previousMotionLibrary && motionLibraryReadOnly == previousLibraryReadOnly &&
-                richMotionCapture == previousRichCapture && fullSubtreeObservation == previousFullSubtree) {
+                richMotionCapture == previousRichCapture && fullSubtreeObservation == previousFullSubtree &&
+                !authoringPanelChanged) {
                 PAPER_TOOLKIT_LOG_INFO(Config, "Reload applied, no value changes (enabled={} mode={} logLevel={})",
                     enabled,
                     motionPathModeName(motionPathMode),

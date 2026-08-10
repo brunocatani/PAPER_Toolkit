@@ -5,6 +5,7 @@
 #include "PaperToolkitConfig.h"
 #include "PaperToolkitLog.h"
 #include "api/ROCKProviderApi.h"
+#include "paper_toolkit/AuthoringRuntime.h"
 #include "paper_toolkit/PaperToolkitRuntime.h"
 
 namespace
@@ -21,10 +22,12 @@ namespace
      * gated against the snapshot ROCK hands us.
      */
     PaperToolkitRuntime s_runtime{};
+    AuthoringRuntime s_authoring{};
     std::uint64_t s_ownerToken = 0;
     std::uint64_t s_frameCallbackToken = 0;
     bool s_rockReady = false;
     bool s_runtimeWasEnabled = false;
+    bool s_authoringStarted = false;
 
     void ROCK_PROVIDER_CALL onRockFrame(const rock::provider::RockProviderFrameSnapshot* snapshot, void*)
     {
@@ -37,6 +40,8 @@ namespace
         const bool configReloaded = g_paperToolkitConfig.processPendingReload();
         if (!g_paperToolkitConfig.enabled) {
             if (s_runtimeWasEnabled) {
+                s_authoring.shutdown();
+                s_authoringStarted = false;
                 s_runtime.shutdown();
                 s_runtimeWasEnabled = false;
                 logger::info("PAPER_Toolkit: disabled by config; runtime shut down.");
@@ -44,12 +49,17 @@ namespace
             return;
         }
         s_runtimeWasEnabled = true;
+        if (!s_authoringStarted) {
+            s_authoring.onGameLoaded();
+            s_authoringStarted = true;
+        }
         // Re-record mode: while the key stays true, every INI save wipes the
         // compact authored/learned serving data (game starts begin empty).
         if (configReloaded && g_paperToolkitConfig.resetMotionData) {
             s_runtime.wipeMotionData();
         }
         s_runtime.onFrame(*snapshot);
+        s_authoring.onFrame(*snapshot);
     }
 
     bool initializeRockApi()
@@ -184,6 +194,8 @@ namespace
                 }
             }
             logger::info("PAPER_Toolkit: initialization complete (frame callback token={}). Waiting for ROCK frames...", s_frameCallbackToken);
+            s_authoring.onGameLoaded();
+            s_authoringStarted = true;
         }
 
         if (msg->type == F4SE::MessagingInterface::kPostLoadGame || msg->type == F4SE::MessagingInterface::kNewGame) {
@@ -192,7 +204,9 @@ namespace
             // PhysicsInteraction reset, which reset this whole stack).
             logger::info("PAPER_Toolkit: new game session -- resetting runtime state...");
             s_runtime.shutdown();
+            s_authoring.shutdown();
             s_runtimeWasEnabled = false;
+            s_authoringStarted = false;
             if (s_rockReady) {
                 g_paperToolkitConfig.load();
             }
@@ -226,14 +240,20 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Query(const F4SE::QueryInterface* a
         return false;
     }
 
-    const auto requiredRuntime = F4SE::RUNTIME_LATEST_VR;
-
-    if (a_f4se->RuntimeVersion() < requiredRuntime) {
-        logger::critical("PAPER_Toolkit: Unsupported runtime version {} (need >= {}).", a_f4se->RuntimeVersion().string(), requiredRuntime.string());
+    const auto executableVersion = REL::Module::get().version();
+    if (executableVersion != F4SE::RUNTIME_VR_1_2_72) {
+        logger::critical(
+            "PAPER_Toolkit: Unsupported Fallout4VR.exe version {} (required {}).",
+            executableVersion.string(),
+            F4SE::RUNTIME_VR_1_2_72.string());
         return false;
     }
 
-    logger::info("PAPER_Toolkit: F4SE v{} query passed. Plugin compatible.", a_f4se->F4SEVersion().string());
+    logger::info(
+        "PAPER_Toolkit: FO4VR executable {} verified; F4SE query compatibility runtime {} and F4SE {}.",
+        executableVersion.string(),
+        a_f4se->RuntimeVersion().string(),
+        a_f4se->F4SEVersion().string());
     return true;
 }
 

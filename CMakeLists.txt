@@ -57,6 +57,15 @@ if(NOT EXISTS "${COMMON_LIB_F4VR_PATH_SELECTED}/CommonLibF4/include/REL/Relocati
 endif()
 set(COMMON_LIB_F4VR_PATH "${COMMON_LIB_F4VR_PATH_SELECTED}" CACHE PATH "" FORCE)
 
+set(PAPER_SDK_INCLUDE "${WORKSPACE_ROOT}/main_projects/PAPER/SDK/PAPER/include")
+set(PRISMA_F4VR_INCLUDE "${WORKSPACE_ROOT}/secondary_projects/Ported_mods/Prisma2.0/src")
+if(NOT EXISTS "${PAPER_SDK_INCLUDE}/PAPERApi.h")
+  message(FATAL_ERROR ">> PAPER public SDK not found at '${PAPER_SDK_INCLUDE}'.")
+endif()
+if(NOT EXISTS "${PRISMA_F4VR_INCLUDE}/PrismaUI_F4VR_API.h")
+  message(FATAL_ERROR ">> Prisma FO4VR SDK not found at '${PRISMA_F4VR_INCLUDE}'.")
+endif()
+
 project(${NAME} VERSION ${VERSION} LANGUAGES CXX)
 message(">>> Building project '${PROJECT_NAME}' v:${PROJECT_VERSION}")
 message(">>> Using found F4VR-CommonFramework in: '${F4VR_COMMON_FRAMEWORK_PATH_SELECTED}'")
@@ -94,6 +103,8 @@ target_include_directories(${PROJECT_NAME}
   PRIVATE
     ${BUILD_DIR}/include
     ${SOURCE_DIR}
+    ${PAPER_SDK_INCLUDE}
+    ${PRISMA_F4VR_INCLUDE}
 )
 
 target_link_libraries(${PROJECT_NAME}
@@ -108,6 +119,15 @@ find_package(nlohmann_json CONFIG REQUIRED)
 target_link_libraries(${PROJECT_NAME} PRIVATE cpptrace::cpptrace nlohmann_json::nlohmann_json)
 
 target_precompile_headers(${PROJECT_NAME} PRIVATE src/PCH.h)
+
+find_program(PWSH_EXECUTABLE NAMES pwsh REQUIRED)
+add_custom_target(PAPER_ToolkitBootstrapSourceGate ALL
+  COMMAND "${PWSH_EXECUTABLE}" -NoLogo -NoProfile -File
+    "${ROOT_DIR}/tests/BootstrapSourceGate.ps1"
+  COMMENT "Validating FO4VR bootstrap and native telemetry identity gates"
+  VERBATIM
+)
+add_dependencies(${PROJECT_NAME} PAPER_ToolkitBootstrapSourceGate)
 
 target_compile_options(${PROJECT_NAME}
   PRIVATE
@@ -174,6 +194,10 @@ if(POST_BUILD_COPY_PLUGIN)
         COMMAND ${CMAKE_COMMAND} -E make_directory "${copy_path}/F4SE/Plugins/"
         COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:${PROJECT_NAME}> "${copy_path}/F4SE/Plugins/"
         COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_PDB_FILE:${PROJECT_NAME}> "${copy_path}/F4SE/Plugins/"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${copy_path}/PrismaUI_F4/views/PAPER-Toolkit-Authoring/"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+          "${ROOT_DIR}/view/"
+          "${copy_path}/PrismaUI_F4/views/PAPER-Toolkit-Authoring/"
       )
     endforeach()
   else()
@@ -205,7 +229,21 @@ if(BUILD_PAPER_TOOLKIT_TESTS)
   add_test(NAME PAPER_ToolkitWeaponPartMotionPolicyTests COMMAND $<TARGET_FILE:PAPER_ToolkitWeaponPartMotionPolicyTests>)
   set_tests_properties(PAPER_ToolkitWeaponPartMotionPolicyTests PROPERTIES LABELS "policy")
 
-  find_program(PWSH_EXECUTABLE NAMES pwsh REQUIRED)
+  add_executable(PAPER_ToolkitAuthoringPolicyTests
+    "${ROOT_DIR}/tests/AuthoringPolicyTests.cpp"
+  )
+  target_compile_features(PAPER_ToolkitAuthoringPolicyTests PRIVATE cxx_std_23)
+  target_include_directories(PAPER_ToolkitAuthoringPolicyTests PRIVATE ${SOURCE_DIR})
+  add_test(NAME PAPER_ToolkitAuthoringPolicyTests COMMAND $<TARGET_FILE:PAPER_ToolkitAuthoringPolicyTests>)
+  set_tests_properties(PAPER_ToolkitAuthoringPolicyTests PROPERTIES LABELS "policy;authoring")
+
+  add_test(
+    NAME PAPER_ToolkitBootstrapSourceGate
+    COMMAND "${PWSH_EXECUTABLE}" -NoLogo -NoProfile -File
+      "${ROOT_DIR}/tests/BootstrapSourceGate.ps1"
+  )
+  set_tests_properties(PAPER_ToolkitBootstrapSourceGate PROPERTIES LABELS "policy;source")
+
   add_test(
     NAME PAPER_ToolkitAuthoredAnimationPreharvestSourceTests
     COMMAND "${PWSH_EXECUTABLE}" -NoLogo -NoProfile -File

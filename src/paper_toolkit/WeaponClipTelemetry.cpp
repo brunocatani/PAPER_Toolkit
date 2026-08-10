@@ -154,6 +154,9 @@ namespace paper_toolkit::weapon_clip_telemetry
          * the equip-time walk masked it.
          */
         constexpr std::uintptr_t kClipGeneratorVtableModuleOffset = 0x2E0FB38;
+        constexpr std::uintptr_t kClipGeneratorActivateModuleOffset = 0x192CA40;
+        constexpr std::uintptr_t kClipGeneratorUpdateModuleOffset = 0x192D0D0;
+        constexpr std::uintptr_t kClipGeneratorDeactivateModuleOffset = 0x192D510;
         constexpr std::uintptr_t kClipGeneratorActivateSlotOffset = 0x38;
         constexpr std::uintptr_t kClipGeneratorUpdateSlotOffset = 0x40;
         constexpr std::uintptr_t kClipGeneratorDeactivateSlotOffset = 0x50;
@@ -1816,21 +1819,35 @@ namespace paper_toolkit::weapon_clip_telemetry
         if (s_installed) {
             return;
         }
-        s_installed = true;
-        const auto vtableBase = REL::Module::get().base() + kClipGeneratorVtableModuleOffset;
+        const auto moduleBase = REL::Module::get().base();
+        const auto vtableBase = moduleBase + kClipGeneratorVtableModuleOffset;
         // 8-byte aligned pointer stores are atomic on x64, so concurrent
         // graph updates dispatching through the slots stay safe during the
         // swaps. Activate copies evidence, update publishes read-only timing,
         // and deactivate clears the matching activity slot.
         const auto activateSlot = vtableBase + kClipGeneratorActivateSlotOffset;
+        const auto updateSlot = vtableBase + kClipGeneratorUpdateSlotOffset;
+        const auto deactivateSlot = vtableBase + kClipGeneratorDeactivateSlotOffset;
+        const auto liveActivate = *reinterpret_cast<const std::uintptr_t*>(activateSlot);
+        const auto liveUpdate = *reinterpret_cast<const std::uintptr_t*>(updateSlot);
+        const auto liveDeactivate = *reinterpret_cast<const std::uintptr_t*>(deactivateSlot);
+        if (liveActivate != moduleBase + kClipGeneratorActivateModuleOffset ||
+            liveUpdate != moduleBase + kClipGeneratorUpdateModuleOffset ||
+            liveDeactivate != moduleBase + kClipGeneratorDeactivateModuleOffset) {
+            PAPER_TOOLKIT_LOG_ERROR(Weapon,
+                "WeaponClipTelemetry: live FO4VR clip vtable identity mismatch; hooks remain disabled (activate +{:#x}, update +{:#x}, deactivate +{:#x})",
+                moduleRelative(liveActivate),
+                moduleRelative(liveUpdate),
+                moduleRelative(liveDeactivate));
+            return;
+        }
+        s_installed = true;
         s_originalClipActivate =
             reinterpret_cast<ClipGeneratorActivateFn>(*reinterpret_cast<std::uintptr_t*>(activateSlot));
         REL::safe_write(activateSlot, reinterpret_cast<std::uintptr_t>(&clipGeneratorActivateShim));
-        const auto updateSlot = vtableBase + kClipGeneratorUpdateSlotOffset;
         s_originalClipUpdate =
             reinterpret_cast<ClipGeneratorUpdateFn>(*reinterpret_cast<std::uintptr_t*>(updateSlot));
         REL::safe_write(updateSlot, reinterpret_cast<std::uintptr_t>(&clipGeneratorUpdateShim));
-        const auto deactivateSlot = vtableBase + kClipGeneratorDeactivateSlotOffset;
         s_originalClipDeactivate =
             reinterpret_cast<ClipGeneratorDeactivateFn>(*reinterpret_cast<std::uintptr_t*>(deactivateSlot));
         REL::safe_write(deactivateSlot, reinterpret_cast<std::uintptr_t>(&clipGeneratorDeactivateShim));

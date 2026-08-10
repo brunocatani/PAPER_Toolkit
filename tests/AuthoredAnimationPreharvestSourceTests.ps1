@@ -91,8 +91,8 @@ Assert-Excludes 'telemetry contains no clip-time drive lifecycle' $telemetry 'Cl
 Assert-Excludes 'production contains no removed clip-time control surface' $productionSource 'ClipScrub|clipScrub|kClipGeneratorModeOffset|UserFraction|setClipScrub|endClipScrub|bClipScrubSweep'
 
 Assert-Contains 'config documents two serving sources' $config 'valid:\s*authored, learned'
-Assert-Excludes 'config contains no removed mode' $config 'hybrid|scrub'
-Assert-Excludes 'default INI contains no removed mode' $defaultIni 'hybrid|scrub'
+Assert-Excludes 'config contains no removed motion mode' $config 'MotionPathMode::(?:Hybrid|ClipScrub)'
+Assert-Excludes 'default INI contains no removed serving mode' $defaultIni 'sMotionPathMode\s*=\s*(?:hybrid|scrub)'
 Assert-Contains 'default INI selects exact authored serving' $defaultIni 'sMotionPathMode\s*=\s*authored'
 Assert-Contains 'default INI retains passive clip diagnostics' $defaultIni 'sClipTelemetryFilter\s*=\s*Reload'
 Assert-Contains 'compact serving library stays at V1' $libraryFormat 'kFormatVersion\s*=\s*1'

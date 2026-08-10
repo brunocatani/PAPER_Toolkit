@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PAPER Toolkit Animation Workstation</title>
+  <style>
+    :root{--ink:#e9e3d6;--muted:#8d928e;--void:#080a0b;--panel:#111517;--panel2:#181d20;--line:#30383b;--amber:#f1ad3d;--cyan:#55d6d0;--bad:#ef765f;--good:#86c98a;--grid:rgba(85,214,208,.07)}
+    *{box-sizing:border-box}html,body{width:100%;height:100%;margin:0;overflow:hidden;background:var(--void);color:var(--ink);font-family:"Bahnschrift SemiCondensed","Arial Narrow",sans-serif}
+    body:before{content:"";position:fixed;inset:0;pointer-events:none;background:linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px);background-size:32px 32px;opacity:.55}
+    button,input{font:inherit}.app{height:100%;display:grid;grid-template-rows:88px 1fr 44px;position:relative}
+    header{display:grid;grid-template-columns:1.25fr 1fr auto;align-items:center;border-bottom:1px solid var(--line);padding:14px 22px;background:rgba(13,16,18,.96)}
+    .brand{display:flex;align-items:center;gap:14px}.mark{width:42px;height:42px;border:1px solid var(--amber);display:grid;place-items:center;color:var(--amber);font-weight:800;letter-spacing:-2px;box-shadow:inset 0 0 0 4px #15110a}
+    h1{font-size:22px;line-height:1;margin:0;letter-spacing:.12em;text-transform:uppercase}.kicker,.label{font:11px "Cascadia Mono",Consolas,monospace;color:var(--muted);letter-spacing:.12em;text-transform:uppercase}.live{border-left:1px solid var(--line);padding-left:22px;min-width:0}.live-name{font:16px "Cascadia Mono",Consolas,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:6px}.pulse{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--muted);margin-right:7px}.pulse.on{background:var(--good);box-shadow:0 0 12px var(--good)}
+    .links{display:flex;gap:7px}.link{font:10px "Cascadia Mono",Consolas,monospace;padding:7px 9px;border:1px solid var(--line);color:var(--muted)}.link.on{border-color:var(--cyan);color:var(--cyan)}
+    main{display:grid;grid-template-columns:390px minmax(520px,1fr) 420px;min-height:0}.column{min-width:0;min-height:0;border-right:1px solid var(--line);background:rgba(15,18,20,.91)}.column:last-child{border-right:0}.section-head{height:51px;display:flex;align-items:center;justify-content:space-between;padding:0 15px;border-bottom:1px solid var(--line);background:#111517}.section-title{font-size:13px;letter-spacing:.11em;text-transform:uppercase;font-weight:700}.counter{font:11px "Cascadia Mono",Consolas,monospace;color:var(--amber)}
+    .filter{height:48px;padding:8px 12px;border-bottom:1px solid var(--line)}.filter input{width:100%;height:31px;border:1px solid var(--line);background:#090c0d;color:var(--ink);padding:0 10px;outline:none}.filter input:focus{border-color:var(--cyan)}
+    .clip-list{height:calc(100% - 99px);overflow:auto}.clip{width:100%;text-align:left;border:0;border-bottom:1px solid #252b2d;background:transparent;color:var(--ink);padding:12px 14px;cursor:pointer}.clip:hover{background:#1a2022}.clip.selected{background:#211b12;border-left:4px solid var(--amber);padding-left:10px}.clip-top{display:flex;justify-content:space-between;gap:10px}.clip-name{font:13px "Cascadia Mono",Consolas,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.duration{color:var(--cyan);font:11px "Cascadia Mono",Consolas,monospace}.path{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin:6px 0}.chips{display:flex;gap:5px}.chip{font:9px "Cascadia Mono",Consolas,monospace;padding:2px 5px;border:1px solid var(--line);color:var(--muted);text-transform:uppercase}.chip.exact{border-color:#6d5935;color:var(--amber)}.chip.active{border-color:#386b68;color:var(--cyan)}
+    .center{display:grid;grid-template-rows:51px 140px 1fr;min-height:0}.selected-summary{padding:18px 20px;border-bottom:1px solid var(--line);display:grid;grid-template-columns:1fr auto;gap:12px;background:linear-gradient(110deg,#151a1c,#101315)}.selected-name{font:20px "Cascadia Mono",Consolas,monospace;margin-top:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.selected-path{font-size:11px;color:var(--muted);margin-top:8px}.preview-button{width:138px;border:1px solid var(--cyan);background:#0c1919;color:var(--cyan);text-transform:uppercase;letter-spacing:.08em;cursor:pointer}.preview-button.on{background:var(--cyan);color:#071010}.preview-button:disabled{opacity:.35;cursor:default}
+    .timeline{padding:18px 20px;min-height:0;overflow:auto}.transport{display:grid;grid-template-columns:46px 74px 1fr auto;gap:9px;align-items:center}.play,.refresh{height:34px;border:1px solid var(--line);background:#171c1e;color:var(--ink);cursor:pointer}.time{font:12px "Cascadia Mono",Consolas,monospace;color:var(--amber)}input[type=range]{accent-color:var(--amber);width:100%}
+    .ruler{height:38px;position:relative;border:1px solid var(--line);margin:14px 0 8px;background:repeating-linear-gradient(90deg,transparent 0,transparent calc(10% - 1px),#343b3e calc(10% - 1px),#343b3e 10%)}.cursor{position:absolute;top:-4px;bottom:-4px;width:2px;background:var(--amber);box-shadow:0 0 8px var(--amber)}.marker-lane{min-height:72px;border:1px solid var(--line);position:relative;background:#0b0e0f;margin-bottom:10px}.lane-label{position:absolute;left:8px;top:7px;z-index:2}.marker{position:absolute;top:31px;width:8px;height:27px;transform:translateX(-4px);background:var(--cyan);cursor:help}.marker.trigger{top:34px;height:21px;background:var(--amber);transform:translateX(-4px) rotate(45deg)}
+    .notice{border-left:3px solid var(--cyan);background:#101d1d;padding:11px 12px;font:11px "Cascadia Mono",Consolas,monospace;color:#b8c6c4;line-height:1.5}.notice strong{color:var(--cyan)}
+    .parts{height:calc(100% - 51px);overflow:auto}.part{display:grid;grid-template-columns:24px 1fr auto;gap:9px;align-items:start;padding:11px 13px;border-bottom:1px solid #252b2d}.part input{margin-top:3px}.part-name{font:12px "Cascadia Mono",Consolas,monospace}.part-meta{font-size:10px;color:var(--muted);margin-top:5px;line-height:1.4}.mapping{font:9px "Cascadia Mono",Consolas,monospace;text-transform:uppercase;padding:3px 5px;border:1px solid var(--line)}.mapping.mapped{color:var(--good);border-color:#466d49}.mapping.ambiguous,.mapping.missing{color:var(--bad);border-color:#754236}
+    footer{display:flex;align-items:center;justify-content:space-between;padding:0 16px;border-top:1px solid var(--line);background:#0c0f10;font:10px "Cascadia Mono",Consolas,monospace;color:var(--muted)}.status{color:var(--ink)}.empty{padding:30px 18px;color:var(--muted);font:12px "Cascadia Mono",Consolas,monospace;line-height:1.7}.warn{color:var(--bad)}
+    ::-webkit-scrollbar{width:9px}::-webkit-scrollbar-track{background:#0b0e0f}::-webkit-scrollbar-thumb{background:#343b3e;border:2px solid #0b0e0f}
+  </style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="brand"><div class="mark">PT</div><div><div class="kicker">PAPER Toolkit / exact animation lab</div><h1>Weapon Motion Workstation</h1></div></div>
+    <div class="live"><div class="label"><span id="livePulse" class="pulse"></span>Native graph / currently active</div><div id="liveName" class="live-name">No active clip reported</div></div>
+    <div class="links"><span id="paperLink" class="link">PAPER</span><span id="rockLink" class="link">ROCK</span><span id="prismaLink" class="link">PRISMA</span></div>
+  </header>
+  <main>
+    <section class="column">
+      <div class="section-head"><span class="section-title">Exact clip catalog</span><span id="clipCount" class="counter">0 clips</span></div>
+      <div class="filter"><input id="search" placeholder="Filter animation name or path"></div>
+      <div id="clips" class="clip-list"></div>
+    </section>
+    <section class="column center">
+      <div class="section-head"><span class="section-title">Timeline / weapon-root local</span><button id="refresh" class="refresh">REFRESH</button></div>
+      <div class="selected-summary"><div><div class="label">Selected exact clip</div><div id="selectedName" class="selected-name">Select a clip</div><div id="selectedPath" class="selected-path">Only exact PAPER value snapshots can be previewed.</div></div><button id="preview" class="preview-button" disabled>Preview parts</button></div>
+      <div class="timeline">
+        <div class="transport"><button id="play" class="play">▶</button><span id="time" class="time">0.000s</span><input id="scrub" type="range" min="0" max="1" step="0.001" value="0" disabled><span id="duration" class="time">/ 0.000s</span></div>
+        <div class="ruler"><span id="cursor" class="cursor" style="left:0%"></span></div>
+        <div id="annotations" class="marker-lane"><span class="lane-label label">Annotations</span></div>
+        <div id="triggers" class="marker-lane"><span class="lane-label label">Graph triggers</span></div>
+        <div class="notice"><strong>NON-NATIVE OVERLAY PREVIEW.</strong> Scrubbing publishes current-generation ROCK part transforms only. It never activates, updates, deactivates, pauses, or seeks the weapon behavior graph; PAPER reload stages continue from native graph output.</div>
+      </div>
+    </section>
+    <section class="column">
+      <div class="section-head"><span class="section-title">Part coverage</span><span id="mappedCount" class="counter">0 mapped</span></div>
+      <div id="parts" class="parts"></div>
+    </section>
+  </main>
+  <footer><span id="status" class="status">Waiting for providers</span><span id="catalogMeta">catalog 0 / revision 0 · memory-only · no save or JSON writes</span></footer>
+</div>
+<script>
+  const state={model:null,filter:"",playing:false,lastTick:0};
+  const $=id=>document.getElementById(id); const esc=value=>String(value??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  function send(command){if(typeof window.paperToolkitAuthoringAction==="function")window.paperToolkitAuthoringAction(JSON.stringify(command));}
+  function fmt(v){return Number.isFinite(Number(v))?Number(v).toFixed(3):"0.000"}
+  function selected(){return state.model?.selection||{loaded:false,time:0,duration:0,tracks:[],annotations:[],triggers:[]}}
+  function markerHtml(markers,type,duration){return `<span class="lane-label label">${type==="trigger"?"Graph triggers":"Annotations"}</span>`+(markers||[]).map(m=>`<span class="marker ${type}" style="left:${duration>0?Math.max(0,Math.min(100,m.time/duration*100)):0}%" title="${esc(m.text||`event ${m.eventId}`)} @ ${fmt(m.time)}s"></span>`).join("")}
+  function render(){const m=state.model||{connections:{},catalog:{},live:{},clips:[],selection:{tracks:[]}};const s=m.selection||{};
+    ["paper","rock","prisma"].forEach(k=>$(k+"Link").classList.toggle("on",!!m.connections?.[k]));$("livePulse").classList.toggle("on",!!m.live?.active);$("liveName").textContent=m.live?.active?(m.live.name||"Unnamed active clip"):`No active clip reported${m.live?.name?` · last ${m.live.name}`:""}`;
+    const clips=(m.clips||[]).filter(c=>(c.name+" "+c.path).toLowerCase().includes(state.filter));$("clipCount").textContent=`${m.catalog?.exactClipCount||0} exact / ${m.catalog?.clipCount||0} total`;
+    $("clips").innerHTML=clips.length?clips.map(c=>`<button class="clip ${c.selected?"selected":""}" data-clip="${c.id}" ${c.exact?"":"disabled"}><div class="clip-top"><span class="clip-name">${esc(c.name||"Unnamed clip")}</span><span class="duration">${fmt(c.duration)}s</span></div><div class="path">${esc(c.path||"No source path")}</div><div class="chips"><span class="chip ${c.exact?"exact":""}">${esc(c.acquisition)}</span>${c.activeNameMatch?'<span class="chip active">active name</span>':""}<span class="chip">${c.tracks} tracks</span></div></button>`).join(""):'<div class="empty">No matching exact clips. PAPER harvests the equipped weapon subgraph and its current keyword/mod composition across frames.</div>';
+    $("selectedName").textContent=s.loaded?(s.name||"Unnamed clip"):"Select a clip";$("selectedPath").textContent=s.loaded?(s.path||"No source path"):"Only exact PAPER value snapshots can be previewed.";$("preview").disabled=!s.loaded;$("preview").classList.toggle("on",!!s.preview);$("preview").textContent=s.preview?"Stop preview":"Preview parts";
+    $("scrub").disabled=!s.loaded;$("scrub").max=Math.max(.001,s.duration||0);$("scrub").value=Math.min(s.time||0,s.duration||0);$("time").textContent=`${fmt(s.time)}s`;$("duration").textContent=`/ ${fmt(s.duration)}s`;$("cursor").style.left=`${s.duration>0?Math.max(0,Math.min(100,(s.time||0)/s.duration*100)):0}%`;
+    $("annotations").innerHTML=markerHtml(s.annotations,"annotation",s.duration);$("triggers").innerHTML=markerHtml(s.triggers,"trigger",s.duration);
+    const tracks=s.tracks||[],mapped=tracks.filter(t=>t.mapping?.state==="mapped").length;$("mappedCount").textContent=`${mapped} mapped / ${tracks.length}`;$("parts").innerHTML=tracks.length?tracks.map(t=>`<label class="part"><input type="checkbox" data-track="${t.id}" ${t.previewEnabled?"checked":""} ${t.mapping?.state!=="mapped"||t.unsupportedScale?"disabled":""}><span><span class="part-name">${esc(t.name||`track ${t.id}`)}</span><div class="part-meta">depth ${t.chainDepth} · ${t.samples} samples · travel ${fmt(t.translationTravel)}<br>${t.mapping?.sourceName?esc(t.mapping.sourceName)+` · body ${t.mapping.bodyId} · OMOD ${Number(t.mapping.omodFormId||0).toString(16).toUpperCase()}`:"No unique current weapon part"}${t.unsupportedScale?'<br><span class="warn">nonuniform scale — preview rejected</span>':""}</div></span><span class="mapping ${esc(t.mapping?.state)}">${esc(t.mapping?.state||"missing")}</span></label>`).join(""):'<div class="empty">Select an exact clip to inspect every sampled weapon-rig track and its current equipped-part mapping.</div>';
+    $("status").textContent=m.status||"Waiting";$("catalogMeta").textContent=`catalog ${m.catalog?.sequence||0} / revision ${m.catalog?.revision||0} · ${m.catalog?.files||0} files · ${m.catalog?.sampled||0} sampled · memory-only`;
+  }
+  document.addEventListener("mousedown",event=>{const track=event.target.closest("[data-track]");if(track&&!track.disabled){send({action:"trackPreview",trackId:Number(track.dataset.track),enabled:!track.checked});event.preventDefault();return}const clip=event.target.closest("[data-clip]");if(clip&&!clip.disabled){send({action:"selectClip",clipId:Number(clip.dataset.clip)});event.preventDefault();}} ,true);
+  $("search").addEventListener("input",e=>{state.filter=e.target.value.toLowerCase();render()});$("refresh").addEventListener("click",()=>send({action:"refresh"}));$("preview").addEventListener("click",()=>send({action:"preview",enabled:!selected().preview}));
+  $("scrub").addEventListener("input",e=>send({action:"scrub",time:Number(e.target.value)}));$("play").addEventListener("click",()=>{state.playing=!state.playing;state.lastTick=performance.now();$("play").textContent=state.playing?"Ⅱ":"▶";requestAnimationFrame(tick)});
+  function tick(now){if(!state.playing)return;const s=selected();if(!s.loaded||s.duration<=0){state.playing=false;$("play").textContent="▶";return}const dt=Math.min(.1,(now-state.lastTick)/1000);state.lastTick=now;let t=(s.time||0)+dt;if(t>s.duration)t=0;send({action:"scrub",time:t});requestAnimationFrame(tick)}
+  window.paperToolkitAuthoringUpdate=payload=>{try{state.model=typeof payload==="string"?JSON.parse(payload):payload;render()}catch(error){console.error("PAPER Toolkit authoring update rejected",error)}};render();
+</script>
+</body>
+</html>
