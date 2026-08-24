@@ -171,7 +171,14 @@ namespace paper_toolkit::rich_capture
 
         const char* weaponClassSourceName(std::uint32_t value)
         {
-            static constexpr std::array names{ "None", "Keyword", "WeightFallback", "Default" };
+            static constexpr std::array names{
+                "None",
+                "Keyword",
+                "LegacyWeightFallback",
+                "Default",
+                "WeaponData",
+                "EquipSlot",
+            };
             return enumName(value, names);
         }
 
