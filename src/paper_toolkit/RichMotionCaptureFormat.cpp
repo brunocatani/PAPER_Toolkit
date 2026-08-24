@@ -174,8 +174,6 @@ namespace paper_toolkit::rich_capture
             static constexpr std::array names{
                 "None",
                 "Keyword",
-                "LegacyWeightFallback",
-                "Default",
                 "WeaponData",
                 "EquipSlot",
             };
