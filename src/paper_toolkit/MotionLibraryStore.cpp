@@ -20,10 +20,10 @@ namespace paper_toolkit::motion_library
         {
             char documents[MAX_PATH];
             if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_MYDOCUMENTS, nullptr, 0, documents))) {
-                return std::string(documents) + R"(\My Games\Fallout4VR\PAPER_Toolkit_Config\MotionLibrary)";
+                return std::string(documents) + R"(\My Games\Fallout4VR\Mods_Config\PAPER_Toolkit\MotionLibrary)";
             }
-            PAPER_TOOLKIT_LOG_WARN(Config, "SHGetFolderPath failed — motion library falls back to Data\\F4SE\\Plugins\\PAPER_Toolkit_MotionLibrary");
-            return R"(Data\F4SE\Plugins\PAPER_Toolkit_MotionLibrary)";
+            PAPER_TOOLKIT_LOG_WARN(Config, "Could not resolve Documents; motion library I/O is unavailable");
+            return {};
         }
 
         // Plugin names become file-name components; keep letters, digits,
@@ -128,7 +128,7 @@ namespace paper_toolkit::motion_library
         if (outError) {
             outError->clear();
         }
-        if (weapon.empty()) {
+        if (_directory.empty() || weapon.empty()) {
             return false;
         }
         auto path = filePathForWeapon(weapon);
@@ -175,7 +175,7 @@ namespace paper_toolkit::motion_library
 
     void MotionLibraryStore::save(const WeaponLibrary& library)
     {
-        if (library.weapon.empty()) {
+        if (_directory.empty() || library.weapon.empty()) {
             return;
         }
         PendingWrite write{ filePathForWeapon(library.weapon), serialize(library) };
@@ -202,7 +202,7 @@ namespace paper_toolkit::motion_library
     bool MotionLibraryStore::appendCapture(rich_capture::Event event)
     {
         const auto& context = rich_capture::contextOf(event);
-        if (context.weapon.ref.empty()) {
+        if (_directory.empty() || context.weapon.ref.empty()) {
             return false;
         }
         const auto estimatedBytes = rich_capture::estimateOwnedBytes(event);
@@ -227,6 +227,7 @@ namespace paper_toolkit::motion_library
 
     std::uint32_t MotionLibraryStore::deleteAllExceptCurated()
     {
+        if (_directory.empty()) return 0;
         // Quiesce the writer first: clearing only the queued writes cannot
         // cancel a serving write already popped by the worker, whose atomic
         // replace could otherwise resurrect learned data after this wipe.

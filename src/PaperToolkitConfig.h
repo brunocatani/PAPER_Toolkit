@@ -27,7 +27,7 @@ namespace paper_toolkit
      *
      * Location follows ROCK's convention — outside the game's Data tree so
      * MO2's VFS cannot interfere with file watching:
-     *   Documents\My Games\Fallout4VR\PAPER_Toolkit_Config\PAPER_Toolkit.ini
+     *   Documents\My Games\Fallout4VR\Mods_Config\PAPER_Toolkit\PAPER_Toolkit.ini
      * A missing file is created with the compiled defaults on first load so
      * there is always a live-editable file.
      */
@@ -109,7 +109,7 @@ namespace paper_toolkit
         bool resetMotionData = false;
         /*
          * Motion library (phase 2): one human-editable JSON per weapon under
-         * PAPER_Toolkit_Config\MotionLibrary — learning survives restarts, and
+         * Mods_Config\PAPER_Toolkit\MotionLibrary — learning survives restarts, and
          * the files are the fine-tuning surface. Loaded on weapon equip
          * ("disk seeds, live learning wins"), saved by a background writer
          * when learning settles. ReadOnly: load but never write (global

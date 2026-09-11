@@ -94,7 +94,7 @@ namespace paper_toolkit
             "bResetMotionData = false\n"
             "\n"
             "; Motion library: one human-editable JSON per weapon in\n"
-            "; PAPER_Toolkit_Config\\MotionLibrary — mapped reloads survive game restarts\n"
+            "; Mods_Config\\PAPER_Toolkit\\MotionLibrary — mapped reloads survive game restarts\n"
             "; and the files are the fine-tuning surface (stageName/notes fields are\n"
             "; yours; they round-trip untouched). Loaded on weapon equip; disk data\n"
             "; seeds the learner, anything learned live always wins. Saves happen on a\n"
@@ -176,11 +176,11 @@ namespace paper_toolkit
         {
             char documents[MAX_PATH];
             if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_MYDOCUMENTS, nullptr, 0, documents))) {
-                return std::string(documents) + R"(\My Games\Fallout4VR\PAPER_Toolkit_Config\PAPER_Toolkit.ini)";
+                return std::string(documents) + R"(\My Games\Fallout4VR\Mods_Config\PAPER_Toolkit\PAPER_Toolkit.ini)";
             }
 
-            PAPER_TOOLKIT_LOG_WARN(Config, "SHGetFolderPath failed — using fallback PAPER_Toolkit.ini path");
-            return R"(Data\F4SE\Plugins\PAPER_Toolkit.ini)";
+            PAPER_TOOLKIT_LOG_WARN(Config, "Could not resolve Documents; configuration I/O is unavailable");
+            return {};
         }
 
         [[nodiscard]] std::int64_t nowMs()
@@ -203,6 +203,7 @@ namespace paper_toolkit
     void PaperToolkitConfig::load()
     {
         _iniFilePath = resolveIniPath();
+        if (_iniFilePath.empty()) return;
         writeDefaultIniIfMissing();
         parseIni(false);
         PAPER_TOOLKIT_LOG_INFO(Config,
